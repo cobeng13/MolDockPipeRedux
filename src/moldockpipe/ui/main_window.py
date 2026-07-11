@@ -152,10 +152,6 @@ class MainWindow(QMainWindow):
         top_layout.addLayout(stages_row)
         top_layout.addWidget(self.current_task_label)
         top_layout.addWidget(self.stage_progress)
-        self.failure_summary = QLabel("Failures\nNo failures recorded")
-        self.failure_summary.setWordWrap(True)
-        self.failure_summary.setObjectName("failureSummary")
-        top_layout.addWidget(self.failure_summary)
 
         self.parent_table = QTableWidget(0, 6)
         self.parent_table.setHorizontalHeaderLabels(["Parent ID", "Source SMILES", "Canonical SMILES", "InChIKey", "Parse status", "Screening"])
@@ -279,6 +275,7 @@ class MainWindow(QMainWindow):
     def _refresh_checkpoint_state(self) -> None:
         if not self.repo:
             return
+        postdock_was_complete = self.overall_progress.states.get("postdock") == "complete"
         with self.repo.connection() as conn:
             parents = conn.execute("SELECT COUNT(*) FROM parent_ligands").fetchone()[0]
             screened = conn.execute("SELECT COUNT(*) FROM screening_results WHERE status IN ('completed','failed')").fetchone()[0]
@@ -288,6 +285,8 @@ class MainWindow(QMainWindow):
             meeko_terminal = conn.execute("SELECT COUNT(*) FROM conformers WHERE status IN ('pdbqt_ready','pdbqt_failed')").fetchone()[0]
             docked = conn.execute("SELECT COUNT(DISTINCT state_id) FROM docking_runs WHERE status='completed' AND is_current=1").fetchone()[0]
             docking_terminal = conn.execute("SELECT COUNT(DISTINCT state_id) FROM docking_runs WHERE status IN ('completed','failed','interrupted')").fetchone()[0]
+            postdock_done = conn.execute("SELECT COUNT(*) FROM artifacts WHERE created_stage='postdock' AND active=1").fetchone()[0]
+        postdock_done = postdock_done or int(any((self.repo.root / "For_PostDocking").rglob("*.pdbqt"))) or int(any((self.repo.root / "For_PostDocking").rglob("*.sdf")))
         self.overall_progress.reset()
         if parents and screened == parents:
             self.overall_progress.complete_stage("screening")
@@ -303,6 +302,8 @@ class MainWindow(QMainWindow):
             self.overall_progress.complete_stage("vina")
         elif docked:
             self.overall_progress.start_stage("vina")
+        if postdock_done or postdock_was_complete:
+            self.overall_progress.complete_stage("postdock")
         self._update_dashboard(parents, screened, states, prepared, docked)
 
     def _update_dashboard(self, parents: int, screened: int, states: int, prepared: int, docked: int) -> None:
@@ -326,23 +327,16 @@ class MainWindow(QMainWindow):
                 WHERE d.status IN ('failed','interrupted') GROUP BY d.run_id, s.state_id ORDER BY s.state_id LIMIT 6""").fetchall()
         self.stat_cards["ligands"].setText(str(parents))
         self.stat_cards["passed"].setText(str(passed))
-        self.stat_cards["failed"].setText(f"Drug-likeness  {failed}\nPDBQT  {len(pdbqt_failures)}\nDocking  {len(docking_failures)}")
+        self.stat_cards["failed"].setText(str(failed))
         self.stat_cards["running"].setText(self.current_stage_label.text() if self.stage_running else "Idle")
         self.project_summary.setText(f"{self.repo.root.name}\n{self.repo.root}")
-        failure_lines = []
-        if screening_failures:
-            failure_lines.append("Druglikeness Screening: " + "; ".join(f"{row[0]} ({row[1]})" for row in screening_failures))
-        if pdbqt_failures:
-            failure_lines.append("PDBQT Generation: " + "; ".join(f"{row[0]} ({row[1]})" for row in pdbqt_failures))
-        if docking_failures:
-            failure_lines.append("Docking: " + "; ".join(f"{row[0]} ({row[1]})" for row in docking_failures))
-        self.failure_summary.setText("Failures\n" + ("\n".join(failure_lines) if failure_lines else "No failures recorded"))
+        export_status = "Complete" if self.overall_progress.states.get("postdock") == "complete" else "Ready" if docked else "Pending"
         labels = {
             "screening": f"Screening\n{passed} passed; {failed} failed",
             "molscrub": f"States\n{states} generated",
             "meeko": f"Ligands\n{prepared} prepared",
             "vina": f"Docking\n{docked} states complete",
-            "postdock": "Export\nReady" if docked else "Export\nPending",
+            "postdock": f"Export\n{export_status}",
         }
         for stage, button in self.stage_buttons.items():
             status = self.overall_progress.states.get(stage, "pending")
@@ -352,7 +346,7 @@ class MainWindow(QMainWindow):
             if status == "complete":
                 button.setStyleSheet("QPushButton { color: #166534; background: #dcfce7; border: 1px solid #86efac; }")
             elif status == "active":
-                button.setStyleSheet("QPushButton { color: #166534; background: #bbf7d0; border: 2px solid #22c55e; font-weight: 600; }")
+                button.setStyleSheet("QPushButton { color: #1d4ed8; background: #dbeafe; border: 2px solid #3b82f6; font-weight: 600; }")
             elif status == "warning":
                 button.setStyleSheet("QPushButton { color: #92400e; background: #fef3c7; border: 1px solid #f59e0b; }")
             else:
