@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import csv
+import time
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
@@ -25,6 +26,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.repo: ProjectRepository | None = None
         self.stage_running = False
+        self.stage_started_at = 0.0
         self.setWindowTitle("MolDockPipe Redux")
         self.resize(1280, 760)
         self._build_ui()
@@ -110,6 +112,7 @@ class MainWindow(QMainWindow):
             value = QLabel("0")
             value.setObjectName("statValue")
             value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            value.setWordWrap(True)
             card_layout.addWidget(value)
             self.stat_cards[key] = value
             stats_row.addWidget(card)
@@ -119,9 +122,10 @@ class MainWindow(QMainWindow):
         self.stage_progress = QProgressBar()
         self.stage_progress.setRange(0, 100)
         self.stage_progress.setValue(0)
-        self.stage_progress.setVisible(False)
-        self.current_stage_label = QLabel("Idle")
+        self.stage_progress.setFormat("%p%")
+        self.current_stage_label = QLabel("Current: Idle")
         self.current_item_label = QLabel("")
+        self.current_task_label = QLabel("Current task: None")
         top = QWidget()
         top_layout = QVBoxLayout(top)
         top_layout.setContentsMargins(0, 0, 0, 8)
@@ -133,6 +137,8 @@ class MainWindow(QMainWindow):
         top_layout.addLayout(header)
         top_layout.addLayout(stats_row)
         top_layout.addLayout(stages_row)
+        top_layout.addWidget(self.current_task_label)
+        top_layout.addWidget(self.stage_progress)
         self.failure_summary = QLabel("Failures\nNo failures recorded")
         self.failure_summary.setWordWrap(True)
         self.failure_summary.setObjectName("failureSummary")
@@ -158,10 +164,11 @@ class MainWindow(QMainWindow):
         self.data_tabs.setVisible(False)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
+        self.log.setMaximumHeight(180)
         self.log.setPlaceholderText("Structured pipeline events and execution logs appear here.")
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.addWidget(self.log)
-        splitter.setSizes([700])
+        splitter.setSizes([560])
         layout = QVBoxLayout()
         layout.addWidget(top)
         layout.addWidget(splitter)
@@ -306,7 +313,7 @@ class MainWindow(QMainWindow):
                 WHERE d.status IN ('failed','interrupted') GROUP BY d.run_id, s.state_id ORDER BY s.state_id LIMIT 6""").fetchall()
         self.stat_cards["ligands"].setText(str(parents))
         self.stat_cards["passed"].setText(str(passed))
-        self.stat_cards["failed"].setText(str(failed))
+        self.stat_cards["failed"].setText(f"Drug-likeness  {failed}\nPDBQT  {len(pdbqt_failures)}\nDocking  {len(docking_failures)}")
         self.stat_cards["running"].setText(self.current_stage_label.text() if self.stage_running else "Idle")
         self.project_summary.setText(f"{parents} ligands | {states} states | {prepared} prepared | {docked} docked")
         failure_lines = []
@@ -333,8 +340,23 @@ class MainWindow(QMainWindow):
                 button.setStyleSheet("QPushButton { color: #166534; background: #dcfce7; border: 1px solid #86efac; }")
             elif status == "active":
                 button.setStyleSheet("QPushButton { color: #166534; background: #bbf7d0; border: 2px solid #22c55e; font-weight: 600; }")
+            elif status == "warning":
+                button.setStyleSheet("QPushButton { color: #92400e; background: #fef3c7; border: 1px solid #f59e0b; }")
             else:
                 button.setStyleSheet("QPushButton { color: #374151; background: #f3f4f6; border: 1px solid #d1d5db; }")
+
+    def _refresh_live_dashboard(self) -> None:
+        if not self.repo:
+            return
+        with self.repo.connection() as conn:
+            values = (
+                conn.execute("SELECT COUNT(*) FROM parent_ligands").fetchone()[0],
+                conn.execute("SELECT COUNT(*) FROM screening_results WHERE status IN ('completed','failed')").fetchone()[0],
+                conn.execute("SELECT COUNT(*) FROM molecular_states").fetchone()[0],
+                conn.execute("SELECT COUNT(*) FROM conformers WHERE status='pdbqt_ready'").fetchone()[0],
+                conn.execute("SELECT COUNT(DISTINCT state_id) FROM docking_runs WHERE status='completed' AND is_current=1").fetchone()[0],
+            )
+        self._update_dashboard(*values)
 
     @staticmethod
     def _load_table(table: QTableWidget, rows: list[object]) -> None:
@@ -361,11 +383,13 @@ class MainWindow(QMainWindow):
         if not self.repo or self.stage_running:
             return
         self.stage_running = True
+        self.stage_started_at = time.monotonic()
         self.pipeline_is_full = not stages
         self.overall_progress.start_stage(stages[0] if stages else "screening")
         self._set_stage_actions(False)
         self.run_all_action.setEnabled(False)
         self.current_stage_label.setText(f"{label} running")
+        self.current_task_label.setText(f"Current task: {label}")
         self._write_log(f"{label} started in background...")
         self.pipeline_thread = QThread(self)
         self.pipeline_worker = PipelineWorker(self.repo, stages)
@@ -405,15 +429,28 @@ class MainWindow(QMainWindow):
         total = getattr(event, "total", 0)
         if total:
             self.stage_progress.setValue(int(index * 100 / total))
+            self.stage_progress.setFormat(f"{index} / {total}   %p%")
         if getattr(event, "event", "") == "stage_started":
             self.overall_progress.start_stage(stage)
             self._update_dashboard(*self._dashboard_values)
         elif getattr(event, "event", "") == "stage_completed":
-            self.overall_progress.complete_stage(stage)
+            if getattr(event, "failed", 0):
+                self.overall_progress.states[stage] = "warning"
+                self.overall_progress.update()
+            else:
+                self.overall_progress.complete_stage(stage)
         self.current_stage_label.setText(f"{stage}: {getattr(event, 'event', '')}")
         self.current_item_label.setText(str(getattr(event, "item_id", "") or ""))
+        self.current_task_label.setText(f"Current task: {stage.title()} | {self.current_item_label.text()} ({index} / {total})")
         self.dashboard_status.setText(self.current_stage_label.text())
         self.stat_cards["running"].setText(stage.title() if stage else "Running")
+        if total and index:
+            elapsed = max(time.monotonic() - self.stage_started_at, 0.1)
+            rate = index / elapsed * 60
+            remaining = max(total - index, 0)
+            eta = remaining / (index / elapsed) if index else 0
+            self.dashboard_status.setText(f"{stage.title()} | {rate:.1f}/min | ETA {eta / 60:.1f} min")
+        self._refresh_live_dashboard()
         item = getattr(event, "item_id", None)
         message = getattr(event, "message", "")
         self.statusBar().showMessage(f"{stage}: {item or ''} {message}")
@@ -435,6 +472,7 @@ class MainWindow(QMainWindow):
         self.stage_progress.setValue(100)
         self.current_stage_label.setText("Idle")
         self.current_item_label.setText("")
+        self.current_task_label.setText("Current task: None")
         self.dashboard_status.setText("Ready")
         self._write_log(f"Pipeline completed: {summary}")
         self.refresh_tables()
