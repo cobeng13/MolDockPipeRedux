@@ -62,7 +62,6 @@ class MainWindow(QMainWindow):
         advanced_menu.addAction("Generate States", self.run_molscrub)
         advanced_menu.addAction("Prepare Ligands", self.run_meeko)
         advanced_menu.addAction("Run Docking", self.run_vina)
-        advanced_menu.addAction("Export Results", self.run_postdock)
         advanced_button.setMenu(advanced_menu)
         advanced_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         toolbar.addWidget(advanced_button)
@@ -72,6 +71,8 @@ class MainWindow(QMainWindow):
         export_menu = QMenu(export_button)
         export_menu.addAction("Manifest CSV", self.export_manifest_csv)
         export_menu.addAction("Leaderboard CSV", self.export_leaderboard_csv)
+        export_menu.addSeparator()
+        export_menu.addAction("Export docked compounds (PDBQT/SDF)", self.run_postdock)
         export_button.setMenu(export_menu)
         export_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         toolbar.addWidget(export_button)
@@ -486,6 +487,12 @@ class MainWindow(QMainWindow):
         self._write_log(f"Pipeline completed: {summary}")
         self.refresh_tables()
         self._refresh_checkpoint_state()
+        if isinstance(summary, dict) and "vina" in summary:
+            QMessageBox.information(
+                self,
+                "Docking complete",
+                "Docking has finished. Export is ready.\n\nUse the Export menu, then choose ‘Export docked compounds (PDBQT/SDF)’."
+            )
 
     def _pipeline_failed(self, message: str) -> None:
         self.stage_running = False
