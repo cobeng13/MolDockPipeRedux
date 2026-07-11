@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moldockpipe"
+version = "0.1.0"
+description = "A traceable desktop molecular docking workflow"
+requires-python = ">=3.10"
+dependencies = [
+  "PyYAML>=6.0",
+  "meeko>=0.5",
+  "scipy>=1.10",
+  "gemmi>=0.6",
+]
+
+[project.optional-dependencies]
+chemistry = [
+  "molscrub @ git+https://github.com/forlilab/molscrub.git",
+  "joblib>=1.3",
+]
+dev = ["pytest>=8.0"]
+
+# Install PyQt6 with Conda alongside RDKit. Installing its wheel with pip can
+# replace Conda's native Qt runtime and break Windows plugin discovery.
+
+[project.scripts]
+moldockpipe = "moldockpipe.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

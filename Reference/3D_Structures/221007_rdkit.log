@@ -1,0 +1,6 @@
+RDKit build for 221007
+SMILES: C1=CC=C(C=C1)C2=NC(=C(N2)C(=O)O)C(=O)O
+Force field: UFF
+Minimize steps: 200
+Output SDF: C:\MEGASync\Teaching Stuff\1st Sem\Drug Disco\Molecular Docking\Molecular Docking Tool Program (PROD)\WINDOWS\3D_Structures\221007.sdf
+Result: OK; Reason: OK; atoms=25
