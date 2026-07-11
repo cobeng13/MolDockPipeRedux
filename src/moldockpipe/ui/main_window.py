@@ -685,7 +685,7 @@ class SettingsDialog(QDialog):
         if answer != QMessageBox.StandardButton.Yes:
             return
         self.repository.clear_workflow_data()
-        for name in ("artifacts", "logs", "exports"):
+        for name in ("artifacts", "logs", "exports", "For_PostDocking"):
             target = self.repository.root / name
             if target.exists():
                 shutil.rmtree(target)
