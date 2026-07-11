@@ -103,13 +103,16 @@ class MainWindow(QMainWindow):
         tabs.addTab(self.parent_table, "Parent Ligands")
         tabs.addTab(self.state_table, "Molecular States")
         tabs.addTab(self.results_table, "Results")
+        # Keep the data views available for later, but hide them while the
+        # progress and execution workflow is being refined.
+        self.data_tabs = tabs
+        self.data_tabs.setVisible(False)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setPlaceholderText("Structured pipeline events and execution logs appear here.")
         splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.addWidget(tabs)
         splitter.addWidget(self.log)
-        splitter.setSizes([530, 180])
+        splitter.setSizes([700])
         layout = QVBoxLayout()
         layout.addWidget(top)
         layout.addWidget(splitter)
@@ -500,7 +503,7 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._meeko_tab(settings.get("meeko", {})), "Meeko")
         tabs.addTab(self._vina_tab(settings.get("vina", {})), "Docking")
         tabs.addTab(self._postdock_tab(settings.get("postdock", {})), "Post-docking")
-        tabs.addTab(self._guardrails_tab(), "Guardrails")
+        tabs.addTab(self._workflow_maintenance_tab(), "Workflow Maintenance")
         layout = QVBoxLayout(self)
         layout.addWidget(tabs)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
@@ -508,20 +511,14 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def _guardrails_tab(self) -> QWidget:
+    def _workflow_maintenance_tab(self) -> QWidget:
         form = QFormLayout()
-        description = QLabel("Reset generated workflow data while preserving source inputs and project settings.")
+        description = QLabel("Reset generated workflow data while preserving source inputs and project settings. This removes derived states, preparations, docking outputs, logs, and reports.")
         description.setWordWrap(True)
         form.addRow(description)
         purge_button = QPushButton("Purge generated workflow data")
         purge_button.clicked.connect(self._purge_workflow)
-        form.addRow("Test reset", purge_button)
-        manifest_button = QPushButton("Export manifest.csv")
-        manifest_button.clicked.connect(self._export_manifest)
-        leaderboard_button = QPushButton("Export leaderboard.csv")
-        leaderboard_button.clicked.connect(self._export_leaderboard)
-        form.addRow("Export Data", manifest_button)
-        form.addRow("Export Data", leaderboard_button)
+        form.addRow("Destructive action", purge_button)
         widget = QWidget(); widget.setLayout(form); return widget
 
     def _purge_workflow(self) -> None:
@@ -539,6 +536,8 @@ class SettingsDialog(QDialog):
         QMessageBox.information(self, "Purge complete", "Generated workflow data was removed. The input files and project.yml were preserved.")
         self.workflow_reset.emit()
 
+    # Kept as dialog helpers for the Export Data toolbar menu. They are no
+    # longer exposed as actions in the destructive-operations tab.
     def _export_manifest(self) -> None:
         if not self.repository:
             return
@@ -546,25 +545,26 @@ class SettingsDialog(QDialog):
         output.parent.mkdir(parents=True, exist_ok=True)
         headers = ["id", "smiles", "inchikey", "admet_status", "admet_reason", "sdf_status", "sdf_path", "sdf_reason", "pdbqt_status", "pdbqt_path", "pdbqt_reason", "vina_status", "vina_score", "vina_pose", "vina_reason", "config_hash", "receptor_sha1", "tools_rdkit", "tools_meeko", "tools_vina", "created_at", "updated_at"]
         with self.repository.connection() as conn:
-            parents = conn.execute("""SELECT p.*, COALESCE(s.decision, '') decision, COALESCE(s.reason, '') screening_reason,
-                COALESCE(s.status, '') screening_status FROM parent_ligands p LEFT JOIN screening_results s USING(parent_id)
-                ORDER BY p.parent_id""").fetchall()
+            parents = conn.execute("""SELECT p.*, COALESCE(s.reason, '') screening_reason,
+                COALESCE(s.status, '') screening_status FROM parent_ligands p
+                LEFT JOIN screening_results s USING(parent_id) ORDER BY p.parent_id""").fetchall()
             rows = []
             for parent in parents:
                 states = conn.execute("""SELECT s.*, c.status conformer_status, a.relative_path sdf_path
                     FROM molecular_states s LEFT JOIN conformers c ON c.state_id=s.state_id
                     LEFT JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id WHERE s.parent_id=?""", (parent["parent_id"],)).fetchall()
-                poses = conn.execute("""SELECT p.affinity, d.receptor_hash, raw.relative_path pose_path, d.settings_fingerprint
+                pose = conn.execute("""SELECT p.affinity, d.receptor_hash, raw.relative_path pose_path, d.settings_fingerprint
                     FROM docking_poses p JOIN docking_runs d ON d.run_id=p.run_id
                     LEFT JOIN artifacts raw ON raw.artifact_id=d.raw_output_artifact_id
-                    JOIN molecular_states s ON s.state_id=d.state_id WHERE s.parent_id=? AND d.is_current=1 ORDER BY p.affinity LIMIT 1""", (parent["parent_id"],)).fetchone()
+                    JOIN molecular_states s ON s.state_id=d.state_id
+                    WHERE s.parent_id=? AND d.is_current=1 ORDER BY p.affinity LIMIT 1""", (parent["parent_id"],)).fetchone()
                 rows.append({
                     "id": parent["parent_id"], "smiles": parent["source_smiles"], "inchikey": parent["parent_inchikey"] or "",
                     "admet_status": parent["screening_status"], "admet_reason": parent["screening_reason"],
                     "sdf_status": "DONE" if states else "", "sdf_path": ";".join(str(s["sdf_path"] or "") for s in states), "sdf_reason": "",
                     "pdbqt_status": "DONE" if states and all(s["conformer_status"] == "pdbqt_ready" for s in states) else "", "pdbqt_path": "", "pdbqt_reason": "",
-                    "vina_status": "DONE" if poses else "", "vina_score": poses["affinity"] if poses else "", "vina_pose": poses["pose_path"] if poses else "", "vina_reason": "",
-                    "config_hash": poses["settings_fingerprint"] if poses else "", "receptor_sha1": poses["receptor_hash"] if poses else "",
+                    "vina_status": "DONE" if pose else "", "vina_score": pose["affinity"] if pose else "", "vina_pose": pose["pose_path"] if pose else "", "vina_reason": "",
+                    "config_hash": pose["settings_fingerprint"] if pose else "", "receptor_sha1": pose["receptor_hash"] if pose else "",
                     "tools_rdkit": "RDKit", "tools_meeko": "Meeko", "tools_vina": "Vina", "created_at": parent["created_at"], "updated_at": parent["created_at"],
                 })
         with output.open("w", newline="", encoding="utf-8") as handle:
