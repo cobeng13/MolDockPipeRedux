@@ -8,8 +8,8 @@ from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QDoubleSpinBox,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
-    QProgressBar, QSpinBox, QSplitter, QStatusBar, QTableWidget, QTableWidgetItem,
+    QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
+    QProgressBar, QSpinBox, QSplitter, QStatusBar, QStyle, QTableWidget, QTableWidgetItem,
     QTabWidget, QTextEdit, QToolBar, QToolButton, QVBoxLayout, QWidget,
     QMenu,
 )
@@ -33,33 +33,28 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar("Project")
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
-        new_action = toolbar.addAction("New Project")
-        new_action.triggered.connect(self.create_project)
-        open_action = toolbar.addAction("Open Project")
-        open_action.triggered.connect(self.open_project)
-        import_action = toolbar.addAction("Import CSV")
+        project_button = QToolButton()
+        project_button.setText("Project")
+        project_menu = QMenu(project_button)
+        project_menu.addAction("New Project", self.create_project)
+        project_menu.addAction("Open Project", self.open_project)
+        project_button.setMenu(project_menu)
+        project_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        toolbar.addWidget(project_button)
+        toolbar.addSeparator()
+        import_action = toolbar.addAction("Import")
         import_action.triggered.connect(self.import_csv)
-        self.stage_action = toolbar.addAction("Run Screening")
-        self.stage_action.setEnabled(False)
-        self.stage_action.triggered.connect(self.run_screening)
-        self.molscrub_action = toolbar.addAction("Generate States")
-        self.molscrub_action.setEnabled(False)
-        self.molscrub_action.triggered.connect(self.run_molscrub)
-        self.meeko_action = toolbar.addAction("Prepare Ligands")
-        self.meeko_action.setEnabled(False)
-        self.meeko_action.triggered.connect(self.run_meeko)
-        self.vina_action = toolbar.addAction("Run Vina")
-        self.vina_action.setEnabled(False)
-        self.vina_action.triggered.connect(self.run_vina)
-        self.postdock_action = toolbar.addAction("Post-dock Export")
-        self.postdock_action.setEnabled(False)
-        self.postdock_action.triggered.connect(self.run_postdock)
-        settings_action = toolbar.addAction("Settings")
-        settings_action.setEnabled(False)
-        settings_action.triggered.connect(self.edit_docking_settings)
-        self.settings_action = settings_action
+        toolbar.addSeparator()
+        self.run_all_action = toolbar.addAction("Run Pipeline")
+        self.run_all_action.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+        self.run_all_action.setEnabled(False)
+        self.run_all_action.triggered.connect(self.run_all)
+        self.resume_action = toolbar.addAction("Resume")
+        self.resume_action.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self.resume_action.setEnabled(False)
+        self.resume_action.triggered.connect(self.run_all)
         export_button = QToolButton()
-        export_button.setText("Export Data")
+        export_button.setText("Export")
         export_button.setToolTip("Export manifest or leaderboard CSV")
         export_menu = QMenu(export_button)
         export_menu.addAction("Manifest CSV", self.export_manifest_csv)
@@ -67,27 +62,77 @@ class MainWindow(QMainWindow):
         export_button.setMenu(export_menu)
         export_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         toolbar.addWidget(export_button)
-        self.run_all_action = toolbar.addAction("Run All")
-        self.run_all_action.setEnabled(False)
-        self.run_all_action.triggered.connect(self.run_all)
+        toolbar.addSeparator()
+        self.settings_action = toolbar.addAction("Settings")
+        self.settings_action.setEnabled(False)
+        self.settings_action.triggered.connect(self.edit_docking_settings)
 
         self.project_path = QLineEdit()
         self.project_path.setReadOnly(True)
         self.project_path.setPlaceholderText("Create or open a portable project")
-        top = QWidget()
-        top_layout = QFormLayout(top)
-        top_layout.addRow("Project", self.project_path)
+        project_label = QLabel("Project")
+        self.project_summary = QLabel("No project loaded")
+        self.project_summary.setObjectName("projectSummary")
+        self.dashboard_status = QLabel("Idle")
+        self.dashboard_status.setObjectName("dashboardStatus")
+
+        self.stage_buttons: dict[str, QPushButton] = {}
+        self.stage_details: dict[str, QLabel] = {}
+        stages_row = QHBoxLayout()
+        for key, label, callback in (
+            ("screening", "Screening", self.run_screening),
+            ("molscrub", "States", self.run_molscrub),
+            ("meeko", "Ligands", self.run_meeko),
+            ("vina", "Docking", self.run_vina),
+            ("postdock", "Export", self.run_postdock),
+        ):
+            button = QPushButton(label)
+            button.setMinimumHeight(42)
+            button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogResetButton))
+            button.clicked.connect(callback)
+            button.setEnabled(False)
+            self.stage_buttons[key] = button
+            stages_row.addWidget(button)
+        self.stage_action = self.stage_buttons["screening"]
+        self.molscrub_action = self.stage_buttons["molscrub"]
+        self.meeko_action = self.stage_buttons["meeko"]
+        self.vina_action = self.stage_buttons["vina"]
+        self.postdock_action = self.stage_buttons["postdock"]
+
+        self.stat_cards: dict[str, QLabel] = {}
+        stats_row = QHBoxLayout()
+        for key, title in (("ligands", "Ligands"), ("passed", "Passed"), ("failed", "Failed"), ("running", "Running")):
+            card = QFrame()
+            card.setFrameShape(QFrame.Shape.StyledPanel)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(12, 8, 12, 8)
+            card_layout.addWidget(QLabel(title))
+            value = QLabel("0")
+            value.setObjectName("statValue")
+            value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            card_layout.addWidget(value)
+            self.stat_cards[key] = value
+            stats_row.addWidget(card)
+
         self.overall_progress = CheckpointProgress()
+        self.overall_progress.setVisible(False)
         self.stage_progress = QProgressBar()
         self.stage_progress.setRange(0, 100)
         self.stage_progress.setValue(0)
-        self.stage_progress.setFormat("Stage: %p%")
+        self.stage_progress.setVisible(False)
         self.current_stage_label = QLabel("Idle")
         self.current_item_label = QLabel("")
-        top_layout.addRow("Overall", self.overall_progress)
-        top_layout.addRow("Current stage", self.stage_progress)
-        top_layout.addRow("Stage status", self.current_stage_label)
-        top_layout.addRow("Current item", self.current_item_label)
+        top = QWidget()
+        top_layout = QVBoxLayout(top)
+        top_layout.setContentsMargins(0, 0, 0, 8)
+        header = QHBoxLayout()
+        header.addWidget(project_label)
+        header.addWidget(self.project_path, 1)
+        header.addWidget(self.project_summary)
+        header.addWidget(self.dashboard_status)
+        top_layout.addLayout(header)
+        top_layout.addLayout(stats_row)
+        top_layout.addLayout(stages_row)
 
         self.parent_table = QTableWidget(0, 6)
         self.parent_table.setHorizontalHeaderLabels(["Parent ID", "Source SMILES", "Canonical SMILES", "InChIKey", "Parse status", "Screening"])
@@ -172,6 +217,7 @@ class MainWindow(QMainWindow):
         self.postdock_action.setEnabled(True)
         self.settings_action.setEnabled(True)
         self.run_all_action.setEnabled(True)
+        self.resume_action.setEnabled(True)
         self._auto_import_input()
         self._write_log(f"{action} project: {self.repo.root}")
         self.refresh_tables()
@@ -233,6 +279,36 @@ class MainWindow(QMainWindow):
             self.overall_progress.complete_stage("vina")
         elif docked:
             self.overall_progress.start_stage("vina")
+        self._update_dashboard(parents, screened, states, prepared, docked)
+
+    def _update_dashboard(self, parents: int, screened: int, states: int, prepared: int, docked: int) -> None:
+        """Refresh the compact statistics and stage labels shown in the ribbon."""
+        if not self.repo:
+            return
+        with self.repo.connection() as conn:
+            passed = conn.execute("SELECT COUNT(*) FROM screening_results WHERE decision != 'fail'").fetchone()[0]
+            failed = conn.execute("SELECT COUNT(*) FROM screening_results WHERE decision = 'fail'").fetchone()[0]
+        self.stat_cards["ligands"].setText(str(parents))
+        self.stat_cards["passed"].setText(str(passed))
+        self.stat_cards["failed"].setText(str(failed))
+        self.stat_cards["running"].setText(self.current_stage_label.text() if self.stage_running else "Idle")
+        self.project_summary.setText(f"{parents} ligands | {states} states | {prepared} prepared | {docked} docked")
+        labels = {
+            "screening": f"Screening\n{passed} passed; {failed} failed",
+            "molscrub": f"States\n{states} generated",
+            "meeko": f"Ligands\n{prepared} prepared",
+            "vina": f"Docking\n{docked} states complete",
+            "postdock": "Export\nReady" if docked else "Export\nPending",
+        }
+        for stage, button in self.stage_buttons.items():
+            status = self.overall_progress.states.get(stage, "pending")
+            icon = "✓" if status == "complete" else "⟳" if status == "active" else "○"
+            button.setText(f"{icon} {labels[stage]}")
+            icon_kind = (QStyle.StandardPixmap.SP_DialogApplyButton if status == "complete" else
+                         QStyle.StandardPixmap.SP_MediaPause if status == "active" else
+                         QStyle.StandardPixmap.SP_DialogResetButton)
+            button.setIcon(self.style().standardIcon(icon_kind))
+            button.setToolTip(labels[stage].replace("\n", "\n"))
 
     @staticmethod
     def _load_table(table: QTableWidget, rows: list[object]) -> None:
@@ -306,6 +382,8 @@ class MainWindow(QMainWindow):
             self.overall_progress.complete_stage(stage)
         self.current_stage_label.setText(f"{stage}: {getattr(event, 'event', '')}")
         self.current_item_label.setText(str(getattr(event, "item_id", "") or ""))
+        self.dashboard_status.setText(self.current_stage_label.text())
+        self.stat_cards["running"].setText(stage.title() if stage else "Running")
         item = getattr(event, "item_id", None)
         message = getattr(event, "message", "")
         self.statusBar().showMessage(f"{stage}: {item or ''} {message}")
@@ -327,8 +405,10 @@ class MainWindow(QMainWindow):
         self.stage_progress.setValue(100)
         self.current_stage_label.setText("Idle")
         self.current_item_label.setText("")
+        self.dashboard_status.setText("Ready")
         self._write_log(f"Pipeline completed: {summary}")
         self.refresh_tables()
+        self._refresh_checkpoint_state()
 
     def _pipeline_failed(self, message: str) -> None:
         self.stage_running = False
@@ -393,9 +473,9 @@ class MainWindow(QMainWindow):
 
 
 class CheckpointProgress(QWidget):
-    """Four-stage overall progress strip: red pending, yellow active, green done."""
+    """Workflow state model used by the ribbon buttons."""
 
-    STAGES = ("screening", "molscrub", "meeko", "vina")
+    STAGES = ("screening", "molscrub", "meeko", "vina", "postdock")
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
