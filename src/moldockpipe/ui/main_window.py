@@ -72,7 +72,7 @@ class MainWindow(QMainWindow):
         export_menu.addAction("Manifest CSV", self.export_manifest_csv)
         export_menu.addAction("Leaderboard CSV", self.export_leaderboard_csv)
         export_menu.addSeparator()
-        export_menu.addAction("Export docked compounds (PDBQT/SDF)", self.run_postdock)
+        export_menu.addAction("Export docked compounds (PDBQT/SDF)", self.select_compounds_for_export)
         export_button.setMenu(export_menu)
         export_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         toolbar.addWidget(export_button)
@@ -416,7 +416,34 @@ class MainWindow(QMainWindow):
         self._start_pipeline(["vina"], "Vina")
 
     def run_postdock(self) -> None:
+        if self.repo and not self.repo.get_settings().get("postdock", {}).get("selected_parents"):
+            QMessageBox.warning(self, "Select compounds", "Choose compounds from the Export menu before starting docked-compound export.")
+            return
         self._start_pipeline(["postdock"], "Post-docking")
+
+    def select_compounds_for_export(self) -> None:
+        if not self.repo or self.stage_running:
+            return
+        with self.repo.connection() as conn:
+            rows = conn.execute("""SELECT s.parent_id, MIN(p.affinity) best_affinity
+                FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id
+                JOIN docking_poses p ON p.run_id=d.run_id
+                WHERE d.status='completed' AND d.is_current=1
+                GROUP BY s.parent_id ORDER BY best_affinity ASC, s.parent_id""").fetchall()
+        current = self.repo.get_settings().get("postdock", {}).get("selected_parents", [])
+        dialog = CompoundSelectorDialog(rows, set(current), self.repo, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected = dialog.selected()
+        if not selected:
+            QMessageBox.warning(self, "Select compounds", "Select at least one successfully docked compound to export.")
+            return
+        config_path = self.repo.root / "project.yml"
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        config.setdefault("postdock", {})["selected_parents"] = selected
+        config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+        self._write_log(f"Export selected compounds: {len(selected)}")
+        self.run_postdock()
 
     def run_all(self) -> None:
         self.overall_progress.reset()
@@ -808,12 +835,6 @@ class SettingsDialog(QDialog):
         self.fields["postdock.mode"] = mode
         form.addRow("Operation", mode)
         self._integer(form, "Poses per compound", "postdock.poses_per_compound", values.get("poses_per_compound", 3), 1, 100)
-        selector = QPushButton("Select successfully docked compounds")
-        selector.clicked.connect(self._select_compounds)
-        self.fields["postdock.selected_parents"] = list(values.get("selected_parents", []))
-        form.addRow("Compounds", selector)
-        self.postdock_selection_label = QLabel(self._selection_text())
-        form.addRow("Selection", self.postdock_selection_label)
         widget = QWidget(); widget.setLayout(form); return widget
 
     def _selection_text(self) -> str:
@@ -854,6 +875,7 @@ class SettingsDialog(QDialog):
 
     def values(self) -> dict[str, dict[str, object]]:
         values: dict[str, dict[str, object]] = {"screening": {}, "molscrub": {}, "meeko": {}, "vina": {}, "postdock": {}}
+        values["postdock"]["selected_parents"] = list(self.settings.get("postdock", {}).get("selected_parents", []))
         for key, field in self.fields.items():
             if isinstance(field, QLineEdit):
                 value = field.text().strip()
