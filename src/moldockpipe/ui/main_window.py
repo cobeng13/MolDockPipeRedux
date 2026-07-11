@@ -78,6 +78,7 @@ class MainWindow(QMainWindow):
 
         self.stage_buttons: dict[str, QPushButton] = {}
         self.stage_details: dict[str, QLabel] = {}
+        self._dashboard_values = (0, 0, 0, 0, 0)
         stages_row = QHBoxLayout()
         for key, label, callback in (
             ("screening", "Screening", self.run_screening),
@@ -88,7 +89,6 @@ class MainWindow(QMainWindow):
         ):
             button = QPushButton(label)
             button.setMinimumHeight(42)
-            button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogResetButton))
             button.clicked.connect(callback)
             button.setEnabled(False)
             self.stage_buttons[key] = button
@@ -133,6 +133,10 @@ class MainWindow(QMainWindow):
         top_layout.addLayout(header)
         top_layout.addLayout(stats_row)
         top_layout.addLayout(stages_row)
+        self.failure_summary = QLabel("Failures\nNo failures recorded")
+        self.failure_summary.setWordWrap(True)
+        self.failure_summary.setObjectName("failureSummary")
+        top_layout.addWidget(self.failure_summary)
 
         self.parent_table = QTableWidget(0, 6)
         self.parent_table.setHorizontalHeaderLabels(["Parent ID", "Source SMILES", "Canonical SMILES", "InChIKey", "Parse status", "Screening"])
@@ -285,14 +289,34 @@ class MainWindow(QMainWindow):
         """Refresh the compact statistics and stage labels shown in the ribbon."""
         if not self.repo:
             return
+        self._dashboard_values = (parents, screened, states, prepared, docked)
         with self.repo.connection() as conn:
             passed = conn.execute("SELECT COUNT(*) FROM screening_results WHERE decision != 'fail'").fetchone()[0]
             failed = conn.execute("SELECT COUNT(*) FROM screening_results WHERE decision = 'fail'").fetchone()[0]
+            screening_failures = conn.execute("""SELECT p.parent_id, COALESCE(s.reason, 'Screening rule failure')
+                FROM screening_results s JOIN parent_ligands p USING(parent_id)
+                WHERE s.decision='fail' ORDER BY p.parent_id LIMIT 6""").fetchall()
+            pdbqt_failures = conn.execute("""SELECT state_id, COALESCE(reason, 'PDBQT generation failed')
+                FROM molecular_states WHERE status='pdbqt_failed' ORDER BY state_id LIMIT 6""").fetchall()
+            docking_failures = conn.execute("""SELECT s.state_id, CASE
+                WHEN COUNT(p.pose_id)=0 THEN 'No valid Vina poses'
+                ELSE 'Docking failed' END
+                FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id
+                LEFT JOIN docking_poses p ON p.run_id=d.run_id
+                WHERE d.status IN ('failed','interrupted') GROUP BY d.run_id, s.state_id ORDER BY s.state_id LIMIT 6""").fetchall()
         self.stat_cards["ligands"].setText(str(parents))
         self.stat_cards["passed"].setText(str(passed))
         self.stat_cards["failed"].setText(str(failed))
         self.stat_cards["running"].setText(self.current_stage_label.text() if self.stage_running else "Idle")
         self.project_summary.setText(f"{parents} ligands | {states} states | {prepared} prepared | {docked} docked")
+        failure_lines = []
+        if screening_failures:
+            failure_lines.append("Druglikeness Screening: " + "; ".join(f"{row[0]} ({row[1]})" for row in screening_failures))
+        if pdbqt_failures:
+            failure_lines.append("PDBQT Generation: " + "; ".join(f"{row[0]} ({row[1]})" for row in pdbqt_failures))
+        if docking_failures:
+            failure_lines.append("Docking: " + "; ".join(f"{row[0]} ({row[1]})" for row in docking_failures))
+        self.failure_summary.setText("Failures\n" + ("\n".join(failure_lines) if failure_lines else "No failures recorded"))
         labels = {
             "screening": f"Screening\n{passed} passed; {failed} failed",
             "molscrub": f"States\n{states} generated",
@@ -304,11 +328,13 @@ class MainWindow(QMainWindow):
             status = self.overall_progress.states.get(stage, "pending")
             icon = "✓" if status == "complete" else "⟳" if status == "active" else "○"
             button.setText(f"{icon} {labels[stage]}")
-            icon_kind = (QStyle.StandardPixmap.SP_DialogApplyButton if status == "complete" else
-                         QStyle.StandardPixmap.SP_MediaPause if status == "active" else
-                         QStyle.StandardPixmap.SP_DialogResetButton)
-            button.setIcon(self.style().standardIcon(icon_kind))
             button.setToolTip(labels[stage].replace("\n", "\n"))
+            if status == "complete":
+                button.setStyleSheet("QPushButton { color: #166534; background: #dcfce7; border: 1px solid #86efac; }")
+            elif status == "active":
+                button.setStyleSheet("QPushButton { color: #166534; background: #bbf7d0; border: 2px solid #22c55e; font-weight: 600; }")
+            else:
+                button.setStyleSheet("QPushButton { color: #374151; background: #f3f4f6; border: 1px solid #d1d5db; }")
 
     @staticmethod
     def _load_table(table: QTableWidget, rows: list[object]) -> None:
@@ -366,8 +392,11 @@ class MainWindow(QMainWindow):
         self._start_pipeline([], "Run All")
 
     def _set_stage_actions(self, enabled: bool) -> None:
-        for action in (self.stage_action, self.molscrub_action, self.meeko_action, self.vina_action, self.postdock_action, self.settings_action):
-            action.setEnabled(enabled)
+        # Keep completed/active ribbon stages visually readable while a run is
+        # active. Their handlers still no-op through _start_pipeline's guard.
+        for action in (self.stage_action, self.molscrub_action, self.meeko_action, self.vina_action, self.postdock_action):
+            action.setEnabled(True)
+        self.settings_action.setEnabled(enabled)
 
     def _on_pipeline_progress(self, event: object) -> None:
         stage_index = {"screening": 0, "molscrub": 1, "meeko": 2, "vina": 3, "postdock": 3}
@@ -378,6 +407,7 @@ class MainWindow(QMainWindow):
             self.stage_progress.setValue(int(index * 100 / total))
         if getattr(event, "event", "") == "stage_started":
             self.overall_progress.start_stage(stage)
+            self._update_dashboard(*self._dashboard_values)
         elif getattr(event, "event", "") == "stage_completed":
             self.overall_progress.complete_stage(stage)
         self.current_stage_label.setText(f"{stage}: {getattr(event, 'event', '')}")
