@@ -16,7 +16,7 @@ import sqlite3
 from pathlib import Path
 
 
-GENERATED_DIRS = ("artifacts", "logs", "exports", "output", "3D_Structures", "prepared_ligands", "results", "state")
+GENERATED_DIRS = ("artifacts", "logs", "exports", "For_PostDocking", "output", "3D_Structures", "prepared_ligands", "results", "state")
 
 
 def purge(root: Path, *, confirmed: bool = False) -> None:

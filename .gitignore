@@ -6,6 +6,10 @@ build/
 dist/
 *.egg-info/
 *.exe
+# Development tools are intentionally versioned for the application runtime.
+!tools/
+!tools/vina/
+!tools/vina/*.exe
 
 # User-created docking projects and generated scientific artifacts
 projects/
@@ -13,3 +17,6 @@ artifacts/
 project.sqlite
 *.sqlite-wal
 *.sqlite-shm
+Test_Bench/logs/
+Test_Bench/artifacts/
+Test_Bench/For_PostDocking/

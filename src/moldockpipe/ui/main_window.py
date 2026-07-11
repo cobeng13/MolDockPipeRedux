@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import shutil
+import csv
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QPainter
 from PyQt6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QDoubleSpinBox,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QDoubleSpinBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
-    QSpinBox, QSplitter, QStatusBar, QTableWidget, QTableWidgetItem,
-    QTabWidget, QTextEdit, QToolBar, QVBoxLayout, QWidget,
+    QProgressBar, QSpinBox, QSplitter, QStatusBar, QTableWidget, QTableWidgetItem,
+    QTabWidget, QTextEdit, QToolBar, QToolButton, QVBoxLayout, QWidget,
+    QMenu,
 )
 
 import yaml
@@ -20,6 +24,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.repo: ProjectRepository | None = None
+        self.stage_running = False
         self.setWindowTitle("MolDockPipe Redux")
         self.resize(1280, 760)
         self._build_ui()
@@ -46,10 +51,25 @@ class MainWindow(QMainWindow):
         self.vina_action = toolbar.addAction("Run Vina")
         self.vina_action.setEnabled(False)
         self.vina_action.triggered.connect(self.run_vina)
-        settings_action = toolbar.addAction("Docking Settings")
+        self.postdock_action = toolbar.addAction("Post-dock Export")
+        self.postdock_action.setEnabled(False)
+        self.postdock_action.triggered.connect(self.run_postdock)
+        settings_action = toolbar.addAction("Settings")
         settings_action.setEnabled(False)
         settings_action.triggered.connect(self.edit_docking_settings)
         self.settings_action = settings_action
+        export_button = QToolButton()
+        export_button.setText("Export Data")
+        export_button.setToolTip("Export manifest or leaderboard CSV")
+        export_menu = QMenu(export_button)
+        export_menu.addAction("Manifest CSV", self.export_manifest_csv)
+        export_menu.addAction("Leaderboard CSV", self.export_leaderboard_csv)
+        export_button.setMenu(export_menu)
+        export_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        toolbar.addWidget(export_button)
+        self.run_all_action = toolbar.addAction("Run All")
+        self.run_all_action.setEnabled(False)
+        self.run_all_action.triggered.connect(self.run_all)
 
         self.project_path = QLineEdit()
         self.project_path.setReadOnly(True)
@@ -57,6 +77,17 @@ class MainWindow(QMainWindow):
         top = QWidget()
         top_layout = QFormLayout(top)
         top_layout.addRow("Project", self.project_path)
+        self.overall_progress = CheckpointProgress()
+        self.stage_progress = QProgressBar()
+        self.stage_progress.setRange(0, 100)
+        self.stage_progress.setValue(0)
+        self.stage_progress.setFormat("Stage: %p%")
+        self.current_stage_label = QLabel("Idle")
+        self.current_item_label = QLabel("")
+        top_layout.addRow("Overall", self.overall_progress)
+        top_layout.addRow("Current stage", self.stage_progress)
+        top_layout.addRow("Stage status", self.current_stage_label)
+        top_layout.addRow("Current item", self.current_item_label)
 
         self.parent_table = QTableWidget(0, 6)
         self.parent_table.setHorizontalHeaderLabels(["Parent ID", "Source SMILES", "Canonical SMILES", "InChIKey", "Parse status", "Screening"])
@@ -135,10 +166,13 @@ class MainWindow(QMainWindow):
         self.molscrub_action.setEnabled(True)
         self.meeko_action.setEnabled(True)
         self.vina_action.setEnabled(True)
+        self.postdock_action.setEnabled(True)
         self.settings_action.setEnabled(True)
+        self.run_all_action.setEnabled(True)
         self._auto_import_input()
         self._write_log(f"{action} project: {self.repo.root}")
         self.refresh_tables()
+        self._refresh_checkpoint_state()
 
     def _auto_import_input(self) -> None:
         if not self.repo:
@@ -169,6 +203,34 @@ class MainWindow(QMainWindow):
         self._load_table(self.state_table, states)
         self._load_table(self.results_table, results)
 
+    def _refresh_checkpoint_state(self) -> None:
+        if not self.repo:
+            return
+        with self.repo.connection() as conn:
+            parents = conn.execute("SELECT COUNT(*) FROM parent_ligands").fetchone()[0]
+            screened = conn.execute("SELECT COUNT(*) FROM screening_results WHERE status IN ('completed','failed')").fetchone()[0]
+            states = conn.execute("SELECT COUNT(*) FROM molecular_states").fetchone()[0]
+            prepared = conn.execute("SELECT COUNT(*) FROM conformers WHERE status='pdbqt_ready'").fetchone()[0]
+            conformers = conn.execute("SELECT COUNT(*) FROM conformers").fetchone()[0]
+            meeko_terminal = conn.execute("SELECT COUNT(*) FROM conformers WHERE status IN ('pdbqt_ready','pdbqt_failed')").fetchone()[0]
+            docked = conn.execute("SELECT COUNT(DISTINCT state_id) FROM docking_runs WHERE status='completed' AND is_current=1").fetchone()[0]
+            docking_terminal = conn.execute("SELECT COUNT(DISTINCT state_id) FROM docking_runs WHERE status IN ('completed','failed','interrupted')").fetchone()[0]
+        self.overall_progress.reset()
+        if parents and screened == parents:
+            self.overall_progress.complete_stage("screening")
+        elif screened:
+            self.overall_progress.start_stage("screening")
+        if states:
+            self.overall_progress.complete_stage("molscrub")
+        if conformers and meeko_terminal == conformers:
+            self.overall_progress.complete_stage("meeko")
+        elif prepared:
+            self.overall_progress.start_stage("meeko")
+        if states and docking_terminal == states:
+            self.overall_progress.complete_stage("vina")
+        elif docked:
+            self.overall_progress.start_stage("vina")
+
     @staticmethod
     def _load_table(table: QTableWidget, rows: list[object]) -> None:
         table.setRowCount(len(rows))
@@ -182,61 +244,113 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message, 5000)
 
     def run_screening(self) -> None:
-        if not self.repo:
-            return
-        try:
-            completed, failed = PipelineRunner(self.repo).run_screening()
-        except Exception as exc:
-            QMessageBox.critical(self, "Screening failed", str(exc))
-            return
-        self._write_log(f"Screening completed: {completed}; failed: {failed}")
-        self.refresh_tables()
+        self._start_pipeline(["screening"], "Screening")
 
     def run_molscrub(self) -> None:
-        if not self.repo:
-            return
-        try:
-            created, failed = PipelineRunner(self.repo).run_molscrub()
-        except Exception as exc:
-            QMessageBox.critical(self, "State generation failed", str(exc))
-            return
-        self._write_log(f"Generated molecular states: {created}; failed parents: {failed}")
-        self.refresh_tables()
+        self._start_pipeline(["molscrub"], "MolScrub")
 
     def run_meeko(self) -> None:
-        if not self.repo:
+        self._start_pipeline(["meeko"], "Meeko")
+
+    def _start_pipeline(self, stages: list[str], label: str) -> None:
+        if not self.repo or self.stage_running:
             return
-        try:
-            prepared, failed = PipelineRunner(self.repo).run_meeko()
-        except Exception as exc:
-            QMessageBox.critical(self, "Meeko preparation failed", str(exc))
-            return
-        self._write_log(f"Meeko preparation completed: {prepared}; failed: {failed}")
-        self.refresh_tables()
+        self.stage_running = True
+        self.pipeline_is_full = not stages
+        self.overall_progress.start_stage(stages[0] if stages else "screening")
+        self._set_stage_actions(False)
+        self.run_all_action.setEnabled(False)
+        self.current_stage_label.setText(f"{label} running")
+        self._write_log(f"{label} started in background...")
+        self.pipeline_thread = QThread(self)
+        self.pipeline_worker = PipelineWorker(self.repo, stages)
+        self.pipeline_worker.moveToThread(self.pipeline_thread)
+        self.pipeline_thread.started.connect(self.pipeline_worker.run)
+        self.pipeline_worker.progress.connect(self._on_pipeline_progress)
+        self.pipeline_worker.finished.connect(self._pipeline_finished)
+        self.pipeline_worker.failed.connect(self._pipeline_failed)
+        self.pipeline_worker.finished.connect(self.pipeline_thread.quit)
+        self.pipeline_worker.failed.connect(self.pipeline_thread.quit)
+        self.pipeline_thread.finished.connect(self.pipeline_worker.deleteLater)
+        self.pipeline_thread.finished.connect(self.pipeline_thread.deleteLater)
+        self.pipeline_thread.start()
 
     def run_vina(self) -> None:
-        if not self.repo:
-            return
-        self.vina_action.setEnabled(False)
-        self._write_log("Vina docking started in background...")
-        self.vina_thread = QThread(self)
-        self.vina_worker = VinaWorker(self.repo)
-        self.vina_worker.moveToThread(self.vina_thread)
-        self.vina_thread.started.connect(self.vina_worker.run)
-        self.vina_worker.finished.connect(self._vina_finished)
-        self.vina_worker.failed.connect(self._vina_failed)
-        self.vina_worker.finished.connect(self.vina_thread.quit)
-        self.vina_worker.failed.connect(self.vina_thread.quit)
-        self.vina_thread.finished.connect(self.vina_worker.deleteLater)
-        self.vina_thread.finished.connect(self.vina_thread.deleteLater)
-        self.vina_thread.start()
+        self._start_pipeline(["vina"], "Vina")
+
+    def run_postdock(self) -> None:
+        self._start_pipeline(["postdock"], "Post-docking")
+
+    def run_all(self) -> None:
+        self.overall_progress.reset()
+        self.stage_progress.setValue(0)
+        self._start_pipeline([], "Run All")
+
+    def _set_stage_actions(self, enabled: bool) -> None:
+        for action in (self.stage_action, self.molscrub_action, self.meeko_action, self.vina_action, self.postdock_action, self.settings_action):
+            action.setEnabled(enabled)
+
+    def _on_pipeline_progress(self, event: object) -> None:
+        stage_index = {"screening": 0, "molscrub": 1, "meeko": 2, "vina": 3, "postdock": 3}
+        stage = getattr(event, "stage", "")
+        index = getattr(event, "index", 0)
+        total = getattr(event, "total", 0)
+        if total:
+            self.stage_progress.setValue(int(index * 100 / total))
+        if getattr(event, "event", "") == "stage_started":
+            self.overall_progress.start_stage(stage)
+        elif getattr(event, "event", "") == "stage_completed":
+            self.overall_progress.complete_stage(stage)
+        self.current_stage_label.setText(f"{stage}: {getattr(event, 'event', '')}")
+        self.current_item_label.setText(str(getattr(event, "item_id", "") or ""))
+        item = getattr(event, "item_id", None)
+        message = getattr(event, "message", "")
+        self.statusBar().showMessage(f"{stage}: {item or ''} {message}")
+        if getattr(event, "event", "") in {"item_failed", "stage_completed"}:
+            self._write_log(self._event_summary(event))
+        if getattr(event, "event", "") == "stage_completed":
+            self.refresh_tables()
+            self._refresh_checkpoint_state()
+
+    def _pipeline_finished(self, summary: object) -> None:
+        self.stage_running = False
+        self._set_stage_actions(True)
+        self.run_all_action.setEnabled(True)
+        if getattr(self, "pipeline_is_full", False):
+            self.overall_progress.complete_all()
+        else:
+            stage = next(iter(summary), "") if isinstance(summary, dict) else ""
+            self.overall_progress.complete_stage(stage)
+        self.stage_progress.setValue(100)
+        self.current_stage_label.setText("Idle")
+        self.current_item_label.setText("")
+        self._write_log(f"Pipeline completed: {summary}")
+        self.refresh_tables()
+
+    def _pipeline_failed(self, message: str) -> None:
+        self.stage_running = False
+        self._set_stage_actions(True)
+        self.run_all_action.setEnabled(True)
+        self._write_log(f"Run All stopped: {message}")
+        QMessageBox.critical(self, "Run All failed", message)
+
+    @staticmethod
+    def _event_summary(event: object) -> str:
+        stage = getattr(event, "stage", "")
+        kind = getattr(event, "event", "")
+        if kind == "stage_completed":
+            return (f"{stage} completed: succeeded={getattr(event, 'succeeded', 0)}, "
+                    f"skipped={getattr(event, 'skipped', 0)}, failed={getattr(event, 'failed', 0)}")
+        return f"{stage} {kind}: {getattr(event, 'item_id', '')} {getattr(event, 'message', '')}".strip()
 
     def _vina_finished(self, completed: int, failed: int) -> None:
+        self.stage_running = False
         self.vina_action.setEnabled(True)
         self._write_log(f"Vina docking completed: {completed}; failed: {failed}")
         self.refresh_tables()
 
     def _vina_failed(self, message: str) -> None:
+        self.stage_running = False
         self.vina_action.setEnabled(True)
         self._write_log(f"Vina docking failed: {message}")
         QMessageBox.critical(self, "Vina docking failed", message)
@@ -244,17 +358,84 @@ class MainWindow(QMainWindow):
     def edit_docking_settings(self) -> None:
         if not self.repo:
             return
-        dialog = DockingSettingsDialog(self.repo.get_settings().get("vina", {}), self)
+        dialog = SettingsDialog(self.repo.get_settings(), self, self.repo)
+        dialog.workflow_reset.connect(self._on_workflow_reset)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         config_path = self.repo.root / "project.yml"
         try:
             config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-            config["vina"] = dialog.values()
+            config.update(dialog.values())
             config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
             self._write_log(f"Updated docking settings in {config_path}")
         except Exception as exc:
             QMessageBox.critical(self, "Settings update failed", str(exc))
+
+    def _on_workflow_reset(self) -> None:
+        self.refresh_tables()
+        self.overall_progress.reset()
+        self.stage_progress.setValue(0)
+        self.current_stage_label.setText("Idle")
+        self.current_item_label.setText("")
+        self._write_log("Workflow reset: refreshed project tables and cleared generated state")
+        self._refresh_checkpoint_state()
+
+    def export_manifest_csv(self) -> None:
+        if self.repo:
+            SettingsDialog(self.repo.get_settings(), self, self.repo)._export_manifest()
+
+    def export_leaderboard_csv(self) -> None:
+        if self.repo:
+            SettingsDialog(self.repo.get_settings(), self, self.repo)._export_leaderboard()
+
+
+class CheckpointProgress(QWidget):
+    """Four-stage overall progress strip: red pending, yellow active, green done."""
+
+    STAGES = ("screening", "molscrub", "meeko", "vina")
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.states = {stage: "pending" for stage in self.STAGES}
+        self.setMinimumHeight(68)
+
+    def reset(self) -> None:
+        self.states = {stage: "pending" for stage in self.STAGES}
+        self.update()
+
+    def start_stage(self, stage: str) -> None:
+        if stage in self.states:
+            self.states[stage] = "active"
+            self.update()
+
+    def complete_stage(self, stage: str) -> None:
+        if stage in self.states:
+            self.states[stage] = "complete"
+            self.update()
+
+    def complete_all(self) -> None:
+        self.states = {stage: "complete" for stage in self.STAGES}
+        self.update()
+
+    def paintEvent(self, event: object) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        width = self.width()
+        segment = width / len(self.STAGES)
+        colors = {"pending": "#d9534f", "active": "#f0ad4e", "complete": "#5cb85c"}
+        labels = {"screening": "Screening", "molscrub": "MolScrub", "meeko": "Meeko", "vina": "Vina"}
+        y = 18
+        painter.setPen(Qt.PenStyle.NoPen)
+        for index, stage in enumerate(self.STAGES):
+            center_x = int(segment * index + segment / 2)
+            if index < len(self.STAGES) - 1:
+                painter.setBrush(QColor("#c8c8c8"))
+                painter.drawRect(center_x + 9, y - 2, int(segment - 18), 4)
+            painter.setBrush(QColor(colors[self.states[stage]]))
+            painter.drawEllipse(center_x - 9, y - 9, 18, 18)
+            painter.setPen(QColor("#303030"))
+            painter.drawText(int(segment * index), 48, int(segment), 18, Qt.AlignmentFlag.AlignCenter, labels[stage])
+            painter.setPen(Qt.PenStyle.NoPen)
 
 
 class VinaWorker(QObject):
@@ -272,27 +453,220 @@ class VinaWorker(QObject):
         except Exception as exc:
             self.failed.emit(str(exc))
 
-class DockingSettingsDialog(QDialog):
-    """Temporary editor for the Vina section of project.yml."""
 
-    def __init__(self, settings: dict[str, object], parent: QWidget | None = None) -> None:
+class PipelineWorker(QObject):
+    progress = pyqtSignal(object)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, repository: ProjectRepository, stages: list[str] | None = None) -> None:
+        super().__init__()
+        self.repository = repository
+        self.stages = stages
+
+    def run(self) -> None:
+        try:
+            runner = PipelineRunner(self.repository, progress=self.progress.emit)
+            summary = {}
+            if self.stages is None or not self.stages or "screening" in self.stages:
+                summary["screening"] = runner.run_screening()
+            if self.stages is None or not self.stages or "molscrub" in self.stages:
+                summary["molscrub"] = runner.run_molscrub()
+            if self.stages is None or not self.stages or "meeko" in self.stages:
+                summary["meeko"] = runner.run_meeko()
+            if self.stages is None or not self.stages or "vina" in self.stages:
+                summary["vina"] = runner.run_vina()
+            if self.stages is not None and "postdock" in self.stages:
+                summary["postdock"] = runner.run_postdock()
+            self.finished.emit(summary)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+class SettingsDialog(QDialog):
+    """Tabbed editor for all project pipeline settings."""
+
+    workflow_reset = pyqtSignal()
+
+    def __init__(self, settings: dict[str, object], parent: QWidget | None = None, repository: ProjectRepository | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Docking Settings")
-        self.resize(440, 420)
-        form = QFormLayout(self)
-        self.fields: dict[str, QLineEdit | QSpinBox | QDoubleSpinBox] = {}
-        self._line(form, "Receptor", "receptor", settings.get("receptor", "inputs/receptor_prepared.pdbqt"))
-        for key in ("center_x", "center_y", "center_z", "size_x", "size_y", "size_z"):
-            self._double(form, key.replace("_", " ").title(), key, settings.get(key, 0.0 if key.startswith("center") else 20.0))
-        self._integer(form, "Exhaustiveness", "exhaustiveness", settings.get("exhaustiveness", 8), 1, 10_000)
-        self._integer(form, "Number of modes", "num_modes", settings.get("num_modes", 9), 1, 100)
-        self._double(form, "Energy range", "energy_range", settings.get("energy_range", 3), 0, 100)
-        self._integer(form, "Random seed", "seed", settings.get("seed", 42), 0, 2_147_483_647)
-        self._integer(form, "CPU count", "cpu_count", settings.get("cpu_count", 1), 1, 256)
+        self.setWindowTitle("Pipeline Settings")
+        self.resize(520, 500)
+        self.settings = settings
+        self.repository = repository
+        self.fields: dict[str, object] = {}
+        tabs = QTabWidget()
+        tabs.addTab(self._screening_tab(settings.get("screening", {})), "Screening")
+        tabs.addTab(self._molscrub_tab(settings.get("molscrub", {})), "MolScrub")
+        tabs.addTab(self._meeko_tab(settings.get("meeko", {})), "Meeko")
+        tabs.addTab(self._vina_tab(settings.get("vina", {})), "Docking")
+        tabs.addTab(self._postdock_tab(settings.get("postdock", {})), "Post-docking")
+        tabs.addTab(self._guardrails_tab(), "Guardrails")
+        layout = QVBoxLayout(self)
+        layout.addWidget(tabs)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        form.addRow(buttons)
+        layout.addWidget(buttons)
+
+    def _guardrails_tab(self) -> QWidget:
+        form = QFormLayout()
+        description = QLabel("Reset generated workflow data while preserving source inputs and project settings.")
+        description.setWordWrap(True)
+        form.addRow(description)
+        purge_button = QPushButton("Purge generated workflow data")
+        purge_button.clicked.connect(self._purge_workflow)
+        form.addRow("Test reset", purge_button)
+        manifest_button = QPushButton("Export manifest.csv")
+        manifest_button.clicked.connect(self._export_manifest)
+        leaderboard_button = QPushButton("Export leaderboard.csv")
+        leaderboard_button.clicked.connect(self._export_leaderboard)
+        form.addRow("Export Data", manifest_button)
+        form.addRow("Export Data", leaderboard_button)
+        widget = QWidget(); widget.setLayout(form); return widget
+
+    def _purge_workflow(self) -> None:
+        if not self.repository:
+            return
+        answer = QMessageBox.warning(self, "Purge workflow data", "This removes generated states, PDBQT files, docking outputs, logs, reports, and database workflow rows. Inputs and project settings are preserved. Continue?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.repository.clear_workflow_data()
+        for name in ("artifacts", "logs", "exports"):
+            target = self.repository.root / name
+            if target.exists():
+                shutil.rmtree(target)
+            target.mkdir(parents=True, exist_ok=True)
+        QMessageBox.information(self, "Purge complete", "Generated workflow data was removed. The input files and project.yml were preserved.")
+        self.workflow_reset.emit()
+
+    def _export_manifest(self) -> None:
+        if not self.repository:
+            return
+        output = self.repository.root / "exports" / "manifest.csv"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        headers = ["id", "smiles", "inchikey", "admet_status", "admet_reason", "sdf_status", "sdf_path", "sdf_reason", "pdbqt_status", "pdbqt_path", "pdbqt_reason", "vina_status", "vina_score", "vina_pose", "vina_reason", "config_hash", "receptor_sha1", "tools_rdkit", "tools_meeko", "tools_vina", "created_at", "updated_at"]
+        with self.repository.connection() as conn:
+            parents = conn.execute("""SELECT p.*, COALESCE(s.decision, '') decision, COALESCE(s.reason, '') screening_reason,
+                COALESCE(s.status, '') screening_status FROM parent_ligands p LEFT JOIN screening_results s USING(parent_id)
+                ORDER BY p.parent_id""").fetchall()
+            rows = []
+            for parent in parents:
+                states = conn.execute("""SELECT s.*, c.status conformer_status, a.relative_path sdf_path
+                    FROM molecular_states s LEFT JOIN conformers c ON c.state_id=s.state_id
+                    LEFT JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id WHERE s.parent_id=?""", (parent["parent_id"],)).fetchall()
+                poses = conn.execute("""SELECT p.affinity, d.receptor_hash, raw.relative_path pose_path, d.settings_fingerprint
+                    FROM docking_poses p JOIN docking_runs d ON d.run_id=p.run_id
+                    LEFT JOIN artifacts raw ON raw.artifact_id=d.raw_output_artifact_id
+                    JOIN molecular_states s ON s.state_id=d.state_id WHERE s.parent_id=? AND d.is_current=1 ORDER BY p.affinity LIMIT 1""", (parent["parent_id"],)).fetchone()
+                rows.append({
+                    "id": parent["parent_id"], "smiles": parent["source_smiles"], "inchikey": parent["parent_inchikey"] or "",
+                    "admet_status": parent["screening_status"], "admet_reason": parent["screening_reason"],
+                    "sdf_status": "DONE" if states else "", "sdf_path": ";".join(str(s["sdf_path"] or "") for s in states), "sdf_reason": "",
+                    "pdbqt_status": "DONE" if states and all(s["conformer_status"] == "pdbqt_ready" for s in states) else "", "pdbqt_path": "", "pdbqt_reason": "",
+                    "vina_status": "DONE" if poses else "", "vina_score": poses["affinity"] if poses else "", "vina_pose": poses["pose_path"] if poses else "", "vina_reason": "",
+                    "config_hash": poses["settings_fingerprint"] if poses else "", "receptor_sha1": poses["receptor_hash"] if poses else "",
+                    "tools_rdkit": "RDKit", "tools_meeko": "Meeko", "tools_vina": "Vina", "created_at": parent["created_at"], "updated_at": parent["created_at"],
+                })
+        with output.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=headers)
+            writer.writeheader(); writer.writerows(rows)
+        QMessageBox.information(self, "Export complete", f"Wrote {output}")
+
+    def _export_leaderboard(self) -> None:
+        if not self.repository:
+            return
+        output = self.repository.root / "exports" / "leaderboard.csv"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with self.repository.connection() as conn:
+            rows = conn.execute("""SELECT parent_id, state_id, mode_index, affinity, rmsd_lb, rmsd_ub, run_id, pose_rank
+                FROM (SELECT s.parent_id, s.state_id, p.mode_index, p.affinity, p.rmsd_lb, p.rmsd_ub, d.run_id,
+                    ROW_NUMBER() OVER (PARTITION BY s.parent_id ORDER BY p.affinity ASC) pose_rank
+                    FROM docking_poses p JOIN docking_runs d ON d.run_id=p.run_id
+                    JOIN molecular_states s ON s.state_id=d.state_id WHERE d.is_current=1)
+                WHERE pose_rank <= 3 ORDER BY affinity ASC, parent_id, pose_rank""").fetchall()
+        headers = ["parent_id", "state_id", "mode_index", "affinity", "rmsd_lb", "rmsd_ub", "run_id", "pose_rank"]
+        with output.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=headers)
+            writer.writeheader(); writer.writerows([dict(row) for row in rows])
+        QMessageBox.information(self, "Export complete", f"Wrote {output}")
+
+    def _screening_tab(self, values: dict[str, object]) -> QWidget:
+        form = QFormLayout()
+        policy = QComboBox()
+        policy.addItem("Annotate only", "annotate_only")
+        policy.addItem("Exclude failing all selected rules", "exclude_failing_all")
+        policy.addItem("Exclude failing any selected rule", "exclude_failing_any")
+        policy.addItem("Manual review", "manual_review")
+        policy.setCurrentIndex(max(0, policy.findData(values.get("policy", "annotate_only"))))
+        self.fields["screening.policy"] = policy
+        form.addRow("Policy", policy)
+        for key, label in (("lipinski", "Lipinski"), ("veber", "Veber"), ("egan", "Egan"), ("ghose", "Ghose")):
+            box = QCheckBox(label)
+            box.setChecked(bool(values.get(key, key in ("lipinski", "veber"))))
+            self.fields[f"screening.{key}"] = box
+            form.addRow("Rule", box)
+        widget = QWidget(); widget.setLayout(form); return widget
+
+    def _molscrub_tab(self, values: dict[str, object]) -> QWidget:
+        form = QFormLayout()
+        self._double(form, "pH", "molscrub.ph", values.get("ph", 7.4), 0, 14)
+        enumerate_box = QCheckBox("Enumerate molecular states")
+        enumerate_box.setChecked(bool(values.get("enumerate_states", True)))
+        self.fields["molscrub.enumerate_states"] = enumerate_box
+        form.addRow("", enumerate_box)
+        self._integer(form, "Maximum states", "molscrub.max_states", values.get("max_states", 32), 1, 10000)
+        widget = QWidget(); widget.setLayout(form); return widget
+
+    def _meeko_tab(self, values: dict[str, object]) -> QWidget:
+        form = QFormLayout()
+        self._integer(form, "Parallel workers", "meeko.workers", values.get("workers", 4), 1, 32)
+        widget = QWidget(); widget.setLayout(form); return widget
+
+    def _vina_tab(self, values: dict[str, object]) -> QWidget:
+        form = QFormLayout()
+        self._line(form, "Receptor", "vina.receptor", values.get("receptor", "inputs/receptor_prepared.pdbqt"))
+        for key in ("center_x", "center_y", "center_z", "size_x", "size_y", "size_z"):
+            self._double(form, key.replace("_", " ").title(), f"vina.{key}", values.get(key, 0.0 if key.startswith("center") else 20.0))
+        self._integer(form, "Exhaustiveness", "vina.exhaustiveness", values.get("exhaustiveness", 8), 1, 10000)
+        self._integer(form, "Number of modes", "vina.num_modes", values.get("num_modes", 9), 1, 100)
+        self._double(form, "Energy range", "vina.energy_range", values.get("energy_range", 3), 0, 100)
+        self._integer(form, "Random seed", "vina.seed", values.get("seed", 42), 0, 2147483647)
+        self._integer(form, "CPU count", "vina.cpu_count", values.get("cpu_count", 1), 1, 256)
+        widget = QWidget(); widget.setLayout(form); return widget
+
+    def _postdock_tab(self, values: dict[str, object]) -> QWidget:
+        form = QFormLayout()
+        mode = QComboBox()
+        mode.addItem("Split only", "split_only")
+        mode.addItem("Split and convert to SDF", "split_and_sdf")
+        mode.addItem("Convert multi-pose output to SDF", "sdf_only")
+        mode.setCurrentIndex(max(0, mode.findData(values.get("mode", "split_and_sdf"))))
+        self.fields["postdock.mode"] = mode
+        form.addRow("Operation", mode)
+        self._integer(form, "Poses per compound", "postdock.poses_per_compound", values.get("poses_per_compound", 3), 1, 100)
+        selector = QPushButton("Select successfully docked compounds")
+        selector.clicked.connect(self._select_compounds)
+        self.fields["postdock.selected_parents"] = list(values.get("selected_parents", []))
+        form.addRow("Compounds", selector)
+        self.postdock_selection_label = QLabel(self._selection_text())
+        form.addRow("Selection", self.postdock_selection_label)
+        widget = QWidget(); widget.setLayout(form); return widget
+
+    def _selection_text(self) -> str:
+        selected = self.fields.get("postdock.selected_parents", [])
+        return "All successfully docked compounds" if not selected else f"{len(selected)} compounds selected"
+
+    def _select_compounds(self) -> None:
+        if not self.repository:
+            return
+        with self.repository.connection() as conn:
+            rows = conn.execute("""SELECT s.parent_id, MIN(p.affinity) best_affinity FROM docking_runs d
+                JOIN molecular_states s ON s.state_id=d.state_id JOIN docking_poses p ON p.run_id=d.run_id
+                WHERE d.status='completed' AND d.is_current=1 GROUP BY s.parent_id ORDER BY best_affinity ASC, s.parent_id""").fetchall()
+        dialog = CompoundSelectorDialog(rows, set(self.fields.get("postdock.selected_parents", [])), self.repository, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.fields["postdock.selected_parents"] = dialog.selected()
+            self.postdock_selection_label.setText(self._selection_text())
 
     def _line(self, form: QFormLayout, label: str, key: str, value: object) -> None:
         field = QLineEdit(str(value))
@@ -314,13 +688,60 @@ class DockingSettingsDialog(QDialog):
         self.fields[key] = field
         form.addRow(label, field)
 
-    def values(self) -> dict[str, object]:
-        values: dict[str, object] = {}
+    def values(self) -> dict[str, dict[str, object]]:
+        values: dict[str, dict[str, object]] = {"screening": {}, "molscrub": {}, "meeko": {}, "vina": {}, "postdock": {}}
         for key, field in self.fields.items():
             if isinstance(field, QLineEdit):
-                values[key] = field.text().strip()
+                value = field.text().strip()
             elif isinstance(field, QDoubleSpinBox):
-                values[key] = field.value()
+                value = field.value()
+            elif isinstance(field, QCheckBox):
+                value = field.isChecked()
+            elif isinstance(field, QComboBox):
+                value = field.currentData()
             else:
-                values[key] = field.value()
+                value = field.value()
+            section, name = key.split(".", 1)
+            values[section][name] = value
         return values
+
+
+class CompoundSelectorDialog(QDialog):
+    def __init__(self, compounds: list[object], selected: set[str], repository: ProjectRepository, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Select Docked Compounds")
+        self.table = QTableWidget(len(compounds), 4)
+        self.table.setHorizontalHeaderLabels(["", "ID", "Vina score", "Exported Status"])
+        self.table.setSortingEnabled(False)
+        for row_index, compound in enumerate(compounds):
+            parent_id = str(compound["parent_id"])
+            check = QTableWidgetItem()
+            check.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            check.setCheckState(Qt.CheckState.Checked if parent_id in selected else Qt.CheckState.Unchecked)
+            self.table.setItem(row_index, 1, QTableWidgetItem(parent_id))
+            self.table.setItem(row_index, 2, QTableWidgetItem(f"{float(compound['best_affinity']):.3f}"))
+            exported = any((repository.root / folder / parent_id).exists() for folder in ("For_PostDocking/SDF", "For_PostDocking/PDBQTs"))
+            status = QTableWidgetItem("Exported" if exported else "Not exported")
+            if exported:
+                check.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                check.setCheckState(Qt.CheckState.Unchecked)
+            self.table.setItem(row_index, 0, check)
+            self.table.setItem(row_index, 3, status)
+        self.table.resizeColumnsToContents()
+        self.table.setSortingEnabled(True)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.table)
+        if not compounds:
+            layout.addWidget(QLabel("No successfully docked compounds are available."))
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected(self) -> list[str]:
+        selected = []
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item and item.checkState() == Qt.CheckState.Checked:
+                selected.append(self.table.item(row, 1).text())
+        return selected

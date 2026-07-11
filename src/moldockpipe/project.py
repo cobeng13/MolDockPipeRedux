@@ -35,13 +35,15 @@ class ProjectRepository:
     def create(cls, root: Path, name: str | None = None) -> "ProjectRepository":
         root = root.resolve()
         root.mkdir(parents=True, exist_ok=True)
-        for relative in ("inputs", "artifacts/sdf", "artifacts/pdbqt", "artifacts/docking", "logs", "exports", "tools/vina"):
+        for relative in ("inputs", "artifacts/sdf", "artifacts/pdbqt", "artifacts/docking", "logs", "exports", "For_PostDocking", "tools/vina"):
             (root / relative).mkdir(parents=True, exist_ok=True)
         config = {
             "name": name or root.name,
             "schema_version": SCHEMA_VERSION,
             "screening": {"policy": ScreeningPolicy.ANNOTATE_ONLY.value, "lipinski": True, "veber": True, "egan": False, "ghose": False},
             "molscrub": {"ph": 7.4, "enumerate_states": True, "max_states": 32, "stereochemistry_policy": "warn_and_continue", "fragment_policy": "manual_review"},
+            "meeko": {"workers": 4},
+            "postdock": {"mode": "split_and_sdf", "poses_per_compound": 3, "selected_parents": []},
             "vina": {"receptor": "inputs/receptor_prepared.pdbqt", "center_x": 0.0, "center_y": 0.0, "center_z": 0.0, "size_x": 20.0, "size_y": 20.0, "size_z": 20.0, "exhaustiveness": 8, "num_modes": 9, "energy_range": 3, "seed": 42, "cpu_count": 1},
         }
         (root / "project.yml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
@@ -161,11 +163,16 @@ class ProjectRepository:
 
     def add_artifact(self, path: Path, artifact_type: str, stage: str, validation_status: str = "valid") -> str:
         path = path.resolve()
-        artifact_id = str(uuid.uuid4())
         relative = path.relative_to(self.root).as_posix()
+        digest = file_sha256(path)
         with self.connection() as conn:
-            conn.execute("INSERT INTO artifacts VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)", (artifact_id, relative, file_sha256(path), path.stat().st_size, artifact_type, stage, validation_status, utc_now()))
-        return artifact_id
+            existing = conn.execute("SELECT artifact_id FROM artifacts WHERE relative_path=?", (relative,)).fetchone()
+            artifact_id = existing[0] if existing else str(uuid.uuid4())
+            conn.execute("""INSERT INTO artifacts(artifact_id,relative_path,sha256,size_bytes,artifact_type,created_stage,validation_status,active,created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+                ON CONFLICT(relative_path) DO UPDATE SET sha256=excluded.sha256,size_bytes=excluded.size_bytes,
+                artifact_type=excluded.artifact_type,created_stage=excluded.created_stage,validation_status=excluded.validation_status,active=1""", (artifact_id, relative, digest, path.stat().st_size, artifact_type, stage, validation_status, utc_now()))
+            return artifact_id
 
     def recover_interrupted_runs(self) -> int:
         with self.connection() as conn:

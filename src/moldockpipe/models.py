@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Any, Callable
 
 
 class StageStatus(StrEnum):
@@ -28,3 +29,19 @@ class Artifact:
     sha256: str
     size: int
     kind: str
+
+
+@dataclass(frozen=True)
+class ProgressEvent:
+    event: str
+    stage: str
+    item_id: str | None = None
+    index: int = 0
+    total: int = 0
+    succeeded: int = 0
+    skipped: int = 0
+    failed: int = 0
+    message: str = ""
+
+
+ProgressCallback = Callable[[ProgressEvent], None]
