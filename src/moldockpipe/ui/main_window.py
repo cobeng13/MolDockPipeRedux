@@ -72,7 +72,7 @@ class MainWindow(QMainWindow):
         export_menu.addAction("Manifest CSV", self.export_manifest_csv)
         export_menu.addAction("Leaderboard CSV", self.export_leaderboard_csv)
         export_menu.addSeparator()
-        export_menu.addAction("Export docked compounds (PDBQT/SDF)", self.select_compounds_for_export)
+        self.docked_export_action = export_menu.addAction("Export docked compounds (PDBQT/SDF)", self.select_compounds_for_export)
         export_button.setMenu(export_menu)
         export_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         toolbar.addWidget(export_button)
@@ -276,7 +276,6 @@ class MainWindow(QMainWindow):
     def _refresh_checkpoint_state(self) -> None:
         if not self.repo:
             return
-        postdock_was_complete = self.overall_progress.states.get("postdock") == "complete"
         with self.repo.connection() as conn:
             parents = conn.execute("SELECT COUNT(*) FROM parent_ligands").fetchone()[0]
             screened = conn.execute("SELECT COUNT(*) FROM screening_results WHERE status IN ('completed','failed')").fetchone()[0]
@@ -286,8 +285,6 @@ class MainWindow(QMainWindow):
             meeko_terminal = conn.execute("SELECT COUNT(*) FROM conformers WHERE status IN ('pdbqt_ready','pdbqt_failed')").fetchone()[0]
             docked = conn.execute("SELECT COUNT(DISTINCT state_id) FROM docking_runs WHERE status='completed' AND is_current=1").fetchone()[0]
             docking_terminal = conn.execute("SELECT COUNT(DISTINCT state_id) FROM docking_runs WHERE status IN ('completed','failed','interrupted')").fetchone()[0]
-            postdock_done = conn.execute("SELECT COUNT(*) FROM artifacts WHERE created_stage='postdock' AND active=1").fetchone()[0]
-        postdock_done = postdock_done or int(any((self.repo.root / "For_PostDocking").rglob("*.pdbqt"))) or int(any((self.repo.root / "For_PostDocking").rglob("*.sdf")))
         self.overall_progress.reset()
         if parents and screened == parents:
             self.overall_progress.complete_stage("screening")
@@ -303,8 +300,6 @@ class MainWindow(QMainWindow):
             self.overall_progress.complete_stage("vina")
         elif docked:
             self.overall_progress.start_stage("vina")
-        if postdock_done or postdock_was_complete:
-            self.overall_progress.complete_stage("postdock")
         self._update_dashboard(parents, screened, states, prepared, docked)
 
     def _update_dashboard(self, parents: int, screened: int, states: int, prepared: int, docked: int) -> None:
@@ -326,12 +321,18 @@ class MainWindow(QMainWindow):
                 FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id
                 LEFT JOIN docking_poses p ON p.run_id=d.run_id
                 WHERE d.status IN ('failed','interrupted') GROUP BY d.run_id, s.state_id ORDER BY s.state_id LIMIT 6""").fetchall()
+            docked_parents = [row[0] for row in conn.execute("""SELECT DISTINCT s.parent_id
+                FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id
+                WHERE d.status='completed' AND d.is_current=1""").fetchall()]
         self.stat_cards["ligands"].setText(str(parents))
         self.stat_cards["passed"].setText(str(passed))
         self.stat_cards["failed"].setText(str(failed))
         self.stat_cards["running"].setText(self.current_stage_label.text() if self.stage_running else "Idle")
         self.project_summary.setText(f"{self.repo.root.name}\n{self.repo.root}")
-        export_status = "Complete" if self.overall_progress.states.get("postdock") == "complete" else "Ready" if docked else "Pending"
+        exported_root = self.repo.root / "For_PostDocking"
+        ready_for_export = [parent_id for parent_id in docked_parents if not any((exported_root / folder / parent_id).exists() for folder in ("SDF", "PDBQTs"))]
+        export_status = "Ready" if ready_for_export else "Pending"
+        self.docked_export_action.setEnabled(bool(ready_for_export))
         labels = {
             "screening": f"Screening\n{passed} passed; {failed} failed",
             "molscrub": f"States\n{states} generated",
@@ -344,6 +345,8 @@ class MainWindow(QMainWindow):
             icon = "✓" if status == "complete" else "⟳" if status == "active" else "○"
             button.setText(f"{icon} {labels[stage]}")
             button.setToolTip(labels[stage].replace("\n", "\n"))
+            if stage == "postdock":
+                button.setEnabled(bool(ready_for_export))
             if status == "complete":
                 button.setStyleSheet("QPushButton { color: #166534; background: #dcfce7; border: 1px solid #86efac; }")
             elif status == "active":
