@@ -40,15 +40,21 @@ The CSV columns are:
 id,smiles,notes,params_json
 ```
 
+`id` must be a stable, unique identifier. Re-importing the CSV synchronizes the
+project incrementally: unchanged compounds retain their results, new compounds
+are added as pending, changed compounds are reprocessed from screening, and
+compounds removed from the CSV are archived rather than deleted. CSV rows with
+missing or duplicate IDs are rejected without changing the project.
+
 Place the prepared receptor at:
 
 ```text
 project/inputs/receptor_prepared.pdbqt
 ```
 
-Opening a project automatically loads `inputs/input.csv` when no ligand set is
-already present. Importing another CSV explicitly replaces the current ligand
-set after confirmation.
+Opening a project automatically loads `inputs/input.csv` when no active ligand
+set is already present. Importing another CSV synchronizes it with the current
+ligand set after confirmation when changes or archived compounds are detected.
 
 ## Workflow
 

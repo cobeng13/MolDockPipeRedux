@@ -38,7 +38,7 @@ class PipelineRunner:
             raise RuntimeError("RDKit must be installed before screening") from exc
         completed = failed = 0
         with self.repository.connection() as conn:
-            parents = conn.execute("SELECT parent_id, source_smiles FROM parent_ligands ORDER BY parent_id").fetchall()
+            parents = conn.execute("SELECT parent_id, source_smiles FROM parent_ligands WHERE active=1 ORDER BY parent_id").fetchall()
         self._emit("stage_started", "screening", total=len(parents))
         skipped = 0
         for index, parent in enumerate(parents, 1):
@@ -46,7 +46,7 @@ class PipelineRunner:
             result = screen_smiles(parent["source_smiles"], enabled, policy)
             run_fingerprint = fingerprint(settings={"enabled": enabled, "policy": policy.value}, inputs={"smiles": parent["source_smiles"]}, tool_version=rdkit_version)
             with self.repository.connection() as conn:
-                previous = conn.execute("SELECT fingerprint,status FROM screening_results WHERE parent_id=?", (parent["parent_id"],)).fetchone()
+                previous = conn.execute("SELECT fingerprint,status FROM screening_results WHERE parent_id=? AND active=1", (parent["parent_id"],)).fetchone()
             if previous and previous["fingerprint"] == run_fingerprint and previous["status"] == StageStatus.COMPLETED:
                 skipped += 1
                 completed += 1
@@ -56,7 +56,9 @@ class PipelineRunner:
             with self.repository.connection() as conn:
                 conn.execute("INSERT INTO stage_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (run_id, "screening", "parent", parent["parent_id"], run_fingerprint, StageStatus.RUNNING, utc_now(), None, None))
                 conn.execute("UPDATE parent_ligands SET canonical_source_smiles=?, parent_inchikey=?, parse_status=?, parse_reason=? WHERE parent_id=?", (result.canonical_smiles, result.inchikey, StageStatus.COMPLETED if result.decision != "fail" else StageStatus.FAILED, result.reason, parent["parent_id"]))
-                conn.execute("""INSERT OR REPLACE INTO screening_results VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                conn.execute("""INSERT OR REPLACE INTO screening_results
+                    (parent_id, fingerprint, status, descriptors_json, rules_json, decision, reason, created_at, active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
                     """, (parent["parent_id"], run_fingerprint, StageStatus.COMPLETED if result.decision != "fail" else StageStatus.FAILED, json.dumps(result.descriptors), json.dumps(result.rules), result.decision, result.reason, utc_now()))
                 conn.execute("UPDATE stage_runs SET status=?, ended_at=?, reason=? WHERE stage_run_id=?", (StageStatus.COMPLETED if result.decision != "fail" else StageStatus.FAILED, utc_now(), result.reason, run_id))
             if result.decision == "fail":
@@ -76,7 +78,8 @@ class PipelineRunner:
         policy = screening.get("policy", ScreeningPolicy.ANNOTATE_ONLY.value)
         with self.repository.connection() as conn:
             rows = conn.execute("""SELECT p.parent_id, p.source_smiles, s.decision FROM parent_ligands p
-                LEFT JOIN screening_results s USING(parent_id) ORDER BY p.parent_id""").fetchall()
+                LEFT JOIN screening_results s ON s.parent_id=p.parent_id AND s.active=1
+                WHERE p.active=1 ORDER BY p.parent_id""").fetchall()
         allowed = [row for row in rows if row["decision"] not in ("fail", None) or policy == ScreeningPolicy.ANNOTATE_ONLY.value]
         service = MolScrubService()
         created = failed = skipped = 0
@@ -85,7 +88,7 @@ class PipelineRunner:
             self._emit("item_started", "molscrub", row["parent_id"], index, len(allowed))
             with self.repository.connection() as conn:
                 existing = conn.execute("""SELECT COUNT(*) FROM molecular_states s JOIN conformers c ON c.state_id=s.state_id
-                    JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id WHERE s.parent_id=? AND c.status IN ('ready','pdbqt_ready') AND a.active=1""", (row["parent_id"],)).fetchone()[0]
+                    JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id WHERE s.parent_id=? AND s.active=1 AND c.status IN ('ready','pdbqt_ready') AND a.active=1""", (row["parent_id"],)).fetchone()[0]
             if existing:
                 created += existing
                 skipped += 1
@@ -134,10 +137,10 @@ class PipelineRunner:
         settings = self.repository.get_settings().get("meeko", {})
         workers = max(1, min(32, int(settings.get("workers", 4))))
         with self.repository.connection() as conn:
-            all_states = conn.execute("SELECT COUNT(*) FROM molecular_states").fetchone()[0]
+            all_states = conn.execute("SELECT COUNT(*) FROM molecular_states WHERE active=1").fetchone()[0]
             rows = conn.execute("""SELECT s.state_id, s.parent_id, c.conformer_id, a.relative_path
                 FROM molecular_states s JOIN conformers c ON c.state_id=s.state_id
-                JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id WHERE c.status='ready'
+                JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id WHERE s.active=1 AND c.status='ready' AND a.active=1
                 ORDER BY s.parent_id, s.state_id""").fetchall()
         self._emit("stage_started", "meeko", total=len(rows))
         skipped = max(0, all_states - len(rows))
@@ -202,7 +205,7 @@ class PipelineRunner:
             states = conn.execute("""SELECT s.state_id, s.parent_id, a.relative_path
                 FROM molecular_states s JOIN conformers c ON c.state_id=s.state_id
                 JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id
-                WHERE c.status='pdbqt_ready' ORDER BY s.parent_id, s.state_id""").fetchall()
+                WHERE s.active=1 AND c.status='pdbqt_ready' AND a.active=1 ORDER BY s.parent_id, s.state_id""").fetchall()
             pdbqt_artifacts = {row["relative_path"].split("/")[-3]: row for row in conn.execute("SELECT artifact_id, relative_path FROM artifacts WHERE artifact_type='ligand_pdbqt' AND active=1")}
         backend = VinaDockingBackend()
         succeeded = failed = 0
@@ -261,7 +264,7 @@ class PipelineRunner:
             runs = conn.execute("""SELECT d.run_id, s.parent_id, s.state_id, a.relative_path raw_path
                 FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id
                 JOIN artifacts a ON a.artifact_id=d.raw_output_artifact_id
-                WHERE d.status='completed' AND d.is_current=1 ORDER BY s.parent_id, s.state_id""").fetchall()
+                WHERE d.status='completed' AND d.is_current=1 AND s.active=1 ORDER BY s.parent_id, s.state_id""").fetchall()
         if selected:
             runs = [run for run in runs if run["parent_id"] in selected]
         self._emit("stage_started", "postdock", total=len(runs))
