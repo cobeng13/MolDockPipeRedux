@@ -42,6 +42,8 @@ class ProgressEvent:
     skipped: int = 0
     failed: int = 0
     message: str = ""
+    receptor_profile_id: str | None = None
+    receptor_profile_name: str | None = None
 
 
 ProgressCallback = Callable[[ProgressEvent], None]

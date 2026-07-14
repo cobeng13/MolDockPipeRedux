@@ -29,7 +29,6 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._screening_tab(settings.get("screening", {})), "Screening")
         tabs.addTab(self._molscrub_tab(settings.get("molscrub", {})), "MolScrub")
         tabs.addTab(self._meeko_tab(settings.get("meeko", {})), "Meeko")
-        tabs.addTab(self._vina_tab(settings.get("vina", {})), "Docking")
         tabs.addTab(self._postdock_tab(settings.get("postdock", {})), "Post-docking")
         tabs.addTab(self._workflow_maintenance_tab(), "Workflow Maintenance")
         layout = QVBoxLayout(self)
@@ -67,57 +66,63 @@ class SettingsDialog(QDialog):
     def _export_manifest(self) -> None:
         if not self.repository:
             return
-        output = self.repository.root / "exports" / "manifest.csv"
-        output.parent.mkdir(parents=True, exist_ok=True)
-        headers = ["id", "smiles", "inchikey", "admet_status", "admet_reason", "sdf_status", "sdf_path", "sdf_reason", "pdbqt_status", "pdbqt_path", "pdbqt_reason", "vina_status", "vina_score", "vina_pose", "vina_reason", "config_hash", "receptor_sha1", "tools_rdkit", "tools_meeko", "tools_vina", "created_at", "updated_at"]
+        profiles = self.repository.get_receptor_profiles(include_archived=True)
+        headers = ["receptor_id", "receptor_name", "id", "smiles", "inchikey", "admet_status", "admet_reason", "sdf_status", "sdf_path", "sdf_reason", "pdbqt_status", "pdbqt_path", "pdbqt_reason", "vina_status", "vina_score", "vina_pose", "vina_reason", "config_hash", "receptor_sha1", "tools_rdkit", "tools_meeko", "tools_vina", "created_at", "updated_at"]
         with self.repository.connection() as conn:
             parents = conn.execute("""SELECT p.*, COALESCE(s.reason, '') screening_reason,
                 COALESCE(s.status, '') screening_status FROM parent_ligands p
                 LEFT JOIN screening_results s ON s.parent_id=p.parent_id AND s.active=1
                 WHERE p.active=1 ORDER BY p.parent_id""").fetchall()
-            rows = []
-            for parent in parents:
-                states = conn.execute("""SELECT s.*, c.status conformer_status, a.relative_path sdf_path
-                    FROM molecular_states s LEFT JOIN conformers c ON c.state_id=s.state_id
-                    LEFT JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id WHERE s.parent_id=? AND s.active=1""", (parent["parent_id"],)).fetchall()
-                pose = conn.execute("""SELECT p.affinity, d.receptor_hash, raw.relative_path pose_path, d.settings_fingerprint
-                    FROM docking_poses p JOIN docking_runs d ON d.run_id=p.run_id
-                    LEFT JOIN artifacts raw ON raw.artifact_id=d.raw_output_artifact_id
-                    JOIN molecular_states s ON s.state_id=d.state_id
-                    WHERE s.parent_id=? AND s.active=1 AND d.is_current=1 ORDER BY p.affinity LIMIT 1""", (parent["parent_id"],)).fetchone()
-                rows.append({
-                    "id": parent["parent_id"], "smiles": parent["source_smiles"], "inchikey": parent["parent_inchikey"] or "",
-                    "admet_status": parent["screening_status"], "admet_reason": parent["screening_reason"],
-                    "sdf_status": "DONE" if states else "", "sdf_path": ";".join(str(s["sdf_path"] or "") for s in states), "sdf_reason": "",
-                    "pdbqt_status": "DONE" if states and all(s["conformer_status"] == "pdbqt_ready" for s in states) else "", "pdbqt_path": "", "pdbqt_reason": "",
-                    "vina_status": "DONE" if pose else "", "vina_score": pose["affinity"] if pose else "", "vina_pose": pose["pose_path"] if pose else "", "vina_reason": "",
-                    "config_hash": pose["settings_fingerprint"] if pose else "", "receptor_sha1": pose["receptor_hash"] if pose else "",
-                    "tools_rdkit": "RDKit", "tools_meeko": "Meeko", "tools_vina": "Vina", "created_at": parent["created_at"], "updated_at": parent["created_at"],
-                })
-        with output.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=headers)
-            writer.writeheader(); writer.writerows(rows)
-        QMessageBox.information(self, "Export complete", f"Wrote {output}")
+            for profile in profiles:
+                profile_id = str(profile["id"]); rows = []
+                for parent in parents:
+                    states = conn.execute("""SELECT s.*, c.status conformer_status, a.relative_path sdf_path
+                        FROM molecular_states s LEFT JOIN conformers c ON c.state_id=s.state_id
+                        LEFT JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id WHERE s.parent_id=? AND s.active=1""", (parent["parent_id"],)).fetchall()
+                    run = conn.execute("""SELECT d.*, raw.relative_path pose_path, p.affinity
+                        FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id
+                        LEFT JOIN docking_poses p ON p.run_id=d.run_id
+                        LEFT JOIN artifacts raw ON raw.artifact_id=d.raw_output_artifact_id
+                        WHERE s.parent_id=? AND s.active=1 AND d.receptor_profile_id=? AND d.is_current=1
+                        ORDER BY (p.affinity IS NULL), p.affinity LIMIT 1""", (parent["parent_id"], profile_id)).fetchone()
+                    rows.append({
+                        "receptor_id": profile_id, "receptor_name": profile.get("name", profile_id),
+                        "id": parent["parent_id"], "smiles": parent["source_smiles"], "inchikey": parent["parent_inchikey"] or "",
+                        "admet_status": parent["screening_status"], "admet_reason": parent["screening_reason"],
+                        "sdf_status": "DONE" if states else "", "sdf_path": ";".join(str(s["sdf_path"] or "") for s in states), "sdf_reason": "",
+                        "pdbqt_status": "DONE" if states and all(s["conformer_status"] == "pdbqt_ready" for s in states) else "", "pdbqt_path": "", "pdbqt_reason": "",
+                        "vina_status": run["status"] if run else "", "vina_score": run["affinity"] if run and run["affinity"] is not None else "",
+                        "vina_pose": run["pose_path"] if run and run["pose_path"] else "", "vina_reason": run["reason"] if run and run["reason"] else "",
+                        "config_hash": run["settings_fingerprint"] if run else "", "receptor_sha1": run["receptor_hash"] if run else "",
+                        "tools_rdkit": "RDKit", "tools_meeko": "Meeko", "tools_vina": "Vina", "created_at": parent["created_at"], "updated_at": parent["created_at"],
+                    })
+                output = self.repository.root / "exports" / profile_id / "manifest.csv"
+                output.parent.mkdir(parents=True, exist_ok=True)
+                with output.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=headers); writer.writeheader(); writer.writerows(rows)
+        QMessageBox.information(self, "Export complete", f"Wrote manifests for {len(profiles)} receptor profiles")
 
     def _export_leaderboard(self) -> None:
         if not self.repository:
             return
-        output = self.repository.root / "exports" / "leaderboard.csv"
-        output.parent.mkdir(parents=True, exist_ok=True)
+        profiles = self.repository.get_receptor_profiles(include_archived=True)
+        headers = ["receptor_id", "receptor_name", "parent_id", "state_id", "mode_index", "affinity", "rmsd_lb", "rmsd_ub", "run_id", "pose_rank"]
         with self.repository.connection() as conn:
-            rows = conn.execute("""SELECT parent_id, state_id, mode_index, affinity, rmsd_lb, rmsd_ub, run_id, pose_rank
-                FROM (SELECT s.parent_id, s.state_id, p.mode_index, p.affinity, p.rmsd_lb, p.rmsd_ub, d.run_id,
-                    ROW_NUMBER() OVER (PARTITION BY s.parent_id ORDER BY p.affinity ASC) pose_rank
-                    FROM docking_poses p JOIN docking_runs d ON d.run_id=p.run_id
-                    JOIN molecular_states s ON s.state_id=d.state_id
-                    JOIN parent_ligands l ON l.parent_id=s.parent_id
-                    WHERE l.active=1 AND s.active=1 AND d.is_current=1)
-                WHERE pose_rank <= 3 ORDER BY affinity ASC, parent_id, pose_rank""").fetchall()
-        headers = ["parent_id", "state_id", "mode_index", "affinity", "rmsd_lb", "rmsd_ub", "run_id", "pose_rank"]
-        with output.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=headers)
-            writer.writeheader(); writer.writerows([dict(row) for row in rows])
-        QMessageBox.information(self, "Export complete", f"Wrote {output}")
+            for profile in profiles:
+                profile_id = str(profile["id"])
+                query_rows = conn.execute("""SELECT parent_id, state_id, mode_index, affinity, rmsd_lb, rmsd_ub, run_id, pose_rank
+                    FROM (SELECT s.parent_id, s.state_id, p.mode_index, p.affinity, p.rmsd_lb, p.rmsd_ub, d.run_id,
+                        ROW_NUMBER() OVER (PARTITION BY s.parent_id ORDER BY p.affinity ASC) pose_rank
+                        FROM docking_poses p JOIN docking_runs d ON d.run_id=p.run_id
+                        JOIN molecular_states s ON s.state_id=d.state_id JOIN parent_ligands l ON l.parent_id=s.parent_id
+                        WHERE l.active=1 AND s.active=1 AND d.is_current=1 AND d.status='completed' AND d.receptor_profile_id=?)
+                    WHERE pose_rank <= 3 ORDER BY affinity ASC, parent_id, pose_rank""", (profile_id,)).fetchall()
+                rows = [{"receptor_id": profile_id, "receptor_name": profile.get("name", profile_id), **dict(row)} for row in query_rows]
+                output = self.repository.root / "exports" / profile_id / "leaderboard.csv"
+                output.parent.mkdir(parents=True, exist_ok=True)
+                with output.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=headers); writer.writeheader(); writer.writerows(rows)
+        QMessageBox.information(self, "Export complete", f"Wrote leaderboards for {len(profiles)} receptor profiles")
 
     def _screening_tab(self, values: dict[str, object]) -> QWidget:
         form = QFormLayout()
@@ -127,7 +132,7 @@ class SettingsDialog(QDialog):
         policy.setCurrentIndex(max(0, policy.findData(values.get("policy", "annotate_only"))))
         self.fields["screening.policy"] = policy
         form.addRow("Policy", policy)
-        for key, label in (("lipinski", "Lipinski"), ("veber", "Veber"), ("egan", "Egan"), ("ghose", "Ghose")):
+        for key, label in (("lipinski", "Lipinski"), ("veber", "Veber"), ("egan", "Egan"), ("ghose", "Ghose"), ("boiled_egg", "BOILED-Egg (BBB/Yolk)")):
             box = QCheckBox(label)
             box.setChecked(bool(values.get(key, key in ("lipinski", "veber"))))
             self.fields[f"screening.{key}"] = box
@@ -180,11 +185,14 @@ class SettingsDialog(QDialog):
     def _select_compounds(self) -> None:
         if not self.repository:
             return
+        profile_ids = [str(profile["id"]) for profile in self.repository.get_receptor_profiles() if profile.get("enabled")]
+        placeholders = ",".join("?" for _ in profile_ids)
         with self.repository.connection() as conn:
-            rows = conn.execute("""SELECT s.parent_id, MIN(p.affinity) best_affinity FROM docking_runs d
+            rows = conn.execute(f"""SELECT s.parent_id, MIN(p.affinity) best_affinity FROM docking_runs d
                 JOIN molecular_states s ON s.state_id=d.state_id JOIN docking_poses p ON p.run_id=d.run_id
                 JOIN parent_ligands l ON l.parent_id=s.parent_id
-                WHERE l.active=1 AND s.active=1 AND d.status='completed' AND d.is_current=1 GROUP BY s.parent_id ORDER BY best_affinity ASC, s.parent_id""").fetchall()
+                WHERE l.active=1 AND s.active=1 AND d.status='completed' AND d.is_current=1
+                AND d.receptor_profile_id IN ({placeholders}) GROUP BY s.parent_id ORDER BY best_affinity ASC, s.parent_id""", profile_ids).fetchall() if profile_ids else []
         dialog = CompoundSelectorDialog(rows, set(self.fields.get("postdock.selected_parents", [])), self.repository, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.fields["postdock.selected_parents"] = dialog.selected()
@@ -210,7 +218,7 @@ class SettingsDialog(QDialog):
         form.addRow(label, field)
 
     def values(self) -> dict[str, dict[str, object]]:
-        values: dict[str, dict[str, object]] = {"screening": {}, "molscrub": {}, "meeko": {}, "vina": {}, "postdock": {}}
+        values: dict[str, dict[str, object]] = {"screening": {}, "molscrub": {}, "meeko": {}, "postdock": {}}
         values["postdock"]["selected_parents"] = list(self.settings.get("postdock", {}).get("selected_parents", []))
         for key, field in self.fields.items():
             if isinstance(field, QLineEdit):

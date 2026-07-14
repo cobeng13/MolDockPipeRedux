@@ -10,7 +10,7 @@ from ..models import ScreeningPolicy
 class ScreeningResult:
     canonical_smiles: str | None
     inchikey: str | None
-    descriptors: dict[str, float | int]
+    descriptors: dict[str, float | int | str]
     rules: dict[str, bool]
     decision: str
     reason: str
@@ -27,16 +27,22 @@ def screen_smiles(smiles: str, enabled_rules: dict[str, bool], policy: Screening
     molecule = Chem.MolFromSmiles(smiles)
     if molecule is None:
         return ScreeningResult(None, None, {}, {}, "fail", "RDKit could not parse or sanitize SMILES")
-    descriptors: dict[str, float | int] = {
+    descriptors: dict[str, float | int | str] = {
         "mw": round(Descriptors.MolWt(molecule), 2), "alogp": round(Crippen.MolLogP(molecule), 2),
         "tpsa": round(rdMolDescriptors.CalcTPSA(molecule), 2), "hbd": Lipinski.NumHDonors(molecule),
         "hba": Lipinski.NumHAcceptors(molecule), "rotatable_bonds": Lipinski.NumRotatableBonds(molecule),
     }
+    # Match the reference BOILED-Egg implementation: RDKit WLOGP (Crippen
+    # MolLogP) and TPSA classify BBB-likely compounds as the egg "YOLK".
+    yolk = descriptors["tpsa"] < 79.0 and 0.4 <= descriptors["alogp"] <= 6.0
+    white = descriptors["tpsa"] <= 130.0 and -0.4 <= descriptors["alogp"] <= 5.6
+    descriptors["boiled_egg"] = "YOLK" if yolk else "WHITE" if white else "GREY"
     rules = {
         "lipinski": descriptors["mw"] <= 500 and descriptors["alogp"] <= 5 and descriptors["hbd"] <= 5 and descriptors["hba"] <= 10,
         "veber": descriptors["tpsa"] <= 140 and descriptors["rotatable_bonds"] <= 10,
         "egan": descriptors["alogp"] <= 5.88 and descriptors["tpsa"] <= 131,
         "ghose": 160 <= descriptors["mw"] <= 480 and -0.4 <= descriptors["alogp"] <= 5.6,
+        "boiled_egg": yolk,
     }
     selected = [name for name, active in enabled_rules.items() if active]
     failed = [name for name in selected if not rules[name]]

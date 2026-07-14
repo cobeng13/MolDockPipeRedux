@@ -22,7 +22,9 @@ wheel into the same environment.
 
 ## Project Inputs
 
-Create a project from the UI or with:
+In the UI, New Project asks for a project name and creates it under `Projects/`
+in the application's current working folder. You can also create a portable
+project at an explicit location with:
 
 ```powershell
 moldockpipe create C:\path\to\project
@@ -46,10 +48,11 @@ are added as pending, changed compounds are reprocessed from screening, and
 compounds removed from the CSV are archived rather than deleted. CSV rows with
 missing or duplicate IDs are rejected without changing the project.
 
-Place the prepared receptor at:
+Use the ribbon **Receptors** manager to import one or more prepared receptor
+PDBQT files. Imported files are copied into the portable project:
 
 ```text
-project/inputs/receptor_prepared.pdbqt
+project/inputs/receptors/profile_id/receptor.pdbqt
 ```
 
 Opening a project automatically loads `inputs/input.csv` when no active ligand
@@ -82,12 +85,16 @@ the project is reopened.
 
 The **Settings** button contains tabs for:
 
-- Screening: policy and Lipinski, Veber, Egan, and Ghose rules.
+- Screening: policy and Lipinski, Veber, Egan, Ghose, and BOILED-Egg (BBB/Yolk) rules.
 - MolScrub: pH, state enumeration, and state limit.
 - Meeko: parallel worker count.
-- Docking: receptor, search box, exhaustiveness, modes, energy range, seed, and CPU count.
 - Post-docking: split/export mode, poses per compound, and successfully docked compound selection.
 - Guardrails: purge generated workflow data and export data.
+
+The separate **Receptors** manager contains each receptor's search box,
+exhaustiveness, modes, energy range, seed, and CPU count. Docking runs every
+enabled receptor sequentially against the same prepared ligand states. The
+**Results** window displays one ranked tab per receptor.
 
 ## Vina and Post-Docking Tools
 
@@ -112,8 +119,8 @@ shows export status, and prevents selecting compounds already exported.
 Outputs are organized as:
 
 ```text
-project/For_PostDocking/SDF/parent_id/state_id/run_id/
-project/For_PostDocking/PDBQTs/parent_id/state_id/run_id/
+project/For_PostDocking/profile_id/SDF/parent_id/state_id/run_id/
+project/For_PostDocking/profile_id/PDBQTs/parent_id/state_id/run_id/
 ```
 
 ## Exports and Test Reset
@@ -121,18 +128,11 @@ project/For_PostDocking/PDBQTs/parent_id/state_id/run_id/
 The ribbon **Export Data** menu writes:
 
 ```text
-project/exports/manifest.csv
-project/exports/leaderboard.csv
+project/exports/profile_id/manifest.csv
+project/exports/profile_id/leaderboard.csv
 ```
 
-The manifest follows the reference stage-oriented columns. The leaderboard contains
-the top three poses per parent compound, globally sorted by most-negative affinity.
-
-For a fast disposable test reset, use the Guardrails tab or:
-
-```powershell
-python Test_Bench/PURGE_TEST_PROJECT.py
-```
-
-The reset preserves inputs and `project.yml` while clearing generated artifacts,
-logs, exports, and SQLite workflow rows.
+Each manifest includes receptor identity and its reproducibility hashes. Each
+leaderboard contains the top three poses per parent compound for that receptor,
+sorted by most-negative affinity. Workflow Maintenance can clear generated data
+while preserving inputs and `project.yml`.

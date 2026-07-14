@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import platform
+import shutil
 import sqlite3
 import sys
 import uuid
@@ -18,7 +19,27 @@ from .fingerprints import file_sha256, fingerprint
 from .models import ScreeningPolicy, StageStatus
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+
+DEFAULT_VINA_PROFILE: dict[str, Any] = {
+    "id": "default",
+    "name": "Default",
+    "enabled": True,
+    "archived": False,
+    "receptor": "inputs/receptors/default/receptor.pdbqt",
+    "center_x": 0.0,
+    "center_y": 0.0,
+    "center_z": 0.0,
+    "size_x": 20.0,
+    "size_y": 20.0,
+    "size_z": 20.0,
+    "exhaustiveness": 8,
+    "num_modes": 9,
+    "energy_range": 3,
+    "seed": 42,
+    "cpu_count": 1,
+}
 
 
 @dataclass(frozen=True)
@@ -49,16 +70,16 @@ class ProjectRepository:
     def create(cls, root: Path, name: str | None = None) -> "ProjectRepository":
         root = root.resolve()
         root.mkdir(parents=True, exist_ok=True)
-        for relative in ("inputs", "artifacts/sdf", "artifacts/pdbqt", "artifacts/docking", "logs", "exports", "For_PostDocking", "tools/vina"):
+        for relative in ("inputs", "inputs/receptors/default", "artifacts/sdf", "artifacts/pdbqt", "artifacts/docking", "logs", "exports", "For_PostDocking", "tools/vina"):
             (root / relative).mkdir(parents=True, exist_ok=True)
         config = {
             "name": name or root.name,
             "schema_version": SCHEMA_VERSION,
-            "screening": {"policy": ScreeningPolicy.ANNOTATE_ONLY.value, "lipinski": True, "veber": True, "egan": False, "ghose": False},
+            "screening": {"policy": ScreeningPolicy.ANNOTATE_ONLY.value, "lipinski": True, "veber": True, "egan": False, "ghose": False, "boiled_egg": False},
             "molscrub": {"ph": 7.4, "enumerate_states": True, "max_states": 32, "stereochemistry_policy": "warn_and_continue", "fragment_policy": "manual_review"},
             "meeko": {"workers": 4},
             "postdock": {"mode": "split_and_sdf", "poses_per_compound": 3, "selected_parents": []},
-            "vina": {"receptor": "inputs/receptor_prepared.pdbqt", "center_x": 0.0, "center_y": 0.0, "center_z": 0.0, "size_x": 20.0, "size_y": 20.0, "size_z": 20.0, "exhaustiveness": 8, "num_modes": 9, "energy_range": 3, "seed": 42, "cpu_count": 1},
+            "vina": {"profiles": [dict(DEFAULT_VINA_PROFILE)]},
         }
         (root / "project.yml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
         repo = cls(root)
@@ -140,10 +161,61 @@ class ProjectRepository:
             self._ensure_column(conn, "parent_ligands", "archived_at", "TEXT")
             self._ensure_column(conn, "screening_results", "active", "INTEGER NOT NULL DEFAULT 1")
             self._ensure_column(conn, "molecular_states", "active", "INTEGER NOT NULL DEFAULT 1")
+            self._ensure_column(conn, "docking_runs", "receptor_profile_id", "TEXT NOT NULL DEFAULT 'default'")
+            self._ensure_column(conn, "docking_runs", "receptor_profile_name", "TEXT NOT NULL DEFAULT 'Default'")
+            self._ensure_column(conn, "docking_runs", "reason", "TEXT")
+            conn.execute("""WITH ranked AS (
+                    SELECT run_id, ROW_NUMBER() OVER (
+                        PARTITION BY state_id, receptor_profile_id
+                        ORDER BY CASE WHEN status='completed' THEN 0 ELSE 1 END,
+                                 COALESCE(ended_at, started_at, '') DESC, run_id DESC) rank
+                    FROM docking_runs WHERE is_current=1)
+                UPDATE docking_runs SET is_current=0 WHERE run_id IN (SELECT run_id FROM ranked WHERE rank>1)""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_docking_runs_profile_state ON docking_runs(receptor_profile_id, state_id, is_current)")
             for row in conn.execute("SELECT parent_id, source_smiles, notes, params_json FROM parent_ligands WHERE input_fingerprint IS NULL OR input_fingerprint='' ").fetchall():
                 conn.execute("UPDATE parent_ligands SET input_fingerprint=? WHERE parent_id=?", (self._input_fingerprint(row["source_smiles"], row["notes"], row["params_json"]), row["parent_id"]))
             conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)", (SCHEMA_VERSION, utc_now()))
             conn.execute("INSERT OR IGNORE INTO projects(project_id, name, root_path, created_at) VALUES (?, ?, ?, ?)", (str(uuid.uuid4()), self.root.name, str(self.root), utc_now()))
+        self._migrate_vina_profiles()
+
+    def _migrate_vina_profiles(self) -> None:
+        """Convert the legacy flat Vina block into a portable receptor profile."""
+        path = self.root / "project.yml"
+        if not path.exists():
+            return
+        config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        vina = dict(config.get("vina", {}) or {})
+        if isinstance(vina.get("profiles"), list):
+            if config.get("schema_version") != SCHEMA_VERSION:
+                config["schema_version"] = SCHEMA_VERSION
+                path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+            return
+        profile = dict(DEFAULT_VINA_PROFILE)
+        legacy_receptor = str(vina.get("receptor", "inputs/receptor_prepared.pdbqt"))
+        for key in ("center_x", "center_y", "center_z", "size_x", "size_y", "size_z", "exhaustiveness", "num_modes", "energy_range", "seed", "cpu_count"):
+            if key in vina:
+                profile[key] = vina[key]
+        source = self.root / legacy_receptor
+        destination = self.root / str(profile["receptor"])
+        if source.is_file() and source.resolve() != destination.resolve():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if not destination.exists():
+                shutil.copy2(source, destination)
+        config["schema_version"] = SCHEMA_VERSION
+        config["vina"] = {"profiles": [profile]}
+        path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+    def get_receptor_profiles(self, *, include_archived: bool = False) -> list[dict[str, Any]]:
+        profiles = self.get_settings().get("vina", {}).get("profiles", [])
+        if not isinstance(profiles, list):
+            return []
+        return [dict(profile) for profile in profiles if isinstance(profile, dict) and (include_archived or not profile.get("archived", False))]
+
+    def save_receptor_profiles(self, profiles: list[dict[str, Any]]) -> None:
+        path = self.root / "project.yml"
+        config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        config["vina"] = {"profiles": profiles}
+        path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:

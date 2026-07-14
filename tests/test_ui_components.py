@@ -5,6 +5,8 @@ import pytest
 try:
     from moldockpipe.ui.compound_selector import CompoundSelectorDialog
     from moldockpipe.ui.progress import CheckpointProgress
+    from moldockpipe.ui.receptor_manager import ReceptorManagerDialog, ReceptorProfileDialog
+    from moldockpipe.ui.results_dialog import DockingResultsDialog
     from moldockpipe.ui.settings_dialog import SettingsDialog
     from moldockpipe.ui.workers import PipelineWorker
     import moldockpipe.ui.workers as workers
@@ -16,6 +18,9 @@ def test_ui_components_import_and_expose_expected_contracts() -> None:
     assert SettingsDialog.workflow_reset is not None
     assert CompoundSelectorDialog.selected
     assert CheckpointProgress.STAGES == ("screening", "molscrub", "meeko", "vina", "postdock")
+    assert ReceptorManagerDialog is not None
+    assert ReceptorProfileDialog is not None
+    assert DockingResultsDialog is not None
 
 
 def test_pipeline_worker_routes_requested_stage(monkeypatch) -> None:

@@ -12,6 +12,7 @@ dist/
 !tools/vina/*.exe
 
 # User-created docking projects and generated scientific artifacts
+Test_Bench/
 projects/
 artifacts/
 project.sqlite
