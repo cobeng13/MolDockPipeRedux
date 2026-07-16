@@ -7,7 +7,7 @@ from PyQt6.QtCore import QThread, Qt
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QPushButton, QProgressBar, QSplitter, QStatusBar, QStyle, QTableWidget, QTableWidgetItem,
+    QPushButton, QProgressBar, QProgressDialog, QSplitter, QStatusBar, QStyle, QTableWidget, QTableWidgetItem,
     QTabWidget, QTextEdit, QToolBar, QToolButton, QVBoxLayout, QWidget, QMenu,
 )
 
@@ -17,6 +17,7 @@ from ..project import ProjectRepository
 from .compound_selector import CompoundSelectorDialog
 from .progress import CheckpointProgress
 from .receptor_manager import ReceptorManagerDialog
+from .receptor_wizard import ReceptorPreparationWizard, ReceptorPreparationWorker
 from .results_dialog import DockingResultsDialog
 from .settings_dialog import SettingsDialog
 from .workers import PipelineWorker
@@ -50,6 +51,15 @@ class MainWindow(QMainWindow):
         self.receptors_action = toolbar.addAction("Receptors")
         self.receptors_action.setEnabled(False)
         self.receptors_action.triggered.connect(self.manage_receptors)
+        tools_button = QToolButton()
+        tools_button.setText("Tools")
+        tools_menu = QMenu(tools_button)
+        self.prepare_receptor_action = tools_menu.addAction("Receptor Preparation…")
+        self.prepare_receptor_action.setEnabled(False)
+        self.prepare_receptor_action.triggered.connect(self.prepare_receptor)
+        tools_button.setMenu(tools_menu)
+        tools_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        toolbar.addWidget(tools_button)
         self.results_action = toolbar.addAction("Results")
         self.results_action.setEnabled(False)
         self.results_action.triggered.connect(self.show_multidock_results)
@@ -300,6 +310,7 @@ class MainWindow(QMainWindow):
         self.run_all_action.setEnabled(True)
         self.refresh_action.setEnabled(True)
         self.receptors_action.setEnabled(True)
+        self.prepare_receptor_action.setEnabled(True)
         self.results_action.setEnabled(True)
         self._auto_import_input()
         self._write_log(f"{action} project: {self.repo.root}")
@@ -719,6 +730,64 @@ class MainWindow(QMainWindow):
             enabled = sum(1 for profile in self.repo.get_receptor_profiles() if profile.get("enabled"))
             self._write_log(f"Updated receptor profiles: {enabled} enabled")
             self._refresh_checkpoint_state()
+
+    def prepare_receptor(self) -> None:
+        if not self.repo or self.stage_running:
+            return
+        wizard = ReceptorPreparationWizard(self)
+        if wizard.exec() != QDialog.DialogCode.Accepted:
+            return
+        plan = wizard.plan()
+        if any(str(profile.get("name", "")).casefold() == plan.profile_name.casefold()
+               for profile in self.repo.get_receptor_profiles() if not profile.get("archived")):
+            QMessageBox.warning(self, "Duplicate receptor name", "Choose a unique receptor profile name.")
+            return
+        activate = wizard.finish_page.activate.isChecked()
+        progress = QProgressDialog("Preparing receptor with Meeko…", "", 0, 0, self)
+        progress.setWindowTitle("Receptor Preparation")
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        thread = QThread(self)
+        worker = ReceptorPreparationWorker(self.repo.root, plan)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+
+        def succeeded(folder: str) -> None:
+            assert self.repo
+            profiles = self.repo.get_receptor_profiles(include_archived=True)
+            profiles.append({
+                "id": plan.profile_id, "name": plan.profile_name, "enabled": activate, "archived": False,
+                "receptor": (Path(folder) / "receptor.pdbqt").relative_to(self.repo.root).as_posix(),
+                "center_x": plan.box_center[0], "center_y": plan.box_center[1], "center_z": plan.box_center[2],
+                "size_x": plan.box_size[0], "size_y": plan.box_size[1], "size_z": plan.box_size[2],
+                "exhaustiveness": 8, "num_modes": 9, "energy_range": 3, "seed": 42, "cpu_count": 1,
+                "reference_ligand": {
+                    "identity": plan.reference_ligand.label() if plan.reference_ligand else None,
+                    "name": plan.reference_ligand.name if plan.reference_ligand else None,
+                    "chain": plan.reference_ligand.chain if plan.reference_ligand else None,
+                    "residue": plan.reference_ligand.number if plan.reference_ligand else None,
+                    "pdb": f"inputs/receptors/{plan.profile_id}/reference_ligand/reference_ligand.pdb" if plan.reference_ligand else None,
+                    "sdf": f"inputs/receptors/{plan.profile_id}/reference_ligand/reference_ligand.sdf" if plan.reference_ligand else None,
+                    "mol2": f"inputs/receptors/{plan.profile_id}/reference_ligand/reference_ligand.mol2" if plan.reference_ligand else None,
+                    "mapping": f"inputs/receptors/{plan.profile_id}/reference_ligand/chemistry_mapping.json" if plan.reference_ligand else None,
+                },
+            })
+            self.repo.save_receptor_profiles(profiles)
+            self._write_log(f"Created receptor profile '{plan.profile_name}' in {folder}")
+            self._refresh_checkpoint_state()
+            QMessageBox.information(self, "Receptor profile created", f"{plan.profile_name}\n\nBox: {plan.box_size[0]:.1f} × {plan.box_size[1]:.1f} × {plan.box_size[2]:.1f} Å")
+
+        worker.succeeded.connect(succeeded)
+        worker.failed.connect(lambda message: QMessageBox.critical(self, "Receptor preparation failed", message))
+        worker.finished.connect(progress.close)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: self.prepare_receptor_action.setEnabled(True))
+        self._receptor_preparation_thread = thread
+        self._receptor_preparation_worker = worker
+        self.prepare_receptor_action.setEnabled(False)
+        thread.start()
 
     def show_multidock_results(self) -> None:
         if self.repo:

@@ -13,7 +13,7 @@ from .services.molscrub import MolScrubService
 from .services.meeko import MeekoService
 from .services.screening import screen_smiles
 from .services.validation import validate_pdbqt
-from .services.vina import VinaDockingBackend
+from .services.vina import VinaDockingBackend, find_vina_executable
 from .services.postdock import PostDockService
 
 
@@ -191,16 +191,7 @@ class PipelineRunner:
             raise RuntimeError("No enabled receptor profiles are configured")
         # Vina is an application-level tool, shared by projects. A project-local
         # copy remains supported for portable runs.
-        application_root = Path(__file__).resolve().parents[2]
-        candidates = [
-            application_root / "tools" / "vina" / "vina.exe",
-            application_root / "tools" / "vina" / "vina_1.2.7_win.exe",
-            self.repository.root / "tools" / "vina" / "vina.exe",
-            self.repository.root / "tools" / "vina" / "vina_1.2.7_win.exe",
-        ]
-        executable = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
-        if not executable.is_file():
-            raise FileNotFoundError(f"Vina executable not found. Place it at {application_root / 'tools' / 'vina'}")
+        executable = find_vina_executable(self.repository.root)
         executable_hash = file_sha256(executable)
         with self.repository.connection() as conn:
             states = conn.execute("""SELECT s.state_id, s.parent_id, a.relative_path

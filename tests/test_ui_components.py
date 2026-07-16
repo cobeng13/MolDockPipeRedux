@@ -6,6 +6,8 @@ try:
     from moldockpipe.ui.compound_selector import CompoundSelectorDialog
     from moldockpipe.ui.progress import CheckpointProgress
     from moldockpipe.ui.receptor_manager import ReceptorManagerDialog, ReceptorProfileDialog
+    from moldockpipe.ui.receptor_wizard import ReceptorPreparationWizard, ReceptorPreparationWorker
+    from moldockpipe.ui.redocking_dialog import RedockingProgressDialog, RedockingResultDialog, RedockingSetupDialog, RedockingWorker
     from moldockpipe.ui.results_dialog import DockingResultsDialog
     from moldockpipe.ui.settings_dialog import SettingsDialog
     from moldockpipe.ui.workers import PipelineWorker
@@ -20,6 +22,12 @@ def test_ui_components_import_and_expose_expected_contracts() -> None:
     assert CheckpointProgress.STAGES == ("screening", "molscrub", "meeko", "vina", "postdock")
     assert ReceptorManagerDialog is not None
     assert ReceptorProfileDialog is not None
+    assert ReceptorPreparationWizard is not None
+    assert ReceptorPreparationWorker is not None
+    assert RedockingSetupDialog is not None
+    assert RedockingProgressDialog is not None
+    assert RedockingResultDialog is not None
+    assert RedockingWorker is not None
     assert DockingResultsDialog is not None
 
 

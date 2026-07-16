@@ -11,6 +11,9 @@ from PyQt6.QtWidgets import (
 )
 
 from ..project import DEFAULT_VINA_PROFILE, ProjectRepository
+from .redocking_dialog import RedockingProgressDialog, RedockingResultDialog, RedockingSetupDialog, RedockingWorker
+from ..redocking.runner import validate_redocking_prerequisites
+from PyQt6.QtCore import QThread, QTimer
 
 
 class ReceptorProfileDialog(QDialog):
@@ -97,6 +100,7 @@ class ReceptorManagerDialog(QDialog):
         for label, callback in (("Add", self._add), ("Edit", self._edit), ("Duplicate", self._duplicate),
                                 ("Enable / Disable", self._toggle), ("Archive", self._archive)):
             button = QPushButton(label); button.clicked.connect(callback); controls.addWidget(button)
+        self.redock_button = QPushButton("Validate by Redocking"); self.redock_button.clicked.connect(self._redock); controls.addWidget(self.redock_button)
         controls.addStretch()
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._save); buttons.rejected.connect(self.reject)
@@ -105,6 +109,7 @@ class ReceptorManagerDialog(QDialog):
         description.setWordWrap(True)
         layout.addWidget(description); layout.addWidget(self.table); layout.addLayout(controls); layout.addWidget(buttons)
         self._refresh()
+        self.table.itemSelectionChanged.connect(self._update_redock_button)
 
     def _refresh(self) -> None:
         self.table.setRowCount(0)
@@ -114,6 +119,40 @@ class ReceptorManagerDialog(QDialog):
                       "Archived" if profile.get("archived") else "Active", profile.get("receptor", ""))
             for column, value in enumerate(values):
                 self.table.setItem(row, column, QTableWidgetItem(str(value)))
+        self._update_redock_button()
+
+    def _update_redock_button(self) -> None:
+        index = self._selected()
+        eligible = index is not None and not self.profiles[index].get("archived") and not validate_redocking_prerequisites(self.repository, self.profiles[index])
+        self.redock_button.setEnabled(bool(eligible))
+
+    def _redock(self) -> None:
+        index = self._selected()
+        if index is None: return
+        profile = self.profiles[index]; missing = validate_redocking_prerequisites(self.repository, profile)
+        if missing:
+            QMessageBox.warning(self, "Redocking cannot start", "Missing:\n• " + "\n• ".join(missing) + "\n\nReturn to Receptor Preparation to complete the profile."); return
+        setup = RedockingSetupDialog(self.repository, profile, self)
+        if setup.exec() != QDialog.DialogCode.Accepted: return
+        self.repository.save_receptor_profiles(self.profiles)
+        resume_id = None
+        with self.repository.connection() as conn:
+            interrupted = conn.execute("SELECT run_id FROM redocking_runs WHERE receptor_profile_id=? AND status='interrupted' ORDER BY started_at DESC LIMIT 1", (str(profile["id"]),)).fetchone()
+        if interrupted and QMessageBox.question(self, "Resume interrupted run", "Resume the latest interrupted redocking run? Matching completed stages will be reused.") == QMessageBox.StandardButton.Yes:
+            resume_id = str(interrupted["run_id"])
+        progress = RedockingProgressDialog(self); thread = QThread(self); worker = RedockingWorker(self.repository, profile, setup.settings(), resume_id)
+        worker.moveToThread(thread); thread.started.connect(worker.run); worker.progress.connect(progress.update_event)
+        progress.cancel_button.clicked.connect(worker.cancel)
+        def success(result):
+            progress.accept(); dialog = RedockingResultDialog(self.repository, result, profile, setup.settings().seed, self)
+            dialog.activate_requested.connect(lambda: self._activate_index(index))
+            dialog.run_again_requested.connect(lambda: QTimer.singleShot(0, self._redock)); dialog.exec()
+        worker.succeeded.connect(success); worker.failed.connect(lambda message: (progress.reject(), QMessageBox.critical(self, "Redocking failed", message)))
+        worker.finished.connect(thread.quit); worker.finished.connect(worker.deleteLater); thread.finished.connect(thread.deleteLater)
+        self._redocking_thread, self._redocking_worker = thread, worker; thread.start(); progress.exec()
+
+    def _activate_index(self, index: int) -> None:
+        self.profiles[index]["enabled"] = True; self.repository.save_receptor_profiles(self.profiles); self._refresh(); self.table.selectRow(index)
 
     def _selected(self) -> int | None:
         rows = self.table.selectionModel().selectedRows()

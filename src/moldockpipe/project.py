@@ -19,7 +19,7 @@ from .fingerprints import file_sha256, fingerprint
 from .models import ScreeningPolicy, StageStatus
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 DEFAULT_VINA_PROFILE: dict[str, Any] = {
@@ -155,6 +155,26 @@ class ProjectRepository:
             CREATE TABLE IF NOT EXISTS tool_installations (tool_name TEXT PRIMARY KEY, version TEXT, location TEXT, sha256 TEXT, recorded_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS project_settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS manual_reviews (review_id TEXT PRIMARY KEY, parent_id TEXT REFERENCES parent_ligands(parent_id), decision TEXT NOT NULL, note TEXT, created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS redocking_runs (
+                run_id TEXT PRIMARY KEY, receptor_profile_id TEXT NOT NULL, status TEXT NOT NULL,
+                reference_ligand_id TEXT NOT NULL, receptor_path TEXT NOT NULL, receptor_sha256 TEXT NOT NULL,
+                reference_sdf_path TEXT NOT NULL, reference_mol2_path TEXT NOT NULL, reference_sha256 TEXT NOT NULL,
+                prepared_ligand_path TEXT, prepared_ligand_sha256 TEXT, settings_json TEXT NOT NULL,
+                fingerprints_json TEXT NOT NULL DEFAULT '{}', meeko_version TEXT, vina_version TEXT,
+                current_stage TEXT, started_at TEXT, finished_at TEXT, interrupted_at TEXT,
+                error_stage TEXT, error_message TEXT, cancel_requested INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS redocking_stages (
+                run_id TEXT NOT NULL REFERENCES redocking_runs(run_id), stage_name TEXT NOT NULL,
+                fingerprint TEXT NOT NULL, status TEXT NOT NULL, artifacts_json TEXT NOT NULL DEFAULT '{}',
+                started_at TEXT, finished_at TEXT, error_message TEXT, PRIMARY KEY(run_id, stage_name)
+            );
+            CREATE TABLE IF NOT EXISTS redocking_poses (
+                pose_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES redocking_runs(run_id), pose_rank INTEGER NOT NULL,
+                affinity REAL, sdf_path TEXT NOT NULL, mol2_path TEXT NOT NULL, pdbqt_source_path TEXT NOT NULL,
+                artifact_sha256 TEXT NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}', UNIQUE(run_id, pose_rank)
+            );
+            CREATE INDEX IF NOT EXISTS idx_redocking_profile_status ON redocking_runs(receptor_profile_id, status);
             """)
             self._ensure_column(conn, "parent_ligands", "active", "INTEGER NOT NULL DEFAULT 1")
             self._ensure_column(conn, "parent_ligands", "input_fingerprint", "TEXT")
@@ -370,4 +390,7 @@ class ProjectRepository:
         with self.connection() as conn:
             result = conn.execute("UPDATE stage_runs SET status=?, ended_at=?, reason=? WHERE status=?", (StageStatus.INTERRUPTED, utc_now(), "Application restarted before completion", StageStatus.RUNNING)).rowcount
             conn.execute("UPDATE docking_runs SET status=?, ended_at=? WHERE status=?", (StageStatus.INTERRUPTED, utc_now(), StageStatus.RUNNING))
-            return result
+            redocking = conn.execute("UPDATE redocking_runs SET status='interrupted', interrupted_at=?, error_message=? WHERE status='running'",
+                                     (utc_now(), "Application restarted before completion")).rowcount
+            conn.execute("UPDATE redocking_stages SET status='interrupted', finished_at=? WHERE status='running'", (utc_now(),))
+            return result + redocking

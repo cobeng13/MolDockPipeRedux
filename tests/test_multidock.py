@@ -26,7 +26,7 @@ def test_legacy_vina_settings_migrate_to_default_profile(tmp_path: Path) -> None
     assert profiles[0]["center_x"] == 7.5
     assert profiles[0]["cpu_count"] == 3
     assert (root / profiles[0]["receptor"]).read_text(encoding="utf-8") == "RECEPTOR"
-    assert repo.get_settings()["schema_version"] == 3
+    assert repo.get_settings()["schema_version"] == 4
 
 
 def test_multidock_runs_and_reuses_each_receptor_independently(tmp_path: Path, monkeypatch) -> None:
