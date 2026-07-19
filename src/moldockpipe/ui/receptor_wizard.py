@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
 
 from ..receptors.analysis import analyze_structure, atoms_for_residues
 from ..receptors.box_calculation import center_from_atoms, envelope_box, radius_of_gyration_box
-from ..receptors.models import ComponentRole, ReceptorPreparationPlan, ResidueKey, StructureAnalysis
+from ..receptors.models import ComponentRole, ProteinResidueIssue, ReceptorPreparationPlan, ResidueKey, StructureAnalysis
 from ..receptors.preparation import prepare_receptor
 
 
@@ -102,6 +102,7 @@ class SourcePage(QWidget):
         self.owner.analysis = analysis
         self.owner.included_chains = chains or tuple(analysis.chains_by_model[model])
         self.owner.components_page.load_analysis(analysis)
+        self.owner.integrity_page.load_analysis(analysis)
         return True
 
 
@@ -157,6 +158,64 @@ class ComponentsPage(QWidget):
         return True
 
 
+class IntegrityPage(QWidget):
+    """Make incomplete polymer residues an informed user decision, not a Meeko surprise."""
+    def __init__(self, wizard: "ReceptorPreparationWizard") -> None:
+        super().__init__(); self.owner = wizard; self.setObjectName("wizardStep")
+        self.summary = QLabel(); self.summary.setWordWrap(True)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Residue", "Missing atoms", "Alt. locations", "Recommended", "Action"])
+        self.issues: tuple[ProteinResidueIssue, ...] = ()
+        self.actions: list[QComboBox] = []
+        self.altlocs: list[QComboBox] = []
+        layout = _page_surface(self)
+        _page_heading(layout, "Review receptor integrity", "Incomplete residues can make Meeko infer invalid bonds. Choose whether to exclude each one from this prepared receptor.")
+        layout.addWidget(self.summary); layout.addWidget(self.table, 1)
+
+    def load_analysis(self, analysis: StructureAnalysis) -> None:
+        self.issues = analysis.protein_residue_issues
+        self.actions.clear(); self.altlocs.clear(); self.table.setRowCount(0)
+        if not self.issues:
+            self.summary.setText("No incomplete standard amino-acid residues were detected in the selected chains.")
+            return
+        self.summary.setText(f"{len(self.issues)} residue(s) are incomplete after alternate-location selection. "
+                             "Excluding a residue removes only that residue from the prepared receptor; it never changes the source file.")
+        for issue in self.issues:
+            row = self.table.rowCount(); self.table.insertRow(row)
+            self.table.setItem(row, 0, QTableWidgetItem(issue.key.label()))
+            self.table.setItem(row, 1, QTableWidgetItem(", ".join(issue.missing_atoms)))
+            self.table.setItem(row, 2, QTableWidgetItem(", ".join(issue.alternate_locations) or "—"))
+            altloc = QComboBox(); altloc.addItem("No alternate location", "")
+            for label in issue.alternate_locations:
+                altloc.addItem(label, label)
+            altloc.setCurrentIndex(max(0, altloc.findData(issue.recommended_altloc)))
+            action = QComboBox(); action.addItem("Choose an action…", "unresolved")
+            action.addItem("Exclude from prepared receptor", "exclude")
+            action.addItem("Keep and let Meeko attempt it", "keep")
+            self.table.setCellWidget(row, 3, altloc); self.table.setCellWidget(row, 4, action)
+            self.altlocs.append(altloc); self.actions.append(action)
+        self.table.resizeColumnsToContents()
+
+    def validatePage(self) -> bool:
+        if any(combo.currentData() == "unresolved" for combo in self.actions):
+            QMessageBox.warning(self, "Resolve receptor integrity", "Choose an action for every incomplete receptor residue before continuing.")
+            return False
+        kept = [issue.key.label() for issue, action in zip(self.issues, self.actions) if action.currentData() == "keep"]
+        if kept:
+            answer = QMessageBox.warning(self, "Attempt preparation with incomplete residues?",
+                "Meeko may still fail for: " + ", ".join(kept) + ". Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+        return True
+
+    def selected_altlocs(self) -> dict[ResidueKey, str]:
+        return {issue.key: str(choice.currentData()) for issue, choice in zip(self.issues, self.altlocs) if choice.currentData()}
+
+    def excluded_residues(self) -> tuple[ResidueKey, ...]:
+        return tuple(issue.key for issue, action in zip(self.issues, self.actions) if action.currentData() == "exclude")
+
+
 class BindingSitePage(QWidget):
     def __init__(self, wizard: "ReceptorPreparationWizard") -> None:
         super().__init__(); self.owner = wizard; self.setObjectName("wizardStep")
@@ -178,10 +237,18 @@ class BindingSitePage(QWidget):
                 component = self.owner.reference_component()
                 if component is None: raise ValueError("Select a reference ligand or use another center method")
                 center = center_from_atoms(component.atoms)
+                self.owner.center_method = "reference_ligand_centroid"
+                self.owner.center_parameters = {"reference_ligand": component.key.label(),
+                                                "heavy_atom_count": len(component.heavy_atoms)}
             elif self.residues.isChecked():
                 keys = self._parse_residues(self.residue_text.text())
                 center = center_from_atoms(atoms_for_residues(Path(self.owner.source_page.source.text()), int(self.owner.source_page.model.currentData()), keys))
-            else: center = tuple(spin.value() for spin in self.center)
+                self.owner.center_method = "selected_residue_centroid"
+                self.owner.center_parameters = {"residues": [key.label() for key in keys]}
+            else:
+                center = tuple(spin.value() for spin in self.center)
+                self.owner.center_method = "manual"
+                self.owner.center_parameters = {}
         except Exception as exc:
             QMessageBox.warning(self, "Invalid binding site", str(exc)); return False
         self.owner.box_center = center
@@ -208,6 +275,8 @@ class BoxPage(QWidget):
         self.padding = QDoubleSpinBox(); self.padding.setRange(0, 100); self.padding.setValue(8); self.padding.setSuffix(" Å")
         self.size = [QDoubleSpinBox() for _ in range(3)]
         for spin in self.size: spin.setRange(0.1, 100000); spin.setValue(22); spin.setDecimals(3); spin.setSuffix(" Å")
+        self.method.currentIndexChanged.connect(self.refresh_dimensions)
+        self.padding.valueChanged.connect(self.refresh_dimensions)
         content = _page_surface(self)
         _page_heading(content, "Choose docking-box dimensions")
         form = QFormLayout(); form.setContentsMargins(0, 0, 0, 0); form.setVerticalSpacing(10)
@@ -215,15 +284,44 @@ class BoxPage(QWidget):
         for axis, spin in zip("XYZ", self.size): form.addRow(f"Size {axis}", spin)
         content.addLayout(form); content.addStretch()
 
-    def validatePage(self) -> bool:
-        method = str(self.method.currentData()); component = self.owner.reference_component()
+    def refresh_dimensions(self, *_args, show_error: bool = False) -> bool:
+        """Immediately reflect the selected calculation method in the size fields."""
+        method = str(self.method.currentData())
+        manual = method == "manual"
+        self.padding.setEnabled(method == "ligand_envelope_padding")
+        for spin in self.size:
+            spin.setReadOnly(not manual)
+        if manual:
+            return True
+        component = self.owner.reference_component()
+        if component is None:
+            if show_error:
+                QMessageBox.warning(self, "Reference ligand required",
+                                    "This box-sizing method requires a selected reference ligand.")
+            return False
         try:
             if method == "ligand_envelope_padding":
-                if component is None: raise ValueError("Ligand-envelope sizing requires a reference ligand")
                 _, size = envelope_box(component.atoms, self.padding.value())
-            elif method == "radius_of_gyration":
-                if component is None: raise ValueError("Radius-of-gyration sizing requires a reference ligand")
+            else:
                 _, size = radius_of_gyration_box(component.atoms)
+        except Exception as exc:
+            if show_error:
+                QMessageBox.warning(self, "Invalid docking box", str(exc))
+            return False
+        for spin, value in zip(self.size, size):
+            spin.setValue(value)
+        self.owner.box_size = size
+        return True
+
+    def validatePage(self) -> bool:
+        method = str(self.method.currentData())
+        try:
+            if method == "ligand_envelope_padding":
+                if not self.refresh_dimensions(show_error=True): return False
+                size = tuple(spin.value() for spin in self.size)
+            elif method == "radius_of_gyration":
+                if not self.refresh_dimensions(show_error=True): return False
+                size = tuple(spin.value() for spin in self.size)
             else: size = tuple(spin.value() for spin in self.size)
         except Exception as exc:
             QMessageBox.warning(self, "Invalid docking box", str(exc)); return False
@@ -298,10 +396,11 @@ class ReceptorPreparationWizard(QDialog):
         palette.setColor(QPalette.ColorRole.Dark, QColor("#171717"))
         self.setPalette(palette)
         self.analysis: StructureAnalysis | None = None; self.included_chains: tuple[str, ...] = ()
-        self.box_center = (0.0, 0.0, 0.0); self.box_size = (22.0, 22.0, 22.0); self.box_method = "manual"; self.box_parameters = {}
-        self.source_page = SourcePage(self); self.components_page = ComponentsPage(self); self.binding_page = BindingSitePage(self)
+        self.box_center = (0.0, 0.0, 0.0); self.center_method = "manual"; self.center_parameters = {}
+        self.box_size = (22.0, 22.0, 22.0); self.box_method = "manual"; self.box_parameters = {}
+        self.source_page = SourcePage(self); self.components_page = ComponentsPage(self); self.integrity_page = IntegrityPage(self); self.binding_page = BindingSitePage(self)
         self.box_page = BoxPage(self); self.finish_page = FinishPage()
-        self.pages = (self.source_page, self.components_page, self.binding_page, self.box_page, self.finish_page)
+        self.pages = (self.source_page, self.components_page, self.integrity_page, self.binding_page, self.box_page, self.finish_page)
         self.stack = QStackedWidget()
         for page in self.pages:
             page.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -345,7 +444,10 @@ class ReceptorPreparationWizard(QDialog):
             return
         if index == len(self.pages) - 1:
             self.accept(); return
-        self.stack.setCurrentIndex(index + 1); self._update_navigation()
+        self.stack.setCurrentIndex(index + 1)
+        if self.stack.currentWidget() is self.box_page:
+            self.box_page.refresh_dimensions()
+        self._update_navigation()
 
     def reference_component(self):
         if not self.analysis: return None
@@ -363,6 +465,9 @@ class ReceptorPreparationWizard(QDialog):
         return ReceptorPreparationPlan(f"{slug}_{uuid.uuid4().hex[:8]}", self.source_page.name.text().strip(),
             Path(self.source_page.source.text()).resolve(), int(self.source_page.model.currentData()), self.included_chains,
             reference, removed, retained, self.box_center, self.box_size, self.box_method, self.box_parameters,
+            center_method=self.center_method, center_parameters=self.center_parameters,
+            altloc_choices=self.integrity_page.selected_altlocs(),
+            excluded_receptor_residues=self.integrity_page.excluded_residues(),
             preserve_hydrogens=self.finish_page.preserve.isChecked(),
             chemistry_template_path=Path(self.components_page.template.text()).resolve() if self.components_page.template.text().strip() else None)
 

@@ -98,12 +98,50 @@ def write_mol2(molecule, destination: Path, *, heavy_only: bool = True, name: st
 
 
 def validate_same_heavy_graph(reference, pose) -> None:
-    ref, other = chemistry_summary(reference), chemistry_summary(pose)
+    match_heavy_atom_graph(reference, pose)
+
+
+def match_heavy_atom_graph(reference, pose) -> tuple[int, ...]:
+    """Return a pose-to-reference atom mapping for the same heavy-atom graph.
+
+    Meeko's PDBQT round trip may reorder atoms and can assign stereochemical
+    tags that were absent from crystallographic PDB/mmCIF coordinates.  Neither
+    changes molecular identity for the external RMSD comparison, so graph
+    matching deliberately ignores atom order and stereochemical labels while
+    retaining element and bond-order/aromaticity checks.
+    """
+    Chem = _chem()
+    ref_mol = Chem.RemoveHs(reference, sanitize=True)
+    pose_mol = Chem.RemoveHs(pose, sanitize=True)
+    ref, other = chemistry_summary(ref_mol), chemistry_summary(pose_mol)
     if ref["heavy_atom_count"] != other["heavy_atom_count"] or ref["elements"] != other["elements"]:
         raise ValueError("The redocked pose molecular graph does not match the reference ligand. "
                          f"Reference heavy atoms: {ref['heavy_atom_count']}; pose heavy atoms: {other['heavy_atom_count']}")
-    if ref["canonical_smiles"] != other["canonical_smiles"]:
+    # The match tuple is indexed by reference atom order and contains the
+    # matching atom index in the pose. useChirality=False is essential here:
+    # reference structures normally do not encode stereochemistry.
+    mapping = pose_mol.GetSubstructMatch(ref_mol, useChirality=False)
+    if len(mapping) != ref_mol.GetNumAtoms():
         raise ValueError("The redocked pose bond graph does not match the reference ligand")
+    for reference_index, pose_index in enumerate(mapping):
+        if ref_mol.GetAtomWithIdx(reference_index).GetFormalCharge() != pose_mol.GetAtomWithIdx(pose_index).GetFormalCharge():
+            raise ValueError("The redocked pose formal-charge graph does not match the reference ligand")
+    return tuple(mapping)
+
+
+def pose_in_reference_order(reference, pose):
+    """Return a heavy-atom pose ordered and named exactly like its reference."""
+    Chem = _chem()
+    reference_heavy = Chem.RemoveHs(reference, sanitize=True)
+    pose_heavy = Chem.RemoveHs(pose, sanitize=True)
+    mapping = match_heavy_atom_graph(reference_heavy, pose_heavy)
+    aligned = Chem.RenumberAtoms(pose_heavy, list(mapping))
+    for index, atom in enumerate(aligned.GetAtoms()):
+        # DockRMSD and manual inspection can now use the same stable labels in
+        # every generated MOL2, even when Meeko changed the PDBQT atom order.
+        atom.SetProp("_TriposAtomName", atom_name(reference_heavy.GetAtomWithIdx(index), index))
+        atom.SetIntProp("MOLDOCK_REFERENCE_ATOM_INDEX", index + 1)
+    return aligned
 
 
 def create_reference_bundle(pdb_path: Path, folder: Path, *, template_sdf: Path | None = None,

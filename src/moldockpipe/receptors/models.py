@@ -63,6 +63,17 @@ class StructureAnalysis:
     insertion_codes: tuple[str, ...]
     zero_occupancy_atoms: tuple[str, ...]
     connections: tuple[str, ...]
+    protein_residue_issues: tuple["ProteinResidueIssue", ...] = ()
+    protein_residues: tuple[ResidueKey, ...] = ()
+
+
+@dataclass(frozen=True)
+class ProteinResidueIssue:
+    """A polymer residue which cannot be prepared without an explicit choice."""
+    key: ResidueKey
+    missing_atoms: tuple[str, ...]
+    alternate_locations: tuple[str, ...]
+    recommended_altloc: str = ""
 
 
 @dataclass(frozen=True)
@@ -79,7 +90,10 @@ class ReceptorPreparationPlan:
     box_size: tuple[float, float, float]
     box_method: str
     box_parameters: dict[str, Any] = field(default_factory=dict)
+    center_method: str = "manual"
+    center_parameters: dict[str, Any] = field(default_factory=dict)
     altloc_choices: dict[ResidueKey, str] = field(default_factory=dict)
+    excluded_receptor_residues: tuple[ResidueKey, ...] = ()
     preserve_hydrogens: bool = False
     chemistry_template_path: Path | None = None
 
@@ -88,4 +102,5 @@ class ReceptorPreparationPlan:
         value["source_path"] = str(self.source_path)
         value["chemistry_template_path"] = str(self.chemistry_template_path) if self.chemistry_template_path else None
         value["altloc_choices"] = {key.label(): alt for key, alt in self.altloc_choices.items()}
+        value["excluded_receptor_residues"] = [key.label() for key in self.excluded_receptor_residues]
         return value

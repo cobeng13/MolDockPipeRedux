@@ -26,7 +26,7 @@ def test_legacy_vina_settings_migrate_to_default_profile(tmp_path: Path) -> None
     assert profiles[0]["center_x"] == 7.5
     assert profiles[0]["cpu_count"] == 3
     assert (root / profiles[0]["receptor"]).read_text(encoding="utf-8") == "RECEPTOR"
-    assert repo.get_settings()["schema_version"] == 4
+    assert repo.get_settings()["schema_version"] == 6
 
 
 def test_multidock_runs_and_reuses_each_receptor_independently(tmp_path: Path, monkeypatch) -> None:
@@ -85,8 +85,14 @@ def test_multidock_runs_and_reuses_each_receptor_independently(tmp_path: Path, m
 
     with repo.connection() as conn:
         runs = conn.execute("SELECT receptor_profile_id, is_current, raw.relative_path FROM docking_runs d JOIN artifacts raw ON raw.artifact_id=d.raw_output_artifact_id ORDER BY receptor_profile_id").fetchall()
+        campaign = conn.execute("SELECT workflow_run_id,status,settings_json FROM workflow_runs WHERE workflow_type='docking' ORDER BY started_at DESC LIMIT 1").fetchone()
+        stage = conn.execute("SELECT status,summary_json FROM workflow_run_stages WHERE workflow_run_id=? AND stage_name='vina'", (campaign["workflow_run_id"],)).fetchone()
+        linked = conn.execute("SELECT COUNT(*) FROM docking_runs WHERE workflow_run_id=?", (campaign["workflow_run_id"],)).fetchone()[0]
     assert [(run["receptor_profile_id"], run["is_current"]) for run in runs] == [("rec-a", 1), ("rec-b", 1)]
     assert all(f"artifacts/docking/{run['receptor_profile_id']}/" in run["relative_path"] for run in runs)
+    assert campaign["status"] == "completed" and '"requested_dockings": 2' in campaign["settings_json"]
+    assert stage["status"] == "completed" and '"newly_completed": 2' in stage["summary_json"]
+    assert linked == 2
 
     calls.clear()
     assert runner.run_vina() == (2, 0)

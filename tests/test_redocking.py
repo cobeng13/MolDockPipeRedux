@@ -8,7 +8,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 
 from moldockpipe.project import ProjectRepository
-from moldockpipe.receptors.ligand_chemistry import chemistry_summary, read_sdf, validate_same_heavy_graph, write_mol2, write_sdf
+from moldockpipe.receptors.ligand_chemistry import chemistry_summary, pose_in_reference_order, read_sdf, validate_same_heavy_graph, write_mol2, write_sdf
 from moldockpipe.redocking.models import RedockingSettings
 from moldockpipe.redocking.runner import RedockingRunner, validate_mol2, validate_redocking_prerequisites
 from moldockpipe.services.meeko import MeekoResult
@@ -90,6 +90,18 @@ def test_mol2_writer_and_graph_validation(redocking_project, tmp_path: Path) -> 
     with pytest.raises(ValueError, match="does not match"): validate_same_heavy_graph(molecule, mismatch.GetMol())
 
 
+def test_graph_validation_and_mol2_mapping_ignore_atom_order_and_stereo(redocking_project, tmp_path: Path) -> None:
+    _, _, reference = redocking_project
+    reordered = Chem.RenumberAtoms(reference, list(reversed(range(reference.GetNumAtoms()))))
+    Chem.AssignStereochemistry(reordered, cleanIt=True, force=True)
+    validate_same_heavy_graph(reference, reordered)
+    aligned = pose_in_reference_order(reference, reordered)
+    assert [atom.GetSymbol() for atom in aligned.GetAtoms()] == [atom.GetSymbol() for atom in Chem.RemoveHs(reference).GetAtoms()]
+    path = tmp_path / "aligned_pose.mol2"; write_mol2(aligned, path)
+    atom_lines = path.read_text(encoding="utf-8").split("@<TRIPOS>ATOM", 1)[1].split("@<TRIPOS>BOND", 1)[0]
+    assert "MOLDOCK_REFERENCE_ATOM_INDEX" not in atom_lines  # metadata stays in-memory; labels are valid MOL2 fields
+
+
 def test_pose_affinity_parsing(tmp_path: Path) -> None:
     output = tmp_path / "poses.pdbqt"; output.write_text("REMARK VINA RESULT: -9.100 0.000 0.000\nREMARK VINA RESULT: -8.200 1.000 2.000\n")
     assert parse_vina_poses(output) == [(1, -9.1, 0.0, 0.0), (2, -8.2, 1.0, 2.0)]
@@ -102,6 +114,9 @@ def test_successful_redocking_generates_all_artifacts(redocking_project) -> None
     assert (root / "dockrmsd/pose_001_heavy.mol2").is_file()
     assert (root / "dockrmsd/top_ranked_pose_heavy.mol2").read_bytes() == (root / "dockrmsd/pose_001_heavy.mol2").read_bytes()
     assert "DockRMSD" in (root / "dockrmsd/README.txt").read_text()
+    transformation = json.loads((root / "transformation.json").read_text(encoding="utf-8"))
+    assert transformation["dockrmsd"]["status"] == "Not calculated"
+    assert transformation["operations"][-1]["atom_mapping"] == "pose graph mapped to reference atom order"
     with repo.connection() as conn:
         assert conn.execute("SELECT status FROM redocking_runs").fetchone()[0] == "ARTIFACTS_READY"
         assert conn.execute("SELECT COUNT(*) FROM redocking_poses").fetchone()[0] == 2

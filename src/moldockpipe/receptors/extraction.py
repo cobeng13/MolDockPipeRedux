@@ -19,7 +19,7 @@ def _line_key(line: str) -> ResidueKey:
 
 
 def _selected_atom_lines(pdb_text: str, plan: ReceptorPreparationPlan) -> list[str]:
-    selected: list[str] = []
+    candidates: dict[ResidueKey, list[str]] = {}
     current_model = 0
     explicit_models = False
     for line in pdb_text.splitlines():
@@ -40,16 +40,34 @@ def _selected_atom_lines(pdb_text: str, plan: ReceptorPreparationPlan) -> list[s
         key = _line_key(line)
         if plan.included_chains and key.chain not in plan.included_chains:
             continue
-        selected_altloc = plan.altloc_choices.get(key, "A")
-        altloc = line[16:17].strip()
-        if altloc and altloc != selected_altloc:
-            continue
-        selected.append(line[:16] + " " + line[17:] if altloc else line)
+        candidates.setdefault(key, []).append(line)
+    selected: list[str] = []
+    for key, lines in candidates.items():
+        specified = plan.altloc_choices.get(key)
+        if specified is None:
+            # Prefer the conformer with the largest atom set.  mmCIF files can
+            # legitimately contain only B/C for a residue, so hard-coding A
+            # silently creates an incomplete amino acid.
+            alternatives = sorted({line[16:17].strip() for line in lines if line[16:17].strip()})
+            if alternatives:
+                def score(alt: str) -> tuple[int, float, bool]:
+                    active = [line for line in lines if not line[16:17].strip() or line[16:17].strip() == alt]
+                    return (len({line[12:16].strip() for line in active}), sum(float(line[54:60] or 0) for line in active), alt == "A")
+                selected_altloc = max(alternatives, key=score)
+            else:
+                selected_altloc = ""
+        else:
+            selected_altloc = specified
+        for line in lines:
+            altloc = line[16:17].strip()
+            if altloc and altloc != selected_altloc:
+                continue
+            selected.append(line[:16] + " " + line[17:] if altloc else line)
     return selected
 
 
 def write_cleaned_receptor(pdb_text: str, plan: ReceptorPreparationPlan, destination: Path) -> None:
-    removed = set(plan.removed_residues)
+    removed = set(plan.removed_residues) | set(plan.excluded_receptor_residues)
     if plan.reference_ligand:
         removed.add(plan.reference_ligand)
     lines = [line for line in _selected_atom_lines(pdb_text, plan) if _line_key(line) not in removed]

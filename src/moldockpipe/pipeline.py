@@ -198,9 +198,25 @@ class PipelineRunner:
                 FROM molecular_states s JOIN conformers c ON c.state_id=s.state_id
                 JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id
                 WHERE s.active=1 AND c.status='pdbqt_ready' AND a.active=1 ORDER BY s.parent_id, s.state_id""").fetchall()
+        campaign_settings = {
+            "receptor_profiles": [{key: value for key, value in profile.items()
+                                   if key not in {"reference_ligand"}} for profile in profiles],
+            "receptor_profile_ids": [str(profile["id"]) for profile in profiles],
+            "prepared_state_count": len(states),
+            "requested_dockings": len(states) * len(profiles),
+            "vina_executable": str(executable),
+            "vina_executable_sha256": executable_hash,
+        }
+        workflow_run_id = self.repository.start_workflow_run("docking", campaign_settings)
         backend = VinaDockingBackend()
-        succeeded = failed = 0
+        succeeded = failed = reused = 0
         total = len(states) * len(profiles)
+        self.repository.update_workflow_stage(workflow_run_id, "vina", StageStatus.RUNNING.value,
+                                              summary={"total": total})
+        self.repository.record_provenance_event(
+            workflow_run_id=workflow_run_id, event_type="docking_campaign_started",
+            stage_name="vina", data={"total": total, "receptors": len(profiles), "states": len(states)},
+        )
         self._emit("stage_started", "vina", total=total)
         index = 0
         for profile in profiles:
@@ -221,9 +237,11 @@ class PipelineRunner:
                         conn.execute("UPDATE docking_runs SET is_current=0 WHERE state_id=? AND receptor_profile_id=?", (state["state_id"], profile_id))
                         conn.execute("""INSERT INTO docking_runs
                             (run_id,state_id,receptor_hash,settings_fingerprint,status,command_json,started_at,ended_at,
-                             is_current,receptor_profile_id,receptor_profile_name,reason)
-                            VALUES (?, ?, '', ?, ?, ?, ?, ?, 1, ?, ?, ?)""",
-                            (run_id, state["state_id"], missing_fp, StageStatus.FAILED, json.dumps(run_settings), utc_now(), utc_now(), profile_id, profile_name, reason))
+                             is_current,receptor_profile_id,receptor_profile_name,reason,workflow_run_id)
+                            VALUES (?, ?, '', ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)""",
+                            (run_id, state["state_id"], missing_fp, StageStatus.FAILED,
+                             json.dumps({"settings": run_settings, "argv": []}, sort_keys=True),
+                             utc_now(), utc_now(), profile_id, profile_name, reason, workflow_run_id))
                     self._emit("item_failed", "vina", state["state_id"], index, total, failed=failed,
                                receptor_profile_id=profile_id, receptor_profile_name=profile_name,
                                message=reason)
@@ -248,6 +266,7 @@ class PipelineRunner:
                         (state["state_id"], profile_id, settings_fp, StageStatus.COMPLETED)).fetchone()
                 if reusable and reusable["raw_path"] and reusable["log_path"] and (self.repository.root / reusable["raw_path"]).is_file() and (self.repository.root / reusable["log_path"]).is_file():
                     succeeded += 1
+                    reused += 1
                     self._emit("item_skipped", "vina", state["state_id"], index, total, skipped=1,
                                receptor_profile_id=profile_id, receptor_profile_name=profile_name,
                                message=f"{profile_name}: matching docking run reused")
@@ -255,16 +274,22 @@ class PipelineRunner:
                 try:
                     with self.repository.connection() as conn:
                         conn.execute("""INSERT INTO docking_runs
-                            (run_id,state_id,receptor_hash,settings_fingerprint,status,command_json,started_at,receptor_profile_id,receptor_profile_name)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (run_id,state_id,receptor_hash,settings_fingerprint,status,command_json,started_at,
+                             receptor_profile_id,receptor_profile_name,workflow_run_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             (run_id, state["state_id"], receptor_hash, settings_fp, StageStatus.RUNNING,
-                             json.dumps(run_settings), utc_now(), profile_id, profile_name))
+                             json.dumps({"settings": run_settings, "argv": []}, sort_keys=True),
+                             utc_now(), profile_id, profile_name, workflow_run_id))
                     result = backend.run(executable=executable, receptor=receptor, ligand=ligand, output=output, log=log, settings=run_settings)
                     raw_artifact = self.repository.add_artifact(output, "vina_output_pdbqt", "vina") if output.exists() else None
                     log_artifact = self.repository.add_artifact(log, "vina_log_txt", "vina")
                     with self.repository.connection() as conn:
                         conn.execute("UPDATE docking_runs SET is_current=0 WHERE state_id=? AND receptor_profile_id=? AND run_id<>?", (state["state_id"], profile_id, run_id))
-                        conn.execute("UPDATE docking_runs SET status=?, log_artifact_id=?, raw_output_artifact_id=?, return_code=?, ended_at=?, is_current=1, reason=? WHERE run_id=?", (StageStatus.COMPLETED if result.poses else StageStatus.FAILED, log_artifact, raw_artifact, result.return_code, utc_now(), None if result.poses else "No valid Vina poses", run_id))
+                        conn.execute("""UPDATE docking_runs SET status=?,log_artifact_id=?,raw_output_artifact_id=?,
+                            return_code=?,ended_at=?,is_current=1,reason=?,command_json=? WHERE run_id=?""",
+                            (StageStatus.COMPLETED if result.poses else StageStatus.FAILED, log_artifact, raw_artifact,
+                             result.return_code, utc_now(), None if result.poses else "No valid Vina poses",
+                             json.dumps({"settings": run_settings, "argv": list(getattr(result, "command", ()))}, sort_keys=True), run_id))
                         best_mode = min(result.poses, key=lambda pose: pose[1])[0] if result.poses else None
                         for mode, affinity, rmsd_lb, rmsd_ub in result.poses:
                             conn.execute("INSERT INTO docking_poses(pose_id,run_id,mode_index,affinity,rmsd_lb,rmsd_ub,is_best_for_state) VALUES (?, ?, ?, ?, ?, ?, ?)", (str(uuid.uuid4()), run_id, mode, affinity, rmsd_lb, rmsd_ub, int(mode == best_mode)))
@@ -282,6 +307,18 @@ class PipelineRunner:
                                receptor_profile_id=profile_id, receptor_profile_name=profile_name,
                                message=f"{profile_name}: {exc}")
         self._emit("stage_completed", "vina", total=total, succeeded=succeeded, failed=failed)
+        summary = {"total": total, "succeeded": succeeded, "failed": failed, "reused": reused,
+                   "newly_completed": max(0, succeeded - reused), "receptor_count": len(profiles),
+                   "state_count": len(states)}
+        final_status = StageStatus.COMPLETED.value if failed == 0 else StageStatus.FAILED.value
+        self.repository.update_workflow_stage(workflow_run_id, "vina", final_status, summary=summary,
+                                              error=None if failed == 0 else f"{failed} docking item(s) failed")
+        self.repository.record_provenance_event(
+            workflow_run_id=workflow_run_id, event_type="docking_campaign_finished",
+            stage_name="vina", level="INFO" if failed == 0 else "WARNING", data=summary,
+        )
+        self.repository.finish_workflow_run(workflow_run_id, final_status,
+                                            error=None if failed == 0 else f"{failed} docking item(s) failed")
         self.repository.record_tool("vina", executable.name, executable)
         return succeeded, failed
 

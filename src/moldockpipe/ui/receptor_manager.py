@@ -11,9 +11,9 @@ from PyQt6.QtWidgets import (
 )
 
 from ..project import DEFAULT_VINA_PROFILE, ProjectRepository
-from .redocking_dialog import RedockingProgressDialog, RedockingResultDialog, RedockingSetupDialog, RedockingWorker
+from .redocking_dialog import RedockingSetupDialog
+from .redocking_queue import RedockingQueueController, RedockingQueueDialog
 from ..redocking.runner import validate_redocking_prerequisites
-from PyQt6.QtCore import QThread, QTimer
 
 
 class ReceptorProfileDialog(QDialog):
@@ -84,12 +84,15 @@ class ReceptorProfileDialog(QDialog):
 
 
 class ReceptorManagerDialog(QDialog):
-    def __init__(self, repository: ProjectRepository, parent: QWidget | None = None) -> None:
+    def __init__(self, repository: ProjectRepository, parent: QWidget | None = None,
+                 queue_controller: RedockingQueueController | None = None) -> None:
         super().__init__(parent)
         self.repository = repository
         self.profiles = repository.get_receptor_profiles(include_archived=True)
         self.original_profiles = {str(profile["id"]): dict(profile) for profile in self.profiles}
         self.sources: dict[str, Path] = {}
+        self.deleted_profile_ids: list[str] = []
+        self.queue_controller = queue_controller or RedockingQueueController(repository, self)
         self.setWindowTitle("Receptor Manager")
         self.resize(760, 440)
         self.table = QTableWidget(0, 4)
@@ -98,16 +101,19 @@ class ReceptorManagerDialog(QDialog):
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         controls = QHBoxLayout()
         for label, callback in (("Add", self._add), ("Edit", self._edit), ("Duplicate", self._duplicate),
-                                ("Enable / Disable", self._toggle), ("Archive", self._archive)):
+                                ("Enable / Disable", self._toggle), ("Archive", self._archive), ("Delete", self._delete)):
             button = QPushButton(label); button.clicked.connect(callback); controls.addWidget(button)
-        self.redock_button = QPushButton("Validate by Redocking"); self.redock_button.clicked.connect(self._redock); controls.addWidget(self.redock_button)
         controls.addStretch()
+        validation_controls = QHBoxLayout()
+        self.redock_button = QPushButton("Add to Validation Queue"); self.redock_button.clicked.connect(self._redock); validation_controls.addWidget(self.redock_button)
+        queue_button = QPushButton("View Validation Queue"); queue_button.clicked.connect(self._show_queue); validation_controls.addWidget(queue_button)
+        validation_controls.addStretch()
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._save); buttons.rejected.connect(self.reject)
         layout = QVBoxLayout(self)
         description = QLabel("Each enabled profile docks the same prepared ligand states against its own receptor and search settings.")
         description.setWordWrap(True)
-        layout.addWidget(description); layout.addWidget(self.table); layout.addLayout(controls); layout.addWidget(buttons)
+        layout.addWidget(description); layout.addWidget(self.table); layout.addLayout(controls); layout.addLayout(validation_controls); layout.addWidget(buttons)
         self._refresh()
         self.table.itemSelectionChanged.connect(self._update_redock_button)
 
@@ -132,24 +138,20 @@ class ReceptorManagerDialog(QDialog):
         profile = self.profiles[index]; missing = validate_redocking_prerequisites(self.repository, profile)
         if missing:
             QMessageBox.warning(self, "Redocking cannot start", "Missing:\n• " + "\n• ".join(missing) + "\n\nReturn to Receptor Preparation to complete the profile."); return
-        setup = RedockingSetupDialog(self.repository, profile, self)
+        setup = RedockingSetupDialog(self.repository, profile, self, action_label="Add to Queue")
         if setup.exec() != QDialog.DialogCode.Accepted: return
         self.repository.save_receptor_profiles(self.profiles)
-        resume_id = None
-        with self.repository.connection() as conn:
-            interrupted = conn.execute("SELECT run_id FROM redocking_runs WHERE receptor_profile_id=? AND status='interrupted' ORDER BY started_at DESC LIMIT 1", (str(profile["id"]),)).fetchone()
-        if interrupted and QMessageBox.question(self, "Resume interrupted run", "Resume the latest interrupted redocking run? Matching completed stages will be reused.") == QMessageBox.StandardButton.Yes:
-            resume_id = str(interrupted["run_id"])
-        progress = RedockingProgressDialog(self); thread = QThread(self); worker = RedockingWorker(self.repository, profile, setup.settings(), resume_id)
-        worker.moveToThread(thread); thread.started.connect(worker.run); worker.progress.connect(progress.update_event)
-        progress.cancel_button.clicked.connect(worker.cancel)
-        def success(result):
-            progress.accept(); dialog = RedockingResultDialog(self.repository, result, profile, setup.settings().seed, self)
-            dialog.activate_requested.connect(lambda: self._activate_index(index))
-            dialog.run_again_requested.connect(lambda: QTimer.singleShot(0, self._redock)); dialog.exec()
-        worker.succeeded.connect(success); worker.failed.connect(lambda message: (progress.reject(), QMessageBox.critical(self, "Redocking failed", message)))
-        worker.finished.connect(thread.quit); worker.finished.connect(worker.deleteLater); thread.finished.connect(thread.deleteLater)
-        self._redocking_thread, self._redocking_worker = thread, worker; thread.start(); progress.exec()
+        try:
+            self.queue_controller.enqueue(profile, setup.settings())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Validation not queued", str(exc)); return
+        QMessageBox.information(self, "Validation queued",
+            f"{profile.get('name')} was added to the validation queue.\n\n"
+            "Validations run one at a time. You can close the queue window and leave MolDockPipe running.")
+        self._show_queue()
+
+    def _show_queue(self) -> None:
+        RedockingQueueDialog(self.queue_controller, self).exec()
 
     def _activate_index(self, index: int) -> None:
         self.profiles[index]["enabled"] = True; self.repository.save_receptor_profiles(self.profiles); self._refresh(); self.table.selectRow(index)
@@ -220,6 +222,36 @@ class ReceptorManagerDialog(QDialog):
             self.profiles[index]["enabled"] = False
             self._refresh()
 
+    def _delete(self) -> None:
+        index = self._selected()
+        if index is None:
+            return
+        profile = self.profiles[index]
+        with self.repository.connection() as conn:
+            running = conn.execute("""SELECT EXISTS(SELECT 1 FROM redocking_queue_items
+                WHERE receptor_profile_id=? AND status='running')""", (str(profile["id"]),)).fetchone()[0]
+        if running:
+            QMessageBox.warning(self, "Validation running",
+                "Cancel this receptor's active validation and wait for it to stop before deleting the receptor.")
+            return
+        name = str(profile.get("name", "this receptor"))
+        dialog = QMessageBox(QMessageBox.Icon.Warning, "Delete receptor profile",
+            f"Delete '{name}' from this project?\n\n"
+            "When you click Save, its prepared receptor and redocking files will be deleted. "
+            "Ligand inputs and other receptor profiles are not affected. Historical database records are retained.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, self)
+        dialog.button(QMessageBox.StandardButton.Yes).setText("Delete")
+        dialog.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        if dialog.exec() != QMessageBox.StandardButton.Yes:
+            return
+        profile_id = str(profile["id"])
+        self.profiles.pop(index)
+        self.sources.pop(profile_id, None)
+        # Profiles added in this unsaved dialog have no persisted directory.
+        if profile_id in self.original_profiles:
+            self.deleted_profile_ids.append(profile_id)
+        self._refresh()
+
     def _save(self) -> None:
         docking_keys = {"receptor", "center_x", "center_y", "center_z", "size_x", "size_y", "size_z",
                         "exhaustiveness", "num_modes", "energy_range", "seed", "cpu_count"}
@@ -238,5 +270,7 @@ class ReceptorManagerDialog(QDialog):
             if original and (source_changed or any(original.get(key) != profile.get(key) for key in docking_keys)):
                 with self.repository.connection() as conn:
                     conn.execute("UPDATE docking_runs SET is_current=0 WHERE receptor_profile_id=?", (profile_id,))
+        for profile_id in self.deleted_profile_ids:
+            self.repository.remove_receptor_profile(profile_id)
         self.repository.save_receptor_profiles(self.profiles)
         self.accept()

@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 
 from PyQt6.QtCore import QThread, Qt
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QCloseEvent, QFont
 from PyQt6.QtWidgets import (
     QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QPushButton, QProgressBar, QProgressDialog, QSplitter, QStatusBar, QStyle, QTableWidget, QTableWidgetItem,
@@ -14,9 +14,11 @@ from PyQt6.QtWidgets import (
 import yaml
 
 from ..project import ProjectRepository
+from ..reporting import generate_project_report
 from .compound_selector import CompoundSelectorDialog
 from .progress import CheckpointProgress
 from .receptor_manager import ReceptorManagerDialog
+from .redocking_queue import RedockingQueueController, RedockingQueueDialog
 from .receptor_wizard import ReceptorPreparationWizard, ReceptorPreparationWorker
 from .results_dialog import DockingResultsDialog
 from .settings_dialog import SettingsDialog
@@ -29,6 +31,7 @@ class MainWindow(QMainWindow):
         self.repo: ProjectRepository | None = None
         self.stage_running = False
         self.stage_started_at = 0.0
+        self.redocking_queue: RedockingQueueController | None = None
         self.setWindowTitle("MolDockPipe Redux")
         self.resize(1280, 760)
         self._build_ui()
@@ -57,6 +60,9 @@ class MainWindow(QMainWindow):
         self.prepare_receptor_action = tools_menu.addAction("Receptor Preparation…")
         self.prepare_receptor_action.setEnabled(False)
         self.prepare_receptor_action.triggered.connect(self.prepare_receptor)
+        self.validation_queue_action = tools_menu.addAction("Redocking Validation Queue…")
+        self.validation_queue_action.setEnabled(False)
+        self.validation_queue_action.triggered.connect(self.show_validation_queue)
         tools_button.setMenu(tools_menu)
         tools_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         toolbar.addWidget(tools_button)
@@ -79,6 +85,7 @@ class MainWindow(QMainWindow):
         export_menu = QMenu(export_button)
         export_menu.addAction("Manifest CSV", self.export_manifest_csv)
         export_menu.addAction("Leaderboard CSV", self.export_leaderboard_csv)
+        export_menu.addAction("Project report (HTML)", self.export_project_report)
         export_menu.addSeparator()
         self.docked_export_action = export_menu.addAction("Export docked compounds (PDBQT/SDF)", self.select_compounds_for_export)
         export_button.setMenu(export_menu)
@@ -237,7 +244,18 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(container)
         self.setStatusBar(QStatusBar())
 
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self.redocking_queue and self.redocking_queue.is_running and not self.redocking_queue.shutdown():
+            event.ignore()
+            QMessageBox.warning(self, "Validation is stopping",
+                "MolDockPipe is still stopping the active validation process. Try closing the application again in a few seconds.")
+            return
+        super().closeEvent(event)
+
     def create_project(self) -> None:
+        if self.redocking_queue and self.redocking_queue.is_running:
+            QMessageBox.warning(self, "Validation running", "Wait for or cancel the active redocking validation before switching projects.")
+            return
         name, accepted = QInputDialog.getText(self, "New Project", "Project name:")
         name = name.strip()
         if not accepted or not name:
@@ -253,6 +271,9 @@ class MainWindow(QMainWindow):
         self._activate_project("Created")
 
     def open_project(self) -> None:
+        if self.redocking_queue and self.redocking_queue.is_running:
+            QMessageBox.warning(self, "Validation running", "Wait for or cancel the active redocking validation before switching projects.")
+            return
         path = QFileDialog.getExistingDirectory(self, "Open project folder")
         if not path:
             return
@@ -311,7 +332,17 @@ class MainWindow(QMainWindow):
         self.refresh_action.setEnabled(True)
         self.receptors_action.setEnabled(True)
         self.prepare_receptor_action.setEnabled(True)
+        self.validation_queue_action.setEnabled(True)
         self.results_action.setEnabled(True)
+        if self.redocking_queue:
+            self.redocking_queue.deleteLater()
+        self.redocking_queue = RedockingQueueController(self.repo, self)
+        self.redocking_queue.activity.connect(self._write_log)
+        self.redocking_queue.activity.connect(lambda message: self.statusBar().showMessage(message, 10000))
+        self.redocking_queue.validation_completed.connect(
+            lambda result: self._write_log(f"Redocking artifacts ready: run {result.get('run_id')}")
+        )
+        self.redocking_queue.start()
         self._auto_import_input()
         self._write_log(f"{action} project: {self.repo.root}")
         self.refresh_tables()
@@ -725,11 +756,16 @@ class MainWindow(QMainWindow):
     def manage_receptors(self) -> None:
         if not self.repo or self.stage_running:
             return
-        dialog = ReceptorManagerDialog(self.repo, self)
+        assert self.redocking_queue
+        dialog = ReceptorManagerDialog(self.repo, self, self.redocking_queue)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             enabled = sum(1 for profile in self.repo.get_receptor_profiles() if profile.get("enabled"))
             self._write_log(f"Updated receptor profiles: {enabled} enabled")
             self._refresh_checkpoint_state()
+
+    def show_validation_queue(self) -> None:
+        if self.redocking_queue:
+            RedockingQueueDialog(self.redocking_queue, self).exec()
 
     def prepare_receptor(self) -> None:
         if not self.repo or self.stage_running:
@@ -809,3 +845,15 @@ class MainWindow(QMainWindow):
     def export_leaderboard_csv(self) -> None:
         if self.repo:
             SettingsDialog(self.repo.get_settings(), self, self.repo)._export_leaderboard()
+
+    def export_project_report(self) -> None:
+        if not self.repo or self.stage_running:
+            return
+        try:
+            output = generate_project_report(self.repo)
+        except Exception as exc:
+            QMessageBox.critical(self, "Report generation failed", str(exc))
+            return
+        self._write_log(f"Generated project report: {output}")
+        QMessageBox.information(self, "Report generated",
+                                f"The HTML report and its provenance files were written to:\n\n{output.parent}")

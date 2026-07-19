@@ -12,7 +12,7 @@ from typing import Any, Callable
 from ..fingerprints import file_sha256, fingerprint
 from ..project import ProjectRepository, utc_now
 from ..receptors.ligand_chemistry import (
-    chemistry_summary, hydrogenated_copy, read_sdf, validate_same_heavy_graph, write_mol2, write_sdf,
+    chemistry_summary, hydrogenated_copy, pose_in_reference_order, read_sdf, validate_same_heavy_graph, write_mol2, write_sdf,
 )
 from ..services.meeko import MeekoService
 from ..services.postdock import PostDockService
@@ -213,7 +213,8 @@ class RedockingRunner:
                 self._stage_start(run_id, STAGES[4], mol2_fp); reference = read_sdf(reference_sdf)
                 write_mol2(reference, reference_out, heavy_only=True, name="reference_ligand")
                 for (rank, *_), sdf, mol2 in zip(scored, expected_sdfs, mol2_paths):
-                    pose = read_sdf(sdf); validate_same_heavy_graph(reference, pose); write_mol2(pose, mol2, heavy_only=True, name=f"pose_{rank:03d}")
+                    pose = read_sdf(sdf); aligned_pose = pose_in_reference_order(reference, pose)
+                    write_mol2(aligned_pose, mol2, heavy_only=True, name=f"pose_{rank:03d}")
                 shutil.copy2(mol2_paths[0], rmsd_dir / "top_ranked_pose_heavy.mol2")
                 (rmsd_dir / "README.txt").write_text("DockRMSD is not run by MolDockPipe. Example commands:\n\n"
                     "DockRMSD reference_ligand_heavy.mol2 pose_001_heavy.mol2\n"
@@ -221,9 +222,12 @@ class RedockingRunner:
                 self._stage_done(run_id, STAGES[4], {path.name: file_sha256(path) for path in (reference_out, *mol2_paths)})
             else: self._emit("stage_reused", STAGES[4])
 
-            final_fp = fingerprint(settings={"validation": "redocking-v1"}, inputs={"multi": file_sha256(multi), "reference": file_sha256(reference_out)}, tool_version="validation-v1")
+            final_fp = fingerprint(settings={"validation": "redocking-v1", "transformation_manifest": "v1"},
+                                   inputs={"multi": file_sha256(multi), "reference": file_sha256(reference_out)},
+                                   tool_version="validation-v2")
             validation_path = run_root / "validation.json"
-            if not self._stage_reusable(run_id, STAGES[5], final_fp, (validation_path,)):
+            transformation_path = run_root / "transformation.json"
+            if not self._stage_reusable(run_id, STAGES[5], final_fp, (validation_path, transformation_path)):
                 self._stage_start(run_id, STAGES[5], final_fp); validate_ligand_pdbqt(ligand_pdbqt); validate_mol2(reference_out)
                 for path in (*expected_sdfs, *mol2_paths):
                     if not path.is_file() or not path.stat().st_size: raise ValueError(f"Missing pose artifact: {path.name}")
@@ -242,13 +246,55 @@ class RedockingRunner:
                     writer = csv.writer(handle); writer.writerow(("pose_rank", "affinity", "sdf_path", "artifact_sha256")); writer.writerows(pose_rows)
                 validation_path.write_text(json.dumps({"status": RedockingStatus.ARTIFACTS_READY.value, "rmsd_status": "Not calculated",
                     "pose_count": len(scored), "top_affinity": scored[0][1], "top_rank": 1, "hashes_recorded": True}, indent=2), encoding="utf-8")
+                mapping_path = _profile_path(self.repository, reference_info["mapping"])
+                chemistry_mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+                meeko_command_path = input_dir / "meeko_command.json"
+                vina_command_path = docking_dir / "command.json"
+                transformation = {
+                    "schema": "moldockpipe-redocking-transformation-v1",
+                    "run_id": run_id,
+                    "receptor_profile_id": profile_id,
+                    "reference_ligand": {
+                        "identity": reference_info["identity"],
+                        "source_pdb": reference_info.get("pdb"),
+                        "source_sdf": reference_info["sdf"],
+                        "source_mol2": reference_info["mol2"],
+                        "chemistry_source": chemistry_mapping.get("chemistry_source"),
+                        "heavy_atom_count": chemistry_mapping.get("heavy_atom_count"),
+                        "formal_charge": chemistry_mapping.get("formal_charge"),
+                        "source_sha256": reference_hash,
+                    },
+                    "operations": [
+                        {"stage": "crystal_reference", "operation": "reuse immutable crystallographic coordinates",
+                         "heavy_atom_coordinate_policy": "preserved"},
+                        {"stage": "hydrogenation", "implementation": "RDKit AddHs",
+                         "input": reference_info["sdf"], "output": ligand_h.relative_to(self.repository.root).as_posix(),
+                         "heavy_atom_coordinate_policy": "verified unchanged"},
+                        {"stage": "ligand_preparation", "implementation": "Meeko mk_prepare_ligand",
+                         "version": _tool_version("meeko"),
+                         "command": json.loads(meeko_command_path.read_text(encoding="utf-8")) if meeko_command_path.is_file() else {}},
+                        {"stage": "vina_redocking", "implementation": "AutoDock Vina",
+                         "parameters": vina_settings,
+                         "command": json.loads(vina_command_path.read_text(encoding="utf-8")) if vina_command_path.is_file() else {}},
+                        {"stage": "pose_export", "implementation": "Meeko mk_export",
+                         "input": multi.relative_to(self.repository.root).as_posix(),
+                         "output": combined.relative_to(self.repository.root).as_posix()},
+                        {"stage": "mol2_generation", "implementation": "MolDockPipe MOL2 writer v1",
+                         "hydrogen_policy": "heavy atoms only", "atom_mapping": "pose graph mapped to reference atom order",
+                         "stereochemistry_matching": "ignored when absent from crystal reference"},
+                    ],
+                    "dockrmsd": {"status": "Not calculated", "external_tool_placeholder": True},
+                }
+                transformation_path.write_text(json.dumps(transformation, indent=2), encoding="utf-8")
                 for path, artifact_type in ((ligand_h, "redocking_input_sdf"), (ligand_pdbqt, "redocking_ligand_pdbqt"),
                     (multi, "redocking_vina_output"), (vina_log, "redocking_vina_log"), (reference_out, "dockrmsd_reference_mol2"),
-                    (rmsd_dir / "top_ranked_pose_heavy.mol2", "dockrmsd_top_pose_mol2"), (validation_path, "redocking_validation")):
+                    (rmsd_dir / "top_ranked_pose_heavy.mol2", "dockrmsd_top_pose_mol2"), (validation_path, "redocking_validation"),
+                    (transformation_path, "redocking_transformation_manifest")):
                     self.repository.add_artifact(path, artifact_type, "redocking")
                 for path in (*expected_sdfs, *mol2_paths):
                     self.repository.add_artifact(path, "redocking_pose_sdf" if path.suffix == ".sdf" else "dockrmsd_pose_mol2", "redocking")
-                self._stage_done(run_id, STAGES[5], {"validation": file_sha256(validation_path)})
+                self._stage_done(run_id, STAGES[5], {"validation": file_sha256(validation_path),
+                                                     "transformation": file_sha256(transformation_path)})
             else: self._emit("stage_reused", STAGES[5])
             with self.repository.connection() as conn:
                 conn.execute("UPDATE redocking_runs SET status=?,finished_at=?,current_stage=NULL,prepared_ligand_path=?,prepared_ligand_sha256=?,meeko_version=?,vina_version=? WHERE run_id=?",

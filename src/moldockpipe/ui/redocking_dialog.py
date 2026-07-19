@@ -40,7 +40,8 @@ class RedockingWorker(QObject):
 
 
 class RedockingSetupDialog(QDialog):
-    def __init__(self, repository: ProjectRepository, profile: dict[str, object], parent: QWidget | None = None) -> None:
+    def __init__(self, repository: ProjectRepository, profile: dict[str, object], parent: QWidget | None = None,
+                 *, action_label: str = "Run Redocking") -> None:
         super().__init__(parent); self.repository = repository; self.profile = profile; self.setWindowTitle("Redocking Validation")
         reference = profile.get("reference_ligand") if isinstance(profile.get("reference_ligand"), dict) else {}
         form = QFormLayout(); form.addRow("Receptor profile", QLabel(str(profile.get("name", profile.get("id", "")))))
@@ -65,7 +66,7 @@ class RedockingSetupDialog(QDialog):
         warning.setWordWrap(True); form.addRow(warning)
         missing = validate_redocking_prerequisites(repository, profile)
         if missing: form.addRow(QLabel("Redocking cannot start. Missing:\n• " + "\n• ".join(missing)))
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel); self.run_button = buttons.addButton("Run Redocking", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel); self.run_button = buttons.addButton(action_label, QDialogButtonBox.ButtonRole.AcceptRole)
         self.run_button.setEnabled(not missing); buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject)
         layout = QVBoxLayout(self); layout.addLayout(form); layout.addWidget(buttons)
 
