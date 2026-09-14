@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 
 import yaml
 
 from moldockpipe.pipeline import PipelineRunner
 from moldockpipe.project import ProjectRepository, utc_now
+from moldockpipe.csv_exports import export_leaderboard_csv, export_manifest_csv
 
 
 def test_legacy_vina_settings_migrate_to_default_profile(tmp_path: Path) -> None:
@@ -52,6 +54,10 @@ def test_multidock_runs_and_reuses_each_receptor_independently(tmp_path: Path, m
     for profile_id, score in (("rec-a", -7.1), ("rec-b", -8.2)):
         receptor = repo.root / "inputs" / "receptors" / profile_id / "receptor.pdbqt"
         receptor.parent.mkdir(parents=True, exist_ok=True); receptor.write_text(profile_id, encoding="utf-8")
+        (receptor.parent / "receptor_prepared.pdb").write_text(
+            "ATOM      1  CA  ALA A   1       1.000   2.000   3.000  1.00 20.00           C  \nEND\n",
+            encoding="ascii",
+        )
         profiles.append({
             "id": profile_id, "name": profile_id.upper(), "enabled": True, "archived": False,
             "receptor": receptor.relative_to(repo.root).as_posix(),
@@ -60,6 +66,29 @@ def test_multidock_runs_and_reuses_each_receptor_independently(tmp_path: Path, m
             "test_score": score,
         })
     repo.save_receptor_profiles(profiles)
+    standard_mol2 = """@<TRIPOS>MOLECULE
+reference_ligand
+ 2 1 0 0 0
+SMALL
+USER_CHARGES
+
+@<TRIPOS>ATOM
+      1 C1          0.0000    0.0000    0.0000 C.3       1 LIG       0.0000
+      2 O1          1.2000    0.0000    0.0000 O.3       1 LIG       0.0000
+@<TRIPOS>BOND
+     1    1    2 1
+"""
+    with repo.connection() as conn:
+        for profile in profiles:
+            validation_run = f"validation-{profile['id']}"
+            standard = repo.root / "inputs" / "receptors" / profile["id"] / "redocking" / validation_run / "dockrmsd" / "reference_ligand_heavy.mol2"
+            standard.parent.mkdir(parents=True); standard.write_text(standard_mol2, encoding="utf-8")
+            conn.execute("""INSERT INTO redocking_runs
+                (run_id,receptor_profile_id,status,reference_ligand_id,receptor_path,receptor_sha256,
+                 reference_sdf_path,reference_mol2_path,reference_sha256,settings_json,finished_at)
+                VALUES (?, ?, 'ARTIFACTS_READY', 'LIG', 'receptor.pdbqt', 'receptor-hash',
+                        'reference.sdf', 'reference.mol2', 'reference-hash', '{}', ?)""",
+                (validation_run, profile["id"], utc_now()))
 
     calls: list[str] = []
 
@@ -94,6 +123,31 @@ def test_multidock_runs_and_reuses_each_receptor_independently(tmp_path: Path, m
     assert stage["status"] == "completed" and '"newly_completed": 2' in stage["summary_json"]
     assert linked == 2
 
+    def fake_export_sdf(self, input_pdbqt, output_sdf, log):
+        output_sdf.parent.mkdir(parents=True, exist_ok=True)
+        output_sdf.write_text("SDF", encoding="ascii")
+        log.write_text("exported", encoding="ascii")
+
+    monkeypatch.setattr("moldockpipe.pipeline.PostDockService.export_sdf", fake_export_sdf)
+    config = repo.get_settings()
+    config["postdock"] = {"mode": "sdf_only", "poses_per_compound": 3, "selected_parents": ["lig1"]}
+    (repo.root / "project.yml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    assert runner.run_postdock() == (2, 0)
+    for profile in profiles:
+        exported = repo.root / "For_PostDocking" / profile["id"] / f"{profile['name']}_prepared.pdb"
+        assert exported.is_file()
+        assert (exported.parent / "SDF" / "lig1").is_dir()
+        assert (exported.parent / "reference_ligand_heavy.mol2").read_text(encoding="utf-8") == standard_mol2
+
+    # Re-running an already exported project refreshes receptor-level package
+    # files without re-exporting all ligand poses.
+    first_root = repo.root / "For_PostDocking" / profiles[0]["id"]
+    (first_root / f"{profiles[0]['name']}_prepared.pdb").unlink()
+    (first_root / "reference_ligand_heavy.mol2").unlink()
+    assert runner.run_postdock() == (0, 0)
+    assert (first_root / f"{profiles[0]['name']}_prepared.pdb").is_file()
+    assert (first_root / "reference_ligand_heavy.mol2").is_file()
+
     calls.clear()
     assert runner.run_vina() == (2, 0)
     assert calls == []
@@ -106,3 +160,13 @@ def test_multidock_runs_and_reuses_each_receptor_independently(tmp_path: Path, m
         assert conn.execute("SELECT COUNT(*) FROM docking_runs WHERE receptor_profile_id='rec-a'").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM docking_runs WHERE receptor_profile_id='rec-b'").fetchone()[0] == 2
         assert conn.execute("SELECT COUNT(*) FROM docking_runs WHERE receptor_profile_id='rec-b' AND is_current=1").fetchone()[0] == 1
+
+    manifest_outputs = export_manifest_csv(repo)
+    leaderboard_outputs = export_leaderboard_csv(repo)
+    assert len(manifest_outputs) == len(leaderboard_outputs) == 3
+    with (repo.root / "exports" / "manifest.csv").open(encoding="utf-8", newline="") as handle:
+        manifest_rows = list(csv.DictReader(handle))
+    with (repo.root / "exports" / "leaderboard.csv").open(encoding="utf-8", newline="") as handle:
+        leaderboard_rows = list(csv.DictReader(handle))
+    assert {(row["receptor_id"], row["id"]) for row in manifest_rows} == {("rec-a", "lig1"), ("rec-b", "lig1")}
+    assert {(row["receptor_id"], row["parent_id"]) for row in leaderboard_rows} == {("rec-a", "lig1"), ("rec-b", "lig1")}

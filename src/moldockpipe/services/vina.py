@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable
 
+from .executables import VINA, VINA_SPLIT, find_executable
 from .validation import parse_vina_poses, validate_pdbqt
 
 
@@ -19,14 +20,11 @@ class VinaResult:
 
 
 def find_vina_executable(project_root: Path) -> Path:
-    application_root = Path(__file__).resolve().parents[3]
-    candidates = (
-        application_root / "tools" / "vina" / "vina.exe", application_root / "tools" / "vina" / "vina_1.2.7_win.exe",
-        project_root / "tools" / "vina" / "vina.exe", project_root / "tools" / "vina" / "vina_1.2.7_win.exe",
-    )
-    executable = next((candidate for candidate in candidates if candidate.is_file()), None)
-    if executable is None: raise FileNotFoundError(f"Vina executable not found. Place it at {application_root / 'tools' / 'vina'}")
-    return executable
+    return find_executable(VINA, project_root)
+
+
+def find_vina_split_executable(project_root: Path) -> Path:
+    return find_executable(VINA_SPLIT, project_root)
 
 
 class VinaDockingBackend:

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
+
+from moldockpipe.project import ProjectRepository
 
 try:
     from moldockpipe.ui.compound_selector import CompoundSelectorDialog
+    from moldockpipe.ui.main_window import MainWindow
     from moldockpipe.ui.progress import CheckpointProgress
     from moldockpipe.ui.receptor_manager import ReceptorManagerDialog, ReceptorProfileDialog
     from moldockpipe.ui.receptor_wizard import ReceptorPreparationWizard, ReceptorPreparationWorker
@@ -69,3 +74,24 @@ def test_pipeline_worker_routes_requested_stage(monkeypatch) -> None:
 
     assert calls == ["meeko"]
     assert summaries == [{"meeko": (1, 0)}]
+
+
+def test_dashboard_refresh_defines_profile_metadata(tmp_path) -> None:
+    class Sink:
+        def setText(self, value): self.text = value
+        def setEnabled(self, value): self.enabled = value
+        def setStyleSheet(self, value): pass
+        def setToolTip(self, value): pass
+
+    fake = SimpleNamespace(
+        repo=ProjectRepository.create(tmp_path / "project"), stage_running=False,
+        stat_cards={key: Sink() for key in ("ligands", "passed", "failed", "running")},
+        stat_details={key: Sink() for key in ("passed", "failed")},
+        project_summary=Sink(), docked_export_action=Sink(),
+        stage_buttons={key: Sink() for key in ("screening", "molscrub", "meeko", "vina", "postdock")},
+        overall_progress=SimpleNamespace(states={}),
+    )
+
+    MainWindow._update_dashboard(fake, 0, 0, 0, 0, 0)
+
+    assert fake.docked_export_action.enabled is False

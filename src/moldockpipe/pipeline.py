@@ -13,8 +13,8 @@ from .services.molscrub import MolScrubService
 from .services.meeko import MeekoService
 from .services.screening import screen_smiles
 from .services.validation import validate_pdbqt
-from .services.vina import VinaDockingBackend, find_vina_executable
-from .services.postdock import PostDockService
+from .services.vina import VinaDockingBackend, find_vina_executable, find_vina_split_executable
+from .services.postdock import PostDockService, receptor_export_filename
 
 
 class PipelineRunner:
@@ -327,11 +327,10 @@ class PipelineRunner:
         mode = str(settings.get("mode", "split_and_sdf"))
         limit = max(1, int(settings.get("poses_per_compound", 3)))
         selected = set(settings.get("selected_parents", []))
-        profile_ids = [str(profile["id"]) for profile in self.repository.get_receptor_profiles() if profile.get("enabled")]
-        application_root = Path(__file__).resolve().parents[2]
-        split_executable = next((p for p in (application_root / "tools" / "vina" / "vina_split.exe", application_root / "tools" / "vina_split.exe") if p.is_file()), None)
-        if mode in ("split_only", "split_and_sdf") and split_executable is None:
-            raise FileNotFoundError("vina_split.exe not found in tools/vina or tools")
+        profiles = [profile for profile in self.repository.get_receptor_profiles() if profile.get("enabled")]
+        profiles_by_id = {str(profile["id"]): profile for profile in profiles}
+        profile_ids = list(profiles_by_id)
+        split_executable = find_vina_split_executable(self.repository.root) if mode in ("split_only", "split_and_sdf") else None
         with self.repository.connection() as conn:
             placeholders = ",".join("?" for _ in profile_ids)
             runs = conn.execute(f"""SELECT d.run_id, d.receptor_profile_id, d.receptor_profile_name,
@@ -344,11 +343,55 @@ class PipelineRunner:
             runs = [run for run in runs if run["parent_id"] in selected]
         self._emit("stage_started", "postdock", total=len(runs))
         service = PostDockService()
+        for profile_id in sorted({str(run["receptor_profile_id"]) for run in runs}):
+            profile = profiles_by_id[profile_id]
+            receptor_pdbqt = self.repository.root / str(profile["receptor"])
+            prepared_pdb = receptor_pdbqt.parent / "receptor_prepared.pdb"
+            profile_root = self.repository.root / "For_PostDocking" / profile_id
+            receptor_export = profile_root / receptor_export_filename(str(profile.get("name", profile_id)))
+            source_kind = service.export_receptor_pdb(receptor_pdbqt, receptor_export, prepared_pdb)
+            self.repository.add_artifact(receptor_export, "postdock_receptor_pdb", "postdock")
+            self.repository.record_provenance_event(
+                event_type="postdock_receptor_exported", stage_name="postdock",
+                entity_type="receptor_profile", entity_id=profile_id, receptor_profile_id=profile_id,
+                data={"source_kind": source_kind, "source": str(prepared_pdb if source_kind == "meeko_prepared_pdb" else receptor_pdbqt),
+                      "output": receptor_export.relative_to(self.repository.root).as_posix()},
+            )
+            with self.repository.connection() as conn:
+                validation_runs = conn.execute("""SELECT run_id FROM redocking_runs
+                    WHERE receptor_profile_id=? AND status='ARTIFACTS_READY'
+                    ORDER BY COALESCE(finished_at,started_at) DESC,run_id DESC""", (profile_id,)).fetchall()
+            standard_source = next((self.repository.root / "inputs" / "receptors" / profile_id / "redocking"
+                                    / str(row["run_id"]) / "dockrmsd" / "reference_ligand_heavy.mol2"
+                                    for row in validation_runs
+                                    if (self.repository.root / "inputs" / "receptors" / profile_id / "redocking"
+                                        / str(row["run_id"]) / "dockrmsd" / "reference_ligand_heavy.mol2").is_file()), None)
+            if standard_source:
+                standard_export = profile_root / "reference_ligand_heavy.mol2"
+                service.export_validation_standard(standard_source, standard_export)
+                self.repository.add_artifact(standard_export, "postdock_validation_standard_mol2", "postdock")
+                self.repository.record_provenance_event(
+                    event_type="postdock_validation_standard_exported", stage_name="postdock",
+                    entity_type="receptor_profile", entity_id=profile_id, receptor_profile_id=profile_id,
+                    data={"source": standard_source.relative_to(self.repository.root).as_posix(),
+                          "output": standard_export.relative_to(self.repository.root).as_posix()},
+                )
+            else:
+                self.repository.record_provenance_event(
+                    event_type="postdock_validation_standard_unavailable", stage_name="postdock", level="WARNING",
+                    entity_type="receptor_profile", entity_id=profile_id, receptor_profile_id=profile_id,
+                    message="No completed receptor-validation reference MOL2 was available for export",
+                )
         success = failed = 0
         for run in runs:
             profile_root = self.repository.root / "For_PostDocking" / run["receptor_profile_id"]
             expected_folders = ("PDBQTs",) if mode == "split_only" else ("SDF",) if mode == "sdf_only" else ("SDF", "PDBQTs")
-            already_exported = all((profile_root / folder / run["parent_id"]).exists() for folder in expected_folders)
+            export_root = lambda folder: profile_root / folder / run["parent_id"] / run["state_id"] / run["run_id"]
+            already_exported = all(
+                export_root(folder).is_dir()
+                and any(export_root(folder).glob("*.sdf" if folder == "SDF" else "*.pdbqt"))
+                for folder in expected_folders
+            )
             if already_exported:
                 self._emit("item_skipped", "postdock", run["state_id"], success + failed, len(runs), skipped=1, message="Compound already exported")
                 continue

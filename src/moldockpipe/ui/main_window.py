@@ -3,8 +3,8 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from PyQt6.QtCore import QThread, Qt
-from PyQt6.QtGui import QCloseEvent, QFont
+from PyQt6.QtCore import QThread, Qt, QUrl
+from PyQt6.QtGui import QCloseEvent, QDesktopServices, QFont
 from PyQt6.QtWidgets import (
     QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QPushButton, QProgressBar, QProgressDialog, QSplitter, QStatusBar, QStyle, QTableWidget, QTableWidgetItem,
@@ -14,7 +14,9 @@ from PyQt6.QtWidgets import (
 import yaml
 
 from ..project import ProjectRepository
+from ..csv_exports import export_leaderboard_csv as write_leaderboards, export_manifest_csv as write_manifests
 from ..reporting import generate_project_report
+from ..services.postdock import receptor_export_filename
 from .compound_selector import CompoundSelectorDialog
 from .progress import CheckpointProgress
 from .receptor_manager import ReceptorManagerDialog
@@ -87,7 +89,7 @@ class MainWindow(QMainWindow):
         export_menu.addAction("Leaderboard CSV", self.export_leaderboard_csv)
         export_menu.addAction("Project report (HTML)", self.export_project_report)
         export_menu.addSeparator()
-        self.docked_export_action = export_menu.addAction("Export docked compounds (PDBQT/SDF)", self.select_compounds_for_export)
+        self.docked_export_action = export_menu.addAction("Export docked compounds (PDBQT/SDF + receptor PDB)", self.select_compounds_for_export)
         export_button.setMenu(export_menu)
         export_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         toolbar.addWidget(export_button)
@@ -388,7 +390,8 @@ class MainWindow(QMainWindow):
     def _refresh_checkpoint_state(self) -> None:
         if not self.repo:
             return
-        profile_ids = [str(profile["id"]) for profile in self.repo.get_receptor_profiles() if profile.get("enabled")]
+        profiles = [profile for profile in self.repo.get_receptor_profiles() if profile.get("enabled")]
+        profile_ids = [str(profile["id"]) for profile in profiles]
         placeholders = ",".join("?" for _ in profile_ids)
         with self.repo.connection() as conn:
             parents = conn.execute("SELECT COUNT(*) FROM parent_ligands WHERE active=1").fetchone()[0]
@@ -426,7 +429,8 @@ class MainWindow(QMainWindow):
         if not self.repo:
             return
         self._dashboard_values = (parents, screened, states, prepared, docked)
-        profile_ids = [str(profile["id"]) for profile in self.repo.get_receptor_profiles() if profile.get("enabled")]
+        profiles = [profile for profile in self.repo.get_receptor_profiles() if profile.get("enabled")]
+        profile_ids = [str(profile["id"]) for profile in profiles]
         placeholders = ",".join("?" for _ in profile_ids)
         with self.repo.connection() as conn:
             passed = conn.execute("SELECT COUNT(*) FROM screening_results s JOIN parent_ligands p USING(parent_id) WHERE p.active=1 AND s.active=1 AND s.decision != 'fail'").fetchone()[0]
@@ -458,10 +462,13 @@ class MainWindow(QMainWindow):
                 FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id
                 LEFT JOIN docking_poses p ON p.run_id=d.run_id
                 WHERE s.active=1 AND d.status IN ('failed','interrupted') GROUP BY d.run_id, s.state_id ORDER BY s.state_id LIMIT 6""").fetchall()
-            docked_pairs = [(row[0], row[1]) for row in conn.execute(f"""SELECT DISTINCT d.receptor_profile_id, s.parent_id
+            docked_exports = [tuple(row) for row in conn.execute(f"""SELECT DISTINCT d.receptor_profile_id, s.parent_id, s.state_id, d.run_id
                 FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id JOIN parent_ligands p USING(parent_id)
                 WHERE p.active=1 AND s.active=1 AND d.status='completed' AND d.is_current=1
                 AND d.receptor_profile_id IN ({placeholders})""", profile_ids).fetchall()] if profile_ids else []
+            validated_profiles = {str(row[0]) for row in conn.execute(
+                "SELECT DISTINCT receptor_profile_id FROM redocking_runs WHERE status='ARTIFACTS_READY'"
+            ).fetchall()}
         self.stat_cards["ligands"].setText(str(parents))
         self.stat_cards["passed"].setText(str(passed))
         self.stat_cards["failed"].setText(str(failed))
@@ -481,10 +488,27 @@ class MainWindow(QMainWindow):
         )
         self.project_summary.setText(f"Current Project: {self.repo.root.name}")
         exported_root = self.repo.root / "For_PostDocking"
-        ready_for_export = [(profile_id, parent_id) for profile_id, parent_id in docked_pairs
-                            if not any((exported_root / profile_id / folder / parent_id).exists() for folder in ("SDF", "PDBQTs"))]
-        export_status = "Ready" if ready_for_export else "Pending"
-        self.docked_export_action.setEnabled(bool(ready_for_export))
+        mode = str(self.repo.get_settings().get("postdock", {}).get("mode", "split_and_sdf"))
+        expected = ("PDBQTs",) if mode == "split_only" else ("SDF",) if mode == "sdf_only" else ("SDF", "PDBQTs")
+        pending_exports = []
+        for profile_id, parent_id, state_id, run_id in docked_exports:
+            def complete(folder: str) -> bool:
+                target = exported_root / profile_id / folder / parent_id / state_id / run_id
+                suffix = "*.sdf" if folder == "SDF" else "*.pdbqt"
+                return target.is_dir() and any(target.glob(suffix))
+            if not all(complete(folder) for folder in expected):
+                pending_exports.append((profile_id, parent_id, state_id, run_id))
+        profile_names = {str(profile["id"]): str(profile.get("name", profile["id"])) for profile in profiles}
+        package_update_needed = any(
+            not (exported_root / profile_id / receptor_export_filename(profile_names[profile_id])).is_file()
+            or (profile_id in validated_profiles and not (exported_root / profile_id / "reference_ligand_heavy.mol2").is_file())
+            for profile_id in {str(row[0]) for row in docked_exports}
+        )
+        has_docking_exports = bool(docked_exports)
+        export_status = "Ready" if pending_exports or package_update_needed else "Complete" if has_docking_exports else "Pending"
+        # Completed results remain exportable so users can refresh an existing
+        # package when bundle contents or export settings change.
+        self.docked_export_action.setEnabled(has_docking_exports)
         labels = {
             "screening": f"Screening\n{passed} passed; {failed} failed",
             "molscrub": f"States\n{states} generated",
@@ -498,7 +522,7 @@ class MainWindow(QMainWindow):
             button.setText(f"{icon} {labels[stage]}")
             button.setToolTip(labels[stage].replace("\n", "\n"))
             if stage == "postdock":
-                button.setEnabled(bool(ready_for_export))
+                button.setEnabled(has_docking_exports)
             if status == "complete":
                 button.setStyleSheet("QPushButton { color: #166534; background: #dcfce7; border: 1px solid #86efac; }")
             elif status == "active":
@@ -686,7 +710,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Docking complete",
-                "Docking has finished. Export is ready.\n\nUse the Export menu, then choose 'Export docked compounds (PDBQT/SDF)'."
+                "Docking has finished. Export is ready.\n\nUse the Export menu, then choose 'Export docked compounds (PDBQT/SDF + receptor PDB)'."
             )
 
     def _pipeline_failed(self, message: str) -> None:
@@ -839,12 +863,30 @@ class MainWindow(QMainWindow):
         self._activate_project("Reloaded")
 
     def export_manifest_csv(self) -> None:
-        if self.repo:
-            SettingsDialog(self.repo.get_settings(), self, self.repo)._export_manifest()
+        if not self.repo:
+            return
+        try:
+            outputs = write_manifests(self.repo)
+        except Exception as exc:
+            QMessageBox.critical(self, "Manifest export failed", str(exc)); return
+        self._write_log(f"Exported manifest CSV files: {len(outputs)}")
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.repo.root / "exports")))
+        QMessageBox.information(self, "Manifest export complete",
+            f"Combined manifest:\n{self.repo.root / 'exports' / 'manifest.csv'}\n\n"
+            f"Also wrote {len(outputs) - 1} receptor-specific manifest files.")
 
     def export_leaderboard_csv(self) -> None:
-        if self.repo:
-            SettingsDialog(self.repo.get_settings(), self, self.repo)._export_leaderboard()
+        if not self.repo:
+            return
+        try:
+            outputs = write_leaderboards(self.repo)
+        except Exception as exc:
+            QMessageBox.critical(self, "Leaderboard export failed", str(exc)); return
+        self._write_log(f"Exported leaderboard CSV files: {len(outputs)}")
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.repo.root / "exports")))
+        QMessageBox.information(self, "Leaderboard export complete",
+            f"Combined leaderboard:\n{self.repo.root / 'exports' / 'leaderboard.csv'}\n\n"
+            f"Also wrote {len(outputs) - 1} receptor-specific leaderboard files.")
 
     def export_project_report(self) -> None:
         if not self.repo or self.stage_running:

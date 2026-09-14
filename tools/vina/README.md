@@ -1,12 +1,15 @@
 # AutoDock Vina Binary
 
-Place the Windows AutoDock Vina executable in this fixed application folder.
-The application checks these names in order:
+Place the platform-compatible AutoDock Vina executable in this application
+folder. The application recognizes:
 
 - `vina.exe`
 - `vina_1.2.7_win.exe`
+- `vina` on Linux and macOS
 
-Place `vina_split.exe` here as well (the application also checks `tools/vina_split.exe`).
+Place `vina_split.exe` (Windows) or `vina_split` (Linux/macOS) here as well.
+Project-local `tools/vina/` folders and executables on `PATH` are also supported.
+Set `MOLDOCKPIPE_VINA` or `MOLDOCKPIPE_VINA_SPLIT` to select an explicit tool.
 
 The receptor is expected at `inputs/receptor_prepared.pdbqt` in the selected project.
 Each run writes a readable `vina.log.txt`; command/settings provenance is also

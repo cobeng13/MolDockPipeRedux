@@ -20,6 +20,20 @@ Keep RDKit and PyQt6 Conda-managed. The project installs MolScrub, Meeko, SciPy,
 Gemmi, Joblib, and the test dependencies through pip. Do not install a pip PyQt6
 wheel into the same environment.
 
+For a headless Linux or macOS environment, PyQt is not required:
+
+```bash
+conda create -n moldockpipe -c conda-forge python=3.13 rdkit pip
+conda activate moldockpipe
+pip install -e ".[chemistry,dev]"
+python -m pytest -q
+moldockpipe run /path/to/project
+```
+
+The worker runs the existing pipeline and writes the same portable project
+layout. Select individual stages with `--stages`, for example
+`moldockpipe run /path/to/project --stages screening molscrub meeko`.
+
 ## Project Inputs
 
 In the UI, New Project asks for a project name and creates it under `Projects/`
@@ -104,8 +118,10 @@ The development Vina executable is supplied in the repository under:
 tools/vina/vina.exe
 ```
 
-`vina_1.2.7_win.exe` is also detected. Place `vina_split.exe` in either
-`tools/vina/` or `tools/`; binaries under `tools/vina/` are tracked for fast development.
+`vina_1.2.7_win.exe` is also detected. On Linux and macOS, use `vina` and
+`vina_split`. Tools can be placed in `tools/vina/`, supplied on `PATH`, or
+selected explicitly with `MOLDOCKPIPE_VINA` and `MOLDOCKPIPE_VINA_SPLIT`.
+Binaries under `tools/vina/` are tracked for fast development.
 
 Post-docking supports:
 
