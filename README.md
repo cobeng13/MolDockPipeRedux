@@ -9,7 +9,7 @@ separate. The legacy scripts remain in `Reference/` as behavioral reference only
 RDKit is best installed from conda-forge. Install the application into that environment:
 
 ```powershell
-conda create -n moldockpipe-clean -c conda-forge python=3.13 rdkit pyqt=6 pip
+conda create -n moldockpipe-clean -c conda-forge python=3.13 rdkit pyqt6 pip
 conda activate moldockpipe-clean
 pip install -e ".[chemistry,dev]"
 python -m pytest -q
@@ -118,8 +118,10 @@ The development Vina executable is supplied in the repository under:
 tools/vina/vina.exe
 ```
 
-`vina_1.2.7_win.exe` is also detected. On Linux and macOS, use `vina` and
-`vina_split`. Tools can be placed in `tools/vina/`, supplied on `PATH`, or
+`vina_1.2.7_win.exe` is also detected. Bundled Vina 1.2.7 binaries are selected
+for Windows, Linux x86_64, macOS Intel, and macOS Apple Silicon automatically.
+Linux ARM requires separately supplied compatible tools. Generic `vina` and
+`vina_split` filenames remain supported on Linux and macOS. Tools can be placed in `tools/vina/`, supplied on `PATH`, or
 selected explicitly with `MOLDOCKPIPE_VINA` and `MOLDOCKPIPE_VINA_SPLIT`.
 Binaries under `tools/vina/` are tracked for fast development.
 

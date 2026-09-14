@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +18,17 @@ class ExecutableSpec:
 
     @property
     def platform_names(self) -> tuple[str, ...]:
-        return self.windows_names if os.name == "nt" else self.posix_names
+        system = platform.system()
+        if system == "Windows":
+            return self.windows_names
+        machine = platform.machine().lower()
+        architecture = {"amd64": "x86_64", "x86_64": "x86_64",
+                        "arm64": "aarch64", "aarch64": "aarch64"}.get(machine)
+        operating_system = {"Darwin": "mac", "Linux": "linux"}.get(system)
+        if operating_system and architecture:
+            bundled = f"{self.posix_names[0]}_1.2.7_{operating_system}_{architecture}"
+            return (bundled, *self.posix_names)
+        return self.posix_names
 
 
 VINA = ExecutableSpec(

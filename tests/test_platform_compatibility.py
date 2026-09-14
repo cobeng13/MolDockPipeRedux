@@ -79,3 +79,44 @@ def test_headless_run_does_not_require_qt(tmp_path: Path, monkeypatch: pytest.Mo
     assert __main__.main() == 0
     assert calls == ["recover", "screening"]
     assert json.loads(capsys.readouterr().out) == {"screening": [2, 0]}
+
+
+@pytest.mark.parametrize("system,machine,suffix", [
+    ("Windows", "AMD64", "win.exe"),
+    ("Linux", "x86_64", "linux_x86_64"),
+    ("Darwin", "x86_64", "mac_x86_64"),
+    ("Darwin", "arm64", "mac_aarch64"),
+    ("Darwin", "aarch64", "mac_aarch64"),
+])
+@pytest.mark.parametrize("spec", [executables.VINA, executables.VINA_SPLIT])
+def test_mixed_os_bundle_selects_matching_binary(tmp_path, monkeypatch, system, machine, suffix, spec):
+    application = tmp_path / "application"
+    prefix = spec.posix_names[0]
+    names = [f"{prefix}_1.2.7_{value}" for value in
+             ("linux_x86_64", "mac_x86_64", "mac_aarch64", "win.exe")]
+    names.append("vina_split.exe")
+    for name in names:
+        _make_executable(application / "tools" / "vina" / name)
+    monkeypatch.setattr(executables.platform, "system", lambda: system)
+    monkeypatch.setattr(executables.platform, "machine", lambda: machine)
+    monkeypatch.setattr(executables, "application_root", lambda: application)
+    monkeypatch.setattr(executables.shutil, "which", lambda _: None)
+    monkeypatch.delenv(spec.environment_variable, raising=False)
+    expected = "vina_split.exe" if system == "Windows" and spec == executables.VINA_SPLIT else f"{prefix}_1.2.7_{suffix}"
+    assert executables.find_executable(spec, tmp_path / "project").name == expected
+
+
+@pytest.mark.parametrize("spec", [executables.VINA, executables.VINA_SPLIT])
+def test_linux_arm_does_not_select_other_architectures(tmp_path, monkeypatch, spec):
+    application = tmp_path / "application"
+    for suffix in ("linux_x86_64", "mac_aarch64", "mac_x86_64"):
+        _make_executable(application / "tools" / "vina" / f"{spec.posix_names[0]}_1.2.7_{suffix}")
+    monkeypatch.setattr(executables.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(executables.platform, "machine", lambda: "aarch64")
+    monkeypatch.setattr(executables, "application_root", lambda: application)
+    monkeypatch.setattr(executables.shutil, "which", lambda _: None)
+    monkeypatch.delenv(spec.environment_variable, raising=False)
+    with pytest.raises(FileNotFoundError):
+        executables.find_executable(spec, tmp_path / "project")
+    generic = _make_executable(application / "tools" / "vina" / spec.posix_names[0])
+    assert executables.find_executable(spec, tmp_path / "project") == generic.resolve()
