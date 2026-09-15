@@ -154,3 +154,9 @@ Each manifest includes receptor identity and its reproducibility hashes. Each
 leaderboard contains the top three poses per parent compound for that receptor,
 sorted by most-negative affinity. Workflow Maintenance can clear generated data
 while preserving inputs and `project.yml`.
+
+## Optional zinc-metalloprotein docking
+
+The feature branch adds receptor-specific AutoDock4Zn preparation and Vina AD4
+map scoring. Standard Vina remains the default. See [AD4Zn setup and validation](docs/AD4Zn.md)
+for the required external tools and manual validation steps.
