@@ -14,6 +14,7 @@ from .services.meeko import MeekoService
 from .services.screening import screen_smiles
 from .services.validation import validate_pdbqt
 from .services.vina import VinaDockingBackend, find_vina_executable, find_vina_split_executable
+from .receptors.ad4zn import protocol_for, ensure_ad4zn_maps
 from .services.postdock import PostDockService, receptor_export_filename
 
 
@@ -226,8 +227,23 @@ class PipelineRunner:
             run_settings = {key: value for key, value in profile.items()
                             if key not in {"id", "name", "enabled", "archived", "receptor"} and value is not None}
             run_settings["cpu"] = run_settings.pop("cpu_count", 1)
-            if not receptor.is_file():
-                reason = f"Prepared receptor not found: {receptor}"
+            maps_kwargs = {}
+            preparation_error = None
+            # Omit the default discriminator from standard fingerprints to preserve legacy reuse.
+            if run_settings.get("protocol", "vina") == "vina":
+                run_settings.pop("protocol", None)
+                run_settings.pop("ad4zn", None)
+            try:
+                if protocol_for(profile) == "ad4zn" and states:
+                    self._emit("item_started", "vina", message=f"{profile_name}: preparing AD4Zn maps")
+                    ligands = [self.repository.root / "artifacts" / "pdbqt" / state["parent_id"] / state["state_id"] / "ligand.pdbqt" for state in states]
+                    maps, record = ensure_ad4zn_maps(self.repository, profile, ligands, executable)
+                    run_settings["ad4zn"] = record
+                    maps_kwargs = {"maps": maps}
+            except Exception as exc:
+                preparation_error = str(exc)
+            if preparation_error or not receptor.is_file():
+                reason = preparation_error or f"Prepared receptor not found: {receptor}"
                 missing_fp = fingerprint(settings=run_settings, inputs={"receptor": "missing"}, tool_version=executable_hash)
                 for state in states:
                     index += 1
@@ -247,13 +263,17 @@ class PipelineRunner:
                                message=reason)
                 continue
             receptor_hash = file_sha256(receptor)
-            settings_fp = fingerprint(settings=run_settings, inputs={"receptor": receptor_hash}, tool_version=executable_hash)
+            base_settings_fp = fingerprint(settings=run_settings, inputs={"receptor": receptor_hash}, tool_version=executable_hash)
             for state in states:
                 index += 1
                 self._emit("item_started", "vina", state["state_id"], index, total,
                            receptor_profile_id=profile_id, receptor_profile_name=profile_name,
                            message=f"{profile_name}: {state['state_id']}")
                 ligand = self.repository.root / "artifacts" / "pdbqt" / state["parent_id"] / state["state_id"] / "ligand.pdbqt"
+                settings_fp = base_settings_fp
+                if protocol_for(profile) == "ad4zn":
+                    settings_fp = fingerprint(settings={"context": base_settings_fp},
+                        inputs={"ligand": file_sha256(ligand)}, tool_version=executable_hash)
                 run_id = str(uuid.uuid4())
                 run_dir = self.repository.root / "artifacts" / "docking" / profile_id / state["parent_id"] / state["state_id"] / run_id
                 output = run_dir / "vina_output.pdbqt"
@@ -280,7 +300,7 @@ class PipelineRunner:
                             (run_id, state["state_id"], receptor_hash, settings_fp, StageStatus.RUNNING,
                              json.dumps({"settings": run_settings, "argv": []}, sort_keys=True),
                              utc_now(), profile_id, profile_name, workflow_run_id))
-                    result = backend.run(executable=executable, receptor=receptor, ligand=ligand, output=output, log=log, settings=run_settings)
+                    result = backend.run(executable=executable, receptor=receptor, ligand=ligand, output=output, log=log, settings=run_settings, **maps_kwargs)
                     raw_artifact = self.repository.add_artifact(output, "vina_output_pdbqt", "vina") if output.exists() else None
                     log_artifact = self.repository.add_artifact(log, "vina_log_txt", "vina")
                     with self.repository.connection() as conn:
@@ -334,7 +354,7 @@ class PipelineRunner:
         with self.repository.connection() as conn:
             placeholders = ",".join("?" for _ in profile_ids)
             runs = conn.execute(f"""SELECT d.run_id, d.receptor_profile_id, d.receptor_profile_name,
-                    s.parent_id, s.state_id, a.relative_path raw_path
+                    s.parent_id, s.state_id, a.relative_path raw_path, d.command_json
                 FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id
                 JOIN artifacts a ON a.artifact_id=d.raw_output_artifact_id
                 WHERE d.status='completed' AND d.is_current=1 AND s.active=1
@@ -385,6 +405,14 @@ class PipelineRunner:
         success = failed = 0
         for run in runs:
             profile_root = self.repository.root / "For_PostDocking" / run["receptor_profile_id"]
+            run_record = json.loads(run["command_json"])
+            if run_record.get("settings", {}).get("protocol") == "ad4zn":
+                metadata = profile_root / "protocols" / (run["run_id"] + ".json")
+                metadata.parent.mkdir(parents=True, exist_ok=True)
+                metadata.write_text(json.dumps({"run_id": run["run_id"], "protocol": "ad4zn",
+                    "settings": run_record.get("settings", {}),
+                    "note": "Prepared PDB contains physical receptor atoms; TZ pseudoatoms and maps remain in the project AD4Zn bundle."}, indent=2), encoding="utf-8")
+                self.repository.add_artifact(metadata, "postdock_protocol", "postdock")
             expected_folders = ("PDBQTs",) if mode == "split_only" else ("SDF",) if mode == "sdf_only" else ("SDF", "PDBQTs")
             export_root = lambda folder: profile_root / folder / run["parent_id"] / run["state_id"] / run["run_id"]
             already_exported = all(

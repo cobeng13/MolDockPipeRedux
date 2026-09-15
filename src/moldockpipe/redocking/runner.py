@@ -14,6 +14,7 @@ from ..project import ProjectRepository, utc_now
 from ..receptors.ligand_chemistry import (
     chemistry_summary, hydrogenated_copy, pose_in_reference_order, read_sdf, validate_same_heavy_graph, write_mol2, write_sdf,
 )
+from ..receptors.ad4zn import protocol_for, ensure_ad4zn_maps, check_ad4zn_environment, require_zinc
 from ..services.meeko import MeekoService
 from ..services.postdock import PostDockService
 from ..services.validation import parse_vina_poses, validate_pdbqt
@@ -54,6 +55,12 @@ def validate_redocking_prerequisites(repository: ProjectRepository, profile: dic
         except (KeyError, TypeError, ValueError): missing.append("Docking-box dimensions"); break
     try: find_vina_executable(repository.root)
     except FileNotFoundError: missing.append("Vina executable")
+    try:
+        if protocol_for(profile) == "ad4zn":
+            missing.extend("AD4Zn: " + name for name in check_ad4zn_environment(repository.root).missing)
+            require_zinc(receptor)
+    except (ValueError, OSError) as exc:
+        missing.append(str(exc))
     return missing
 
 
@@ -178,11 +185,22 @@ class RedockingRunner:
                 "size_x": self.profile["size_x"], "size_y": self.profile["size_y"], "size_z": self.profile["size_z"],
                 "exhaustiveness": settings["exhaustiveness"], "num_modes": settings["num_modes"], "energy_range": settings["energy_range"],
                 "seed": settings["seed"], "cpu": settings["cpu_count"]}
+            maps_kwargs = {}
+            if protocol_for(self.profile) == "ad4zn":
+                self._stage_start(run_id, "ad4zn_maps", file_sha256(ligand_pdbqt))
+                maps, record = ensure_ad4zn_maps(self.repository, self.profile, [ligand_pdbqt], executable, self._cancelled)
+                vina_settings.update(protocol="ad4zn", ad4zn=record)
+                maps_kwargs = {"maps": maps}
+                settings["protocol"] = "ad4zn"
+                settings["ad4zn"] = record
+                with self.repository.connection() as conn:
+                    conn.execute("UPDATE redocking_runs SET settings_json=? WHERE run_id=?", (json.dumps(settings, sort_keys=True), run_id))
+                self._stage_done(run_id, "ad4zn_maps", {"maps": record["map_fingerprint"]})
             dock_fp = fingerprint(settings=vina_settings, inputs={"ligand": file_sha256(ligand_pdbqt), "receptor": receptor_hash}, tool_version=file_sha256(executable))
             if not self._stage_reusable(run_id, STAGES[2], dock_fp, (multi, vina_log)):
                 self._stage_start(run_id, STAGES[2], dock_fp)
                 result = self.vina.run(executable=executable, receptor=receptor, ligand=ligand_pdbqt, output=multi, log=vina_log,
-                                       settings=vina_settings, cancelled=self._cancelled)
+                                       settings=vina_settings, cancelled=self._cancelled, **maps_kwargs)
                 if result.return_code or not result.poses: raise RuntimeError(result.stderr or "Vina produced no scored poses")
                 (docking_dir / "command.json").write_text(json.dumps({"command": list(result.command), "exit_code": result.return_code}, indent=2), encoding="utf-8")
                 self._stage_done(run_id, STAGES[2], {"pdbqt": file_sha256(multi), "log": file_sha256(vina_log)})
@@ -191,7 +209,10 @@ class RedockingRunner:
             if not scored: raise ValueError("Vina output contains no scored poses")
 
             combined = poses_dir / "all_poses.sdf"
-            export_fp = fingerprint(settings={"all_poses": True}, inputs={"pdbqt": file_sha256(multi)}, tool_version=_tool_version("meeko"))
+            export_settings = {"all_poses": True}
+            if protocol_for(self.profile) == "ad4zn":
+                export_settings.update(protocol="ad4zn", docking_fingerprint=dock_fp)
+            export_fp = fingerprint(settings=export_settings, inputs={"pdbqt": file_sha256(multi)}, tool_version=_tool_version("meeko"))
             expected_sdfs = tuple(poses_dir / f"pose_{rank:03d}.sdf" for rank, *_ in scored)
             if not self._stage_reusable(run_id, STAGES[3], export_fp, expected_sdfs):
                 self._stage_start(run_id, STAGES[3], export_fp); self.postdock.export_sdf(multi, combined, poses_dir / "meeko_export.log")
@@ -201,6 +222,7 @@ class RedockingRunner:
                 for (rank, affinity, _, _), molecule, destination in zip(scored, molecules, expected_sdfs):
                     molecule.SetIntProp("POSE_RANK", rank); molecule.SetDoubleProp("VINA_AFFINITY", affinity)
                     molecule.SetProp("RECEPTOR_PROFILE_ID", profile_id); molecule.SetProp("REDOCKING_RUN_ID", run_id)
+                    molecule.SetProp("DOCKING_PROTOCOL", protocol_for(self.profile))
                     molecule.SetIntProp("SEED", int(settings["seed"])); molecule.SetProp("BOX_JSON", json.dumps(vina_settings, sort_keys=True))
                     molecule.SetProp("SOURCE_PDBQT", multi.relative_to(self.repository.root).as_posix()); write_sdf(molecule, destination)
                 self._stage_done(run_id, STAGES[3], {path.name: file_sha256(path) for path in expected_sdfs})

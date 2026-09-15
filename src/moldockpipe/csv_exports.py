@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
 from typing import Any
 
@@ -11,11 +12,11 @@ MANIFEST_HEADERS = [
     "receptor_id", "receptor_name", "id", "smiles", "inchikey", "admet_status", "admet_reason",
     "sdf_status", "sdf_path", "sdf_reason", "pdbqt_status", "pdbqt_path", "pdbqt_reason",
     "vina_status", "vina_score", "vina_pose", "vina_reason", "config_hash", "receptor_sha1",
-    "tools_rdkit", "tools_meeko", "tools_vina", "created_at", "updated_at",
+    "tools_rdkit", "tools_meeko", "tools_vina", "created_at", "updated_at", "protocol",
 ]
 LEADERBOARD_HEADERS = [
     "receptor_id", "receptor_name", "parent_id", "state_id", "mode_index", "affinity",
-    "rmsd_lb", "rmsd_ub", "run_id", "pose_rank",
+    "rmsd_lb", "rmsd_ub", "run_id", "pose_rank", "protocol",
 ]
 
 
@@ -65,6 +66,7 @@ def export_manifest_csv(repository: ProjectRepository) -> list[Path]:
                     "config_hash": run["settings_fingerprint"] if run else "", "receptor_sha1": run["receptor_hash"] if run else "",
                     "tools_rdkit": "RDKit", "tools_meeko": "Meeko", "tools_vina": "Vina",
                     "created_at": parent["created_at"], "updated_at": parent["created_at"],
+                    "protocol": json.loads(run["command_json"]).get("settings", {}).get("protocol", "vina") if run else profile.get("protocol", "vina"),
                 }
                 rows.append(row); combined.append(row)
             output = repository.root / "exports" / profile_id / "manifest.csv"
@@ -87,14 +89,16 @@ def export_leaderboard_csv(repository: ProjectRepository) -> list[Path]:
     with repository.connection() as conn:
         for profile in profiles:
             profile_id = str(profile["id"])
-            query_rows = conn.execute("""SELECT parent_id,state_id,mode_index,affinity,rmsd_lb,rmsd_ub,run_id,pose_rank
-                FROM (SELECT s.parent_id,s.state_id,p.mode_index,p.affinity,p.rmsd_lb,p.rmsd_ub,d.run_id,
+            query_rows = conn.execute("""SELECT parent_id,state_id,mode_index,affinity,rmsd_lb,rmsd_ub,run_id,pose_rank,command_json
+                FROM (SELECT s.parent_id,s.state_id,p.mode_index,p.affinity,p.rmsd_lb,p.rmsd_ub,d.run_id,d.command_json,
                     ROW_NUMBER() OVER (PARTITION BY s.parent_id ORDER BY p.affinity ASC) pose_rank
                     FROM docking_poses p JOIN docking_runs d ON d.run_id=p.run_id
                     JOIN molecular_states s ON s.state_id=d.state_id JOIN parent_ligands l ON l.parent_id=s.parent_id
                     WHERE l.active=1 AND s.active=1 AND d.is_current=1 AND d.status='completed' AND d.receptor_profile_id=?)
                 WHERE pose_rank<=3 ORDER BY affinity,parent_id,pose_rank""", (profile_id,)).fetchall()
             rows = [{"receptor_id": profile_id, "receptor_name": profile.get("name", profile_id), **dict(row)} for row in query_rows]
+            for row in rows:
+                row["protocol"] = json.loads(row.pop("command_json")).get("settings", {}).get("protocol", "vina")
             combined.extend(rows)
             output = repository.root / "exports" / profile_id / "leaderboard.csv"
             _write_csv(output, LEADERBOARD_HEADERS, rows); outputs.append(output)

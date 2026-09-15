@@ -14,6 +14,7 @@ from typing import Any
 import yaml
 
 from .extraction import structure_as_pdb, write_box_pdb, write_cleaned_receptor, write_reference_ligand
+from .ad4zn import protocol_for, check_ad4zn_environment, probe_environment, prepare_zinc_receptor
 from .models import ReceptorPreparationPlan
 from .ligand_chemistry import create_reference_bundle
 from .validation import validate_plan, validate_prepared_outputs
@@ -69,6 +70,8 @@ def _meeko_failure_message(stderr: str, failure_dir: Path) -> str:
 def _prepare_receptor_files(project_root: Path, plan: ReceptorPreparationPlan,
                             inventory: dict[str, object]) -> Path:
     """Prepare into a temporary sibling and publish only after every check passes."""
+    protocol_for({"protocol": plan.protocol})
+    tools = check_ad4zn_environment(project_root).require() if plan.protocol == "ad4zn" else None
     validate_plan(plan)
     parent = Path(project_root) / "inputs" / "receptors"
     parent.mkdir(parents=True, exist_ok=True)
@@ -85,6 +88,10 @@ def _prepare_receptor_files(project_root: Path, plan: ReceptorPreparationPlan,
         inventory_path.write_text(json.dumps(inventory, indent=2), encoding="utf-8")
         cleaned = work / "receptor_cleaned.pdb"
         write_cleaned_receptor(pdb_text, plan, cleaned)
+        if tools and not any(line.startswith(("ATOM  ", "HETATM")) and line[76:78].strip().upper() == "ZN"
+                             for line in cleaned.read_text().splitlines()):
+            failure_dir = _preserve_failure_artifacts(project_root, plan.profile_id, work)
+            raise ValueError(f"AD4Zn needs retained Zn in the cleaned receptor. Review component choices. Logs: {failure_dir}")
         if plan.reference_ligand:
             reference_folder = work / "reference_ligand"
             reference_folder.mkdir()
@@ -110,7 +117,28 @@ def _prepare_receptor_files(project_root: Path, plan: ReceptorPreparationPlan,
             failure_dir = _preserve_failure_artifacts(project_root, plan.profile_id, work)
             raise RuntimeError(_meeko_failure_message(result.stderr, failure_dir))
         warnings = validate_prepared_outputs(work, plan)
+        zinc_report = None
+        if tools:
+            zinc_work = work / "ad4zn" / "receptor_preparation"
+            zinc_work.mkdir(parents=True)
+            try:
+                cleaned_zn = sum(line.startswith(("ATOM  ", "HETATM")) and line[76:78].strip().upper() == "ZN"
+                                 for line in cleaned.read_text().splitlines())
+                prepared_zn = sum(line.startswith(("ATOM  ", "HETATM")) and line[77:].strip().upper() == "ZN"
+                                  for line in (work / "receptor.pdbqt").read_text().splitlines())
+                if cleaned_zn != prepared_zn:
+                    raise ValueError("Meeko did not preserve all retained Zn atoms")
+                records = []
+                versions = probe_environment(tools, zinc_work, records)
+                tz = prepare_zinc_receptor(work / "receptor.pdbqt", zinc_work, tools, records)
+                zinc_report = {"tz_receptor": "ad4zn/receptor_preparation/receptor_TZ.pdbqt",
+                    "tz_receptor_sha256": _sha256(tz), "versions": versions,
+                    "map_status": "Pending prepared ligand atom types"}
+            except Exception as exc:
+                failure_dir = _preserve_failure_artifacts(project_root, plan.profile_id, work)
+                raise RuntimeError(f"AD4Zn receptor preparation failed: {exc}. Logs: {failure_dir}") from exc
         report: dict[str, Any] = {
+            "protocol": plan.protocol, "ad4zn": zinc_report,
             "receptor_profile_id": plan.profile_id, "receptor_name": plan.profile_name,
             "source_sha256": _sha256(source), "cleaned_receptor_sha256": _sha256(cleaned),
             "prepared_receptor_sha256": _sha256(work / "receptor.pdbqt"), "meeko_version": _meeko_version(),

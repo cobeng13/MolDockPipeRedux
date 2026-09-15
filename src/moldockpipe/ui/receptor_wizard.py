@@ -67,6 +67,10 @@ class SourcePage(QWidget):
         content = _page_surface(self)
         _page_heading(content, "Select structure", "Choose the source structure and the receptor chains to prepare.")
         form = QFormLayout(); form.setContentsMargins(0, 0, 0, 0); form.setHorizontalSpacing(14); form.setVerticalSpacing(10)
+        self.protocol = QComboBox()
+        self.protocol.addItem("Standard AutoDock Vina", "vina")
+        self.protocol.addItem("AutoDock4Zn / Vina AD4 scoring", "ad4zn")
+        form.addRow("Docking protocol", self.protocol)
         form.addRow("Receptor profile name", self.name); form.addRow("Input structure", row)
         form.addRow("Structural model", self.model); form.addRow("Chains to include", self.chains)
         note = QLabel("The source is copied into the portable project. The original file is never modified.")
@@ -469,6 +473,7 @@ class ReceptorPreparationWizard(QDialog):
             altloc_choices=self.integrity_page.selected_altlocs(),
             excluded_receptor_residues=self.integrity_page.excluded_residues(),
             preserve_hydrogens=self.finish_page.preserve.isChecked(),
+            protocol=self.source_page.protocol.currentData(),
             chemistry_template_path=Path(self.components_page.template.text()).resolve() if self.components_page.template.text().strip() else None)
 
 

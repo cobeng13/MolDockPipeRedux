@@ -25,6 +25,7 @@ SCHEMA_VERSION = 6
 DEFAULT_VINA_PROFILE: dict[str, Any] = {
     "id": "default",
     "name": "Default",
+    "protocol": "vina",
     "enabled": True,
     "archived": False,
     "receptor": "inputs/receptors/default/receptor.pdbqt",
@@ -272,9 +273,12 @@ class ProjectRepository:
         profiles = self.get_settings().get("vina", {}).get("profiles", [])
         if not isinstance(profiles, list):
             return []
-        return [dict(profile) for profile in profiles if isinstance(profile, dict) and (include_archived or not profile.get("archived", False))]
+        return [{**profile, "protocol": profile.get("protocol", "vina")} for profile in profiles if isinstance(profile, dict) and (include_archived or not profile.get("archived", False))]
 
     def save_receptor_profiles(self, profiles: list[dict[str, Any]]) -> None:
+        from .receptors.ad4zn import protocol_for
+        for profile in profiles:
+            protocol_for(profile)
         path = self.root / "project.yml"
         config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         config["vina"] = {"profiles": profiles}

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from PyQt6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget
 
 from ..project import ProjectRepository
@@ -21,20 +23,20 @@ class DockingResultsDialog(QDialog):
         layout = QVBoxLayout(self); layout.addWidget(tabs); layout.addWidget(buttons)
 
     def _profile_table(self, profile_id: str) -> QTableWidget:
-        headers = ["Ligand", "Best state", "Affinity", "Mode", "Status", "Reason"]
+        headers = ["Ligand", "Best state", "Affinity", "Mode", "Status", "Reason", "Protocol"]
         table = QTableWidget(0, len(headers)); table.setHorizontalHeaderLabels(headers)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         with self.repository.connection() as conn:
             parents = conn.execute("SELECT parent_id FROM parent_ligands WHERE active=1 ORDER BY parent_id").fetchall()
             best = {row["parent_id"]: row for row in conn.execute("""WITH ranked AS (
-                    SELECT s.parent_id, s.state_id, p.affinity, p.mode_index,
+                    SELECT s.parent_id, s.state_id, p.affinity, p.mode_index, d.command_json,
                            ROW_NUMBER() OVER (PARTITION BY s.parent_id ORDER BY p.affinity, s.state_id, p.mode_index) rank
                     FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id
                     JOIN docking_poses p ON p.run_id=d.run_id
                     WHERE d.receptor_profile_id=? AND d.is_current=1 AND d.status='completed' AND s.active=1)
                 SELECT * FROM ranked WHERE rank=1""", (profile_id,)).fetchall()}
             latest = {row["parent_id"]: row for row in conn.execute("""WITH ranked AS (
-                    SELECT s.parent_id, d.status, COALESCE(d.reason, '') reason,
+                    SELECT s.parent_id, d.status, d.command_json, COALESCE(d.reason, '') reason,
                            ROW_NUMBER() OVER (PARTITION BY s.parent_id ORDER BY d.started_at DESC, d.run_id DESC) rank
                     FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id
                     WHERE d.receptor_profile_id=? AND d.is_current=1 AND s.active=1)
@@ -51,6 +53,8 @@ class DockingResultsDialog(QDialog):
             values = [parent_id, score["state_id"] if score else "", score["affinity"] if score else "",
                       score["mode_index"] if score else "", "completed" if score else run["status"] if run else "pending",
                       "" if score else run["reason"] if run else ""]
+            source = score or run
+            values.append(json.loads(source["command_json"]).get("settings", {}).get("protocol", "vina") if source else "")
             for column, value in enumerate(values):
                 table.setItem(row, column, QTableWidgetItem(str(value)))
         return table

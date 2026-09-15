@@ -127,7 +127,7 @@ class ReportDataBuilder:
             "limitations": [
                 "Vina affinities are ranking estimates and are not experimental binding free energies.",
                 "Redocking remains ARTIFACTS_READY until an external RMSD result is recorded.",
-                "Flexible-receptor, covalent, and metal-specific docking are outside the current workflow.",
+                "Flexible-receptor and covalent docking are outside the current workflow. AD4Zn is opt-in and requires target-specific validation; scores from different protocols are not directly comparable.",
                 "Inferred ligand chemistry and deliberately excluded receptor residues should be reviewed.",
             ],
         }
@@ -191,6 +191,10 @@ class ReportDataBuilder:
                 transformation = self.repository.root / "inputs" / "receptors" / profile_id / "redocking" / str(redock_row["run_id"]) / "transformation.json"
                 redocking["transformation"] = _decode(transformation.read_text(encoding="utf-8"), {}) if transformation.is_file() else {}
 
+        ad4zn_record = None
+        ad4zn_manifest = self.repository.root / "inputs" / "receptors" / profile_id / "ad4zn" / "current.json"
+        if profile.get("protocol") == "ad4zn" and ad4zn_manifest.is_file():
+            ad4zn_record = _decode(ad4zn_manifest.read_text(encoding="utf-8"), {})
         best = [dict(row) for row in best_rows]
         parameters = {key: profile.get(key) for key in (
             "center_x", "center_y", "center_z", "size_x", "size_y", "size_z",
@@ -199,6 +203,7 @@ class ReportDataBuilder:
             "profile": {key: value for key, value in profile.items() if key != "reference_ligand"},
             "reference_ligand": profile.get("reference_ligand"),
             "preparation": preparation,
+            "ad4zn_preparation": ad4zn_record,
             "redocking": redocking,
             "docking": {
                 "counts": {**dict(docking_counts), "pose_count": pose_count},
@@ -334,9 +339,15 @@ def render_html(data: dict[str, object]) -> str:
         if docking["failure_reasons"]:
             docking_html += _table(["Failure reason", "Count"], [[item.get("reason"), item.get("count")]
                                                                    for item in docking["failure_reasons"]])
+        if receptor.get("ad4zn_preparation"):
+            zinc = receptor["ad4zn_preparation"]
+            preparation_html += "<h4>AD4Zn map bundle (last generated)</h4>" + _table(["Field", "Value"], [
+                ["Map fingerprint", zinc.get("map_fingerprint")], ["Ligand atom types", zinc.get("atom_types")],
+                ["Bundle", zinc.get("directory")], ["Grid", zinc.get("grid")], ["Tool versions", zinc.get("versions")],
+                ["Validation", "Software integration only; target-specific validation is required."]])
         receptor_sections.append(f"""
         <section><h2>{html.escape(str(profile.get('name', profile.get('id'))))}</h2>
-        <p class='muted'>Profile ID: {_cell(profile.get('id'))} · Receptor: {_cell(profile.get('receptor'))}</p>
+        <p class='muted'>Profile ID: {_cell(profile.get('id'))} · Protocol: {_cell(profile.get('protocol', 'vina'))} · Receptor: {_cell(profile.get('receptor'))}</p>
         <h3>Receptor preparation</h3>{preparation_html}
         <h3>Redocking</h3>{redocking_html}
         <h3>Docking</h3>{docking_html}</section>""")

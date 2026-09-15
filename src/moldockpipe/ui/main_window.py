@@ -816,7 +816,7 @@ class MainWindow(QMainWindow):
             assert self.repo
             profiles = self.repo.get_receptor_profiles(include_archived=True)
             profiles.append({
-                "id": plan.profile_id, "name": plan.profile_name, "enabled": activate, "archived": False,
+                "id": plan.profile_id, "name": plan.profile_name, "enabled": activate, "archived": False, "protocol": plan.protocol,
                 "receptor": (Path(folder) / "receptor.pdbqt").relative_to(self.repo.root).as_posix(),
                 "center_x": plan.box_center[0], "center_y": plan.box_center[1], "center_z": plan.box_center[2],
                 "size_x": plan.box_size[0], "size_y": plan.box_size[1], "size_z": plan.box_size[2],

@@ -5,11 +5,12 @@ import uuid
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
-    QCheckBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from ..receptors.ad4zn import check_ad4zn_environment, require_zinc
 from ..project import DEFAULT_VINA_PROFILE, ProjectRepository
 from .redocking_dialog import RedockingSetupDialog
 from .redocking_queue import RedockingQueueController, RedockingQueueDialog
@@ -33,6 +34,17 @@ class ReceptorProfileDialog(QDialog):
         form.addRow("Name", self.name)
         form.addRow("", self.enabled)
         form.addRow("Receptor PDBQT", receptor_row)
+        self.protocol = QComboBox()
+        self.protocol.addItem("Standard AutoDock Vina", "vina")
+        self.protocol.addItem("AutoDock4Zn / Vina AD4 scoring", "ad4zn")
+        self.protocol.setCurrentIndex(1 if profile.get("protocol") == "ad4zn" else 0)
+        form.addRow("Docking protocol", self.protocol)
+        self.protocol_status = QLabel()
+        self.protocol_status.setWordWrap(True)
+        form.addRow("Protocol status", self.protocol_status)
+        self.protocol.currentIndexChanged.connect(self._protocol_status)
+        self.receptor.textChanged.connect(self._protocol_status)
+        self._protocol_status()
         self.numbers: dict[str, QDoubleSpinBox | QSpinBox] = {}
         for key in ("center_x", "center_y", "center_z", "size_x", "size_y", "size_z"):
             field = QDoubleSpinBox(); field.setRange(-100000, 100000); field.setDecimals(4)
@@ -48,6 +60,22 @@ class ReceptorProfileDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._validate); buttons.rejected.connect(self.reject)
         layout = QVBoxLayout(self); layout.addLayout(form); layout.addWidget(buttons)
+
+    def _protocol_status(self) -> None:
+        if self.protocol.currentData() == "vina":
+            self.protocol_status.setText("Standard Vina; no zinc tools required.")
+            return
+        missing = check_ad4zn_environment(self.repository.root).missing
+        text = "Missing: " + ", ".join(missing) if missing else "Tool files found; runtime compatibility is checked before preparation."
+        try:
+            source = Path(self.receptor.text().strip())
+            require_zinc(source if source.is_absolute() else self.repository.root / source)
+            text += "\nRetained Zn detected."
+        except (OSError, ValueError) as exc:
+            text += "\n" + str(exc)
+        current = self.repository.root / "inputs" / "receptors" / str(self.profile["id"]) / "ad4zn" / "current.json"
+        text += "\nAn existing map bundle will be revalidated before docking." if current.is_file() else "\nMaps will be prepared before docking, after ligand types are known."
+        self.protocol_status.setText(text)
 
     def _browse(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Select prepared receptor", filter="PDBQT files (*.pdbqt);;All files (*)")
@@ -68,10 +96,17 @@ class ReceptorProfileDialog(QDialog):
         if any(key.startswith("size_") and field.value() <= 0 for key, field in self.numbers.items()):
             QMessageBox.warning(self, "Invalid search box", "All search-box sizes must be greater than zero.")
             return
+        if self.protocol.currentData() == "ad4zn":
+            try:
+                require_zinc(resolved)
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(self, "AD4Zn receptor", str(exc))
+                return
         self.accept()
 
     def values(self) -> tuple[dict[str, object], Path]:
         profile = dict(self.profile)
+        profile["protocol"] = self.protocol.currentData()
         profile["name"] = self.name.text().strip()
         profile["enabled"] = self.enabled.isChecked()
         profile["archived"] = False
@@ -253,7 +288,7 @@ class ReceptorManagerDialog(QDialog):
         self._refresh()
 
     def _save(self) -> None:
-        docking_keys = {"receptor", "center_x", "center_y", "center_z", "size_x", "size_y", "size_z",
+        docking_keys = {"protocol", "ad4zn", "receptor", "center_x", "center_y", "center_z", "size_x", "size_y", "size_z",
                         "exhaustiveness", "num_modes", "energy_range", "seed", "cpu_count"}
         for profile in self.profiles:
             profile_id = str(profile["id"])
