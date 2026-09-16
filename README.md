@@ -160,3 +160,6 @@ while preserving inputs and `project.yml`.
 The feature branch adds receptor-specific AutoDock4Zn preparation and Vina AD4
 map scoring. Standard Vina remains the default. See [AD4Zn setup and validation](docs/AD4Zn.md)
 for the required external tools and manual validation steps.
+
+On Windows, after installing the environment, double-click `Launch-MolDockPipe.cmd`
+to launch this checkout without manual activation or PYTHONPATH settings.

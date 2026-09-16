@@ -43,3 +43,14 @@ execution and interactive UI behavior have not been validated. MMP-13 coordinati
 inspection, reference-ligand pose recovery, and external RMSD assessment remain
 the requested manual acceptance step. Synthetic-map success is not scientific
 validation. Keep this feature separate from main until that review.
+
+
+## Student deployment follow-up
+
+Added standard-folder/Windows-installer discovery for ADFR, invalid-parameter
+messages in the UI, and Launch-MolDockPipe.cmd with a diagnostic CheckOnly mode.
+The diagnostic correctly selected the feature checkout and discovered the local
+ADFR interpreter and AutoGrid without overrides. The user's parameter file was
+still a symbolic-link placeholder at the time of this check and was correctly
+reported as invalid. No supplied resource files were replaced or committed.
+Full regression result after these changes: **92 passed, 1 skipped** (13.72 seconds).

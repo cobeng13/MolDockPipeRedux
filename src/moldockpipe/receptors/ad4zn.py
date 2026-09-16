@@ -31,11 +31,63 @@ class AD4ZnEnvironment:
     def missing(self) -> list[str]:
         return [name for name, path in self.components.items() if path is None]
 
+    @property
+    def problems(self) -> list[str]:
+        labels = {"python": "ADFR Python interpreter (install ADFR Suite)",
+                  "autogrid": "AutoGrid4 (included with ADFR Suite)",
+                  "zinc_pseudo": "zinc_pseudo.py", "prepare_gpf": "prepare_gpf4zn.py",
+                  "parameters": "AD4Zn.dat"}
+        problems = ["Missing: " + labels.get(name, name) for name in self.missing]
+        parameter = self.components.get("parameters")
+        if parameter:
+            try:
+                if not any(line.split()[:2] == ["atom_par", "TZ"] for line in parameter.read_text().splitlines()):
+                    problems.append("Invalid AD4Zn.dat: download the actual parameter file, not the small symbolic-link placeholder. See docs/AD4Zn.md.")
+            except (OSError, UnicodeError) as exc:
+                problems.append(f"Cannot read AD4Zn.dat: {exc}")
+        return problems
+
     def require(self) -> dict[str, Path]:
-        if self.missing:
-            raise FileNotFoundError("AD4Zn requires: " + ", ".join(self.missing)
-                + ". Configure MOLDOCKPIPE_AD4ZN_* overrides or tools/ad4zn. See docs/AD4Zn.md.")
+        if self.problems:
+            raise FileNotFoundError("AD4Zn setup needs attention:\n" + "\n".join(self.problems))
         return dict(self.components)
+
+
+def adfr_installations() -> list[Path]:
+    """Find conventional ADFR installations without changing the host environment."""
+    roots = [Path.home()]
+    for variable in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        value = os.environ.get(variable)
+        if value:
+            roots.append(Path(value))
+            if variable == "LOCALAPPDATA":
+                roots.append(Path(value) / "Programs")
+    found = []
+    for root in roots:
+        try:
+            found.extend(path for path in root.glob("ADFRsuite*") if path.is_dir())
+        except OSError:
+            continue
+    # A custom installer location may be registered instead of using a default folder.
+    if os.name == "nt":
+        import winreg
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            for view in (winreg.KEY_WOW64_32KEY, winreg.KEY_WOW64_64KEY):
+                try:
+                    with winreg.OpenKey(hive, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", 0, winreg.KEY_READ | view) as entries:
+                        for index in range(winreg.QueryInfoKey(entries)[0]):
+                            try:
+                                with winreg.OpenKey(entries, winreg.EnumKey(entries, index)) as entry:
+                                    name = str(winreg.QueryValueEx(entry, "DisplayName")[0])
+                                    if "adfr" in name.lower():
+                                        location = str(winreg.QueryValueEx(entry, "InstallLocation")[0])
+                                        if location and Path(location).is_dir():
+                                            found.append(Path(location))
+                            except OSError:
+                                continue
+                except OSError:
+                    continue
+    return sorted(set(found), key=lambda path: tuple(int(n) for n in re.findall(r"\d+", path.name)), reverse=True)
 
 
 def check_ad4zn_environment(project_root: Path) -> AD4ZnEnvironment:
@@ -45,6 +97,7 @@ def check_ad4zn_environment(project_root: Path) -> AD4ZnEnvironment:
              "zinc_pseudo": ("zinc_pseudo.py",), "prepare_gpf": ("prepare_gpf4zn.py",),
              "parameters": ("AD4Zn.dat",)}
     roots = [application_root() / "tools" / "ad4zn", Path(project_root) / "tools" / "ad4zn"]
+    installations = adfr_installations()
     components = {}
     for key, candidates in names.items():
         executable = key in {"python", "autogrid"}
@@ -54,6 +107,12 @@ def check_ad4zn_environment(project_root: Path) -> AD4ZnEnvironment:
             located = shutil.which(override)
             if located:
                 paths.append(Path(located))
+        if not override and key in {"python", "autogrid"}:
+            for installation in installations:
+                if key == "python":
+                    paths += [installation / "python.exe"] if os.name == "nt" else [installation / "bin" / "pythonsh"]
+                else:
+                    paths += [installation / "bin" / name for name in candidates]
         if not override:
             paths += [Path(found) for name in candidates if (found := shutil.which(name))]
         components[key] = next((path.resolve() for path in paths if path.is_file()

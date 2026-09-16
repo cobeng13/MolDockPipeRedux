@@ -5,6 +5,26 @@ standard Vina, and standard Vina does not require any AD4Zn tools. The ligand
 Screening -> MolScrub -> Meeko pipeline is unchanged. This branch implements
 software integration; it does not establish scientific validity for MMP-13.
 
+## Windows student launch
+
+After the course Conda environment and ADFR Suite are installed, double-click
+`Launch-MolDockPipe.cmd` in the repository root. It selects this checkout's source
+and the `moldockpipe-clean` Conda environment automatically. Closing the launcher
+session discards its environment settings; the stable checkout is not reinstalled.
+The Windows launcher uses a process-scoped execution-policy override to run its
+shipped PowerShell script; it does not change the machine execution policy.
+
+Install ADFR Suite in its default location and place the three supplied resource
+files in `tools/ad4zn`. The application discovers standard ADFR installation
+folders and Windows installer registry locations. Manual path overrides below
+are only needed for installations it cannot discover. An invalid parameter
+placeholder is reported directly in the Receptors dialog.
+
+For a diagnostic without opening the UI, run `Launch-MolDockPipe.cmd -CheckOnly`
+from a terminal. If the course environment uses another name, pass
+`-EnvironmentName moldockpipe`. Conda itself and the course environment still
+need initial installation; this launcher does not download or install software.
+
 ## Windows setup
 
 Install the ADFR suite separately from its official distribution. Its compatible
@@ -12,7 +32,8 @@ Python runtime must import MolKit and AutoDockTools; the legacy official grid
 helper also requires Python 2's string.split. Do not replace the application's
 Conda Python or install these legacy packages into its environment.
 
-Supply these five components explicitly (the application never downloads them):
+These five components must be available (the application never downloads them).
+The overrides are optional for automatically discovered installations:
 
 | Component | Environment override |
 |---|---|
@@ -40,7 +61,7 @@ Use the interpreter from the installed ADFR environment that passes the import
 probe, not an arbitrary Python executable. Overrides are host configuration and
 are not written into portable project profiles. Invalid overrides fail without
 falling back. Without overrides, discovery checks application tools/ad4zn,
-project tools/ad4zn, then PATH. Conventional names are pythonsh(.exe),
+project tools/ad4zn, installed ADFR runtimes, then PATH. Conventional names are pythonsh(.exe),
 autogrid4(.exe), zinc_pseudo.py, prepare_gpf4zn.py, and AD4Zn.dat.
 Other OSes can use compatible native tools through the same overrides; their
 ADFR runtimes have not been validated by this Windows-first integration.

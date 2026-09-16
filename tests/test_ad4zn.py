@@ -170,7 +170,7 @@ def test_missing_dependencies_and_invalid_override(tmp_path, monkeypatch):
         monkeypatch.setenv('MOLDOCKPIPE_AD4ZN_' + name, str(tmp_path / 'missing'))
     environment = ad4zn.check_ad4zn_environment(tmp_path)
     assert len(environment.missing) == 5
-    with pytest.raises(FileNotFoundError, match='parameters'):
+    with pytest.raises(FileNotFoundError, match='AD4Zn.dat'):
         environment.require()
 
 
@@ -283,7 +283,7 @@ def test_meeko_then_zinc_preparation_and_failure_retention(zinc_project, monkeyp
 def test_invalid_parameter_file_fails_before_tools_run(zinc_project, content):
     repo, profile, ligand, vina, tools, calls = zinc_project
     tools['parameters'].write_text(content)
-    with pytest.raises(ValueError, match='TZ atom definition'):
+    with pytest.raises(FileNotFoundError, match='Invalid AD4Zn.dat'):
         ad4zn.ensure_ad4zn_maps(repo, profile, [ligand], vina)
     assert not calls
 
@@ -309,3 +309,32 @@ def test_subprocess_cancellation_preserves_logs(tmp_path):
     with pytest.raises(InterruptedError, match='cancelled'):
         ad4zn._run([sys.executable, '-c', 'import time; time.sleep(5)'], tmp_path, [], lambda: True)
     assert (tmp_path / 'commands.json').is_file()
+
+
+def test_adfr_installer_layout_is_discovered(tmp_path, monkeypatch):
+    import os
+    installation = tmp_path / 'ADFRsuite-1.0'
+    (installation / 'bin').mkdir(parents=True)
+    interpreter = installation / ('python.exe' if os.name == 'nt' else 'bin/pythonsh')
+    autogrid = installation / 'bin' / ('autogrid4.exe' if os.name == 'nt' else 'autogrid4')
+    for path in (interpreter, autogrid):
+        path.write_text('tool'); path.chmod(0o755)
+    monkeypatch.setattr(ad4zn, 'adfr_installations', lambda: [installation])
+    monkeypatch.setattr(ad4zn, 'application_root', lambda: tmp_path)
+    monkeypatch.setattr(ad4zn.shutil, 'which', lambda _: None)
+    for name in ('PYTHON', 'AUTOGRID'):
+        monkeypatch.delenv('MOLDOCKPIPE_AD4ZN_' + name, raising=False)
+    environment = ad4zn.check_ad4zn_environment(tmp_path)
+    assert environment.components['python'] == interpreter.resolve()
+    assert environment.components['autogrid'] == autogrid.resolve()
+    monkeypatch.setenv('MOLDOCKPIPE_AD4ZN_PYTHON', str(tmp_path / 'missing'))
+    assert ad4zn.check_ad4zn_environment(tmp_path).components['python'] is None
+
+
+def test_parameter_placeholder_is_reported_in_ui_preflight(tmp_path):
+    parameter = tmp_path / 'AD4Zn.dat'
+    parameter.write_text('../../../data/AD4Zn.dat')
+    environment = ad4zn.AD4ZnEnvironment({'parameters': parameter})
+    assert 'symbolic-link placeholder' in environment.problems[0]
+    parameter.write_text('atom_par TZ 0 0 0')
+    assert environment.problems == []

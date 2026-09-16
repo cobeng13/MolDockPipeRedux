@@ -57,7 +57,7 @@ def validate_redocking_prerequisites(repository: ProjectRepository, profile: dic
     except FileNotFoundError: missing.append("Vina executable")
     try:
         if protocol_for(profile) == "ad4zn":
-            missing.extend("AD4Zn: " + name for name in check_ad4zn_environment(repository.root).missing)
+            missing.extend(check_ad4zn_environment(repository.root).problems)
             require_zinc(receptor)
     except (ValueError, OSError) as exc:
         missing.append(str(exc))

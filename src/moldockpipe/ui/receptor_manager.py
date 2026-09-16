@@ -65,8 +65,8 @@ class ReceptorProfileDialog(QDialog):
         if self.protocol.currentData() == "vina":
             self.protocol_status.setText("Standard Vina; no zinc tools required.")
             return
-        missing = check_ad4zn_environment(self.repository.root).missing
-        text = "Missing: " + ", ".join(missing) if missing else "Tool files found; runtime compatibility is checked before preparation."
+        problems = check_ad4zn_environment(self.repository.root).problems
+        text = "\n".join(problems) if problems else "Tool files found; runtime compatibility is checked before preparation."
         try:
             source = Path(self.receptor.text().strip())
             require_zinc(source if source.is_absolute() else self.repository.root / source)
