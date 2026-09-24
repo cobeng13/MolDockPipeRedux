@@ -110,6 +110,10 @@ class MainWindow(QMainWindow):
         self.refresh_action.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
         self.refresh_action.setEnabled(False)
         self.refresh_action.triggered.connect(self.refresh_dashboard)
+        self.stop_action = pipeline_toolbar.addAction("Stop")
+        self.stop_action.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop))
+        self.stop_action.setEnabled(False)
+        self.stop_action.triggered.connect(self.stop_pipeline)
 
         self.project_path = QLineEdit()
         self.project_path.setReadOnly(True)
@@ -579,6 +583,7 @@ class MainWindow(QMainWindow):
         self._set_stage_actions(False)
         self.run_all_action.setEnabled(False)
         self.refresh_action.setEnabled(False)
+        self.stop_action.setEnabled(True)
         self.current_stage_label.setText(f"{label} running")
         self.current_task_label.setText(f"Current task: {label}")
         self.dashboard_status.setText("Running")
@@ -590,11 +595,37 @@ class MainWindow(QMainWindow):
         self.pipeline_worker.progress.connect(self._on_pipeline_progress)
         self.pipeline_worker.finished.connect(self._pipeline_finished)
         self.pipeline_worker.failed.connect(self._pipeline_failed)
+        self.pipeline_worker.stopped.connect(self._pipeline_stopped)
         self.pipeline_worker.finished.connect(self.pipeline_thread.quit)
         self.pipeline_worker.failed.connect(self.pipeline_thread.quit)
+        self.pipeline_worker.stopped.connect(self.pipeline_thread.quit)
         self.pipeline_thread.finished.connect(self.pipeline_worker.deleteLater)
         self.pipeline_thread.finished.connect(self.pipeline_thread.deleteLater)
         self.pipeline_thread.start()
+
+    def stop_pipeline(self) -> None:
+        if not self.stage_running or not hasattr(self, "pipeline_worker"):
+            return
+        self.stop_action.setEnabled(False)
+        self.dashboard_status.setText("Stopping safely…")
+        self.current_task_label.setText("Current task: stopping safely")
+        self._write_log("Stop requested; waiting for active work to clean up...")
+        self.pipeline_worker.stop()
+
+    def _pipeline_stopped(self) -> None:
+        self.stage_running = False
+        self._set_stage_actions(True)
+        self.run_all_action.setEnabled(True)
+        self.refresh_action.setEnabled(True)
+        self.stop_action.setEnabled(False)
+        self.current_stage_label.setText("Idle")
+        self.current_item_label.setText("")
+        self.current_task_label.setText("Current task: None")
+        self.dashboard_status.setText("Pipeline Stopped Safely")
+        self.statusBar().showMessage("Pipeline Stopped Safely", 10000)
+        self._write_log("Pipeline Stopped Safely")
+        self.refresh_tables()
+        self._refresh_checkpoint_state()
 
     def run_vina(self) -> None:
         self._start_pipeline(["vina"], "Vina")
@@ -693,6 +724,7 @@ class MainWindow(QMainWindow):
         self._set_stage_actions(True)
         self.run_all_action.setEnabled(True)
         self.refresh_action.setEnabled(True)
+        self.stop_action.setEnabled(False)
         if getattr(self, "pipeline_is_full", False):
             self.overall_progress.complete_all()
         else:
@@ -718,6 +750,7 @@ class MainWindow(QMainWindow):
         self._set_stage_actions(True)
         self.run_all_action.setEnabled(True)
         self.refresh_action.setEnabled(True)
+        self.stop_action.setEnabled(False)
         self._write_log(f"Run All stopped: {message}")
         self._refresh_checkpoint_state()
         QMessageBox.critical(self, "Run All failed", message)

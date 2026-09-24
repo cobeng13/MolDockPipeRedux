@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import shutil
+import json
 import uuid
+import zipfile
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -91,6 +93,7 @@ class ReceptorManagerDialog(QDialog):
         self.profiles = repository.get_receptor_profiles(include_archived=True)
         self.original_profiles = {str(profile["id"]): dict(profile) for profile in self.profiles}
         self.sources: dict[str, Path] = {}
+        self.import_packages: dict[str, Path] = {}
         self.deleted_profile_ids: list[str] = []
         self.queue_controller = queue_controller or RedockingQueueController(repository, self)
         self.setWindowTitle("Receptor Manager")
@@ -100,7 +103,8 @@ class ReceptorManagerDialog(QDialog):
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         controls = QHBoxLayout()
-        for label, callback in (("Add", self._add), ("Edit", self._edit), ("Duplicate", self._duplicate),
+        for label, callback in (("Add", self._add), ("Import…", self._import_profile), ("Export…", self._export_profile),
+                                ("Edit", self._edit), ("Duplicate", self._duplicate),
                                 ("Enable / Disable", self._toggle), ("Archive", self._archive), ("Delete", self._delete)):
             button = QPushButton(label); button.clicked.connect(callback); controls.addWidget(button)
         controls.addStretch()
@@ -206,6 +210,78 @@ class ReceptorManagerDialog(QDialog):
         if not self._edit_profile(new_index):
             self.profiles.pop(new_index); self._refresh()
 
+    def _export_profile(self) -> None:
+        index = self._selected()
+        if index is None:
+            QMessageBox.information(self, "Select receptor", "Select a receptor profile to export.")
+            return
+        profile = self.profiles[index]
+        receptor = self.repository.root / str(profile.get("receptor", ""))
+        if not receptor.is_file():
+            QMessageBox.warning(self, "Receptor unavailable", "The prepared receptor file for this profile could not be found.")
+            return
+        suggested = f"{profile.get('name', 'receptor').replace(' ', '_')}.moldock-receptor.zip"
+        path, _ = QFileDialog.getSaveFileName(self, "Export receptor profile", suggested, "MolDockPipe receptor package (*.moldock-receptor.zip)")
+        if not path:
+            return
+        profile_id = str(profile.get("id", ""))
+        profile_folder = self.repository.root / "inputs" / "receptors" / profile_id
+        package_profile = {key: value for key, value in profile.items() if key != "id"}
+        try:
+            with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("profile.json", json.dumps(package_profile, indent=2))
+                archive.write(receptor, "receptor.pdbqt")
+                if profile_folder.is_dir():
+                    for source in profile_folder.rglob("*"):
+                        if source.is_file() and source.resolve() != receptor.resolve():
+                            archive.write(source, f"preparation/{source.relative_to(profile_folder).as_posix()}")
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        QMessageBox.information(self, "Receptor exported", f"Receptor profile and docking settings exported to:\n{path}")
+
+    def _import_profile(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Import receptor profile", filter="MolDockPipe receptor package (*.moldock-receptor.zip *.zip)")
+        if not path:
+            return
+        try:
+            with zipfile.ZipFile(path, "r") as archive:
+                names = set(archive.namelist())
+                if "profile.json" not in names or "receptor.pdbqt" not in names:
+                    raise ValueError("This package is missing its profile settings or prepared receptor.")
+                profile = json.loads(archive.read("profile.json").decode("utf-8"))
+                if not isinstance(profile, dict):
+                    raise ValueError("The profile settings are malformed.")
+                receptor_data = archive.read("receptor.pdbqt")
+                if not receptor_data.strip():
+                    raise ValueError("The prepared receptor file is empty.")
+                for name in names:
+                    parts = Path(name).parts
+                    if Path(name).is_absolute() or ".." in parts or name.startswith(("/", "\\")):
+                        raise ValueError("The package contains an unsafe file path.")
+                    if name.startswith("preparation/") and not name.endswith("/"):
+                        info = archive.getinfo(name)
+                        if info.file_size > 100_000_000:
+                            raise ValueError("A preparation file is unexpectedly large.")
+        except (OSError, ValueError, KeyError, UnicodeDecodeError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+            QMessageBox.warning(self, "Import failed", str(exc))
+            return
+        existing_names = {str(item.get("name", "")).casefold() for item in self.profiles if not item.get("archived")}
+        base_name = str(profile.get("name") or "Imported receptor")
+        candidate = base_name
+        suffix = 2
+        while candidate.casefold() in existing_names:
+            candidate = f"{base_name} ({suffix})"
+            suffix += 1
+        profile["name"] = candidate
+        profile["id"] = uuid.uuid4().hex
+        profile["receptor"] = f"inputs/receptors/{profile['id']}/receptor.pdbqt"
+        profile["archived"] = False
+        self.profiles.append(profile)
+        self.import_packages[str(profile["id"])] = Path(path)
+        self._refresh()
+        self.table.selectRow(len(self.profiles) - 1)
+
     def _toggle(self) -> None:
         index = self._selected()
         if index is not None and not self.profiles[index].get("archived"):
@@ -247,6 +323,7 @@ class ReceptorManagerDialog(QDialog):
         profile_id = str(profile["id"])
         self.profiles.pop(index)
         self.sources.pop(profile_id, None)
+        self.import_packages.pop(profile_id, None)
         # Profiles added in this unsaved dialog have no persisted directory.
         if profile_id in self.original_profiles:
             self.deleted_profile_ids.append(profile_id)
@@ -261,7 +338,29 @@ class ReceptorManagerDialog(QDialog):
             original = self.original_profiles.get(profile_id)
             original_source = self.repository.root / str(original.get("receptor", "")) if original else None
             source_changed = bool(source and (original_source is None or source.resolve() != original_source.resolve()))
-            if source:
+            imported_package = self.import_packages.get(profile_id)
+            if imported_package:
+                destination_dir = self.repository.root / "inputs" / "receptors" / profile_id
+                destination_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    with zipfile.ZipFile(imported_package, "r") as archive:
+                        for member in archive.namelist():
+                            if not member.startswith("preparation/") or member.endswith("/"):
+                                continue
+                            relative = Path(member).relative_to("preparation")
+                            target = (destination_dir / relative).resolve()
+                            if destination_dir.resolve() not in target.parents:
+                                raise ValueError("The receptor package contains an unsafe preparation path.")
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_bytes(archive.read(member))
+                        receptor_path = destination_dir / "receptor.pdbqt"
+                        receptor_path.write_bytes(archive.read("receptor.pdbqt"))
+                except (OSError, KeyError, ValueError, zipfile.BadZipFile) as exc:
+                    QMessageBox.warning(self, "Import failed", str(exc))
+                    return
+                profile["receptor"] = receptor_path.relative_to(self.repository.root).as_posix()
+                source_changed = True
+            elif source:
                 destination = self.repository.root / "inputs" / "receptors" / profile_id / "receptor.pdbqt"
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 if source.resolve() != destination.resolve():

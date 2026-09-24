@@ -4,7 +4,7 @@ import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Collection
+from typing import Collection, Callable
 
 from .fingerprints import file_sha256, fingerprint
 from .models import ProgressCallback, ProgressEvent, ScreeningPolicy, StageStatus
@@ -20,15 +20,22 @@ from .services.postdock import PostDockService, receptor_export_filename
 class PipelineRunner:
     """Application service for small, independently resumable stage operations."""
 
-    def __init__(self, repository: ProjectRepository, progress: ProgressCallback | None = None):
+    def __init__(self, repository: ProjectRepository, progress: ProgressCallback | None = None,
+                 cancelled: Callable[[], bool] | None = None):
         self.repository = repository
         self.progress = progress
+        self.cancelled = cancelled
+
+    def _check_cancelled(self) -> None:
+        if self.cancelled and self.cancelled():
+            raise InterruptedError("Pipeline stopped safely")
 
     def _emit(self, event: str, stage: str, item_id: str | None = None, index: int = 0, total: int = 0, **kwargs: object) -> None:
         if self.progress:
             self.progress(ProgressEvent(event, stage, item_id, index, total, **kwargs))
 
     def run_screening(self) -> tuple[int, int]:
+        self._check_cancelled()
         settings = self.repository.get_settings().get("screening", {})
         policy = ScreeningPolicy(settings.get("policy", ScreeningPolicy.ANNOTATE_ONLY.value))
         enabled = {name: bool(settings.get(name, False)) for name in ("lipinski", "veber", "egan", "ghose", "boiled_egg")}
@@ -43,6 +50,7 @@ class PipelineRunner:
         self._emit("stage_started", "screening", total=len(parents))
         skipped = 0
         for index, parent in enumerate(parents, 1):
+            self._check_cancelled()
             self._emit("item_started", "screening", parent["parent_id"], index, len(parents))
             result = screen_smiles(parent["source_smiles"], enabled, policy)
             run_fingerprint = fingerprint(settings={"enabled": enabled, "policy": policy.value}, inputs={"smiles": parent["source_smiles"]}, tool_version=rdkit_version)
@@ -73,6 +81,7 @@ class PipelineRunner:
         return completed, failed
 
     def run_molscrub(self) -> tuple[int, int]:
+        self._check_cancelled()
         project = self.repository.get_settings()
         settings = project.get("molscrub", {})
         screening = project.get("screening", {})
@@ -86,6 +95,7 @@ class PipelineRunner:
         created = failed = skipped = 0
         self._emit("stage_started", "molscrub", total=len(allowed))
         for index, row in enumerate(allowed, 1):
+            self._check_cancelled()
             self._emit("item_started", "molscrub", row["parent_id"], index, len(allowed))
             with self.repository.connection() as conn:
                 existing = conn.execute("""SELECT COUNT(*) FROM molecular_states s JOIN conformers c ON c.state_id=s.state_id
@@ -134,6 +144,7 @@ class PipelineRunner:
 
     def run_meeko(self) -> tuple[int, int]:
         """Prepare every retained SDF state into a state-specific ligand PDBQT."""
+        self._check_cancelled()
         prepared = failed = 0
         settings = self.repository.get_settings().get("meeko", {})
         workers = max(1, min(32, int(settings.get("workers", 4))))
@@ -162,6 +173,7 @@ class PipelineRunner:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="meeko") as pool:
             futures = [pool.submit(prepare, row) for row in rows]
             for index, future in enumerate(as_completed(futures), 1):
+                self._check_cancelled()
                 row, pdbqt, log, error = future.result()
                 self._emit("item_started", "meeko", row["state_id"], index, len(rows))
                 try:
@@ -175,6 +187,8 @@ class PipelineRunner:
                     prepared += 1
                     self._emit("item_succeeded", "meeko", row["state_id"], index, len(rows), succeeded=prepared)
                 except Exception as exc:
+                    if isinstance(exc, InterruptedError):
+                        raise
                     failed += 1
                     with self.repository.connection() as conn:
                         conn.execute("UPDATE conformers SET status=? WHERE conformer_id=?", ("pdbqt_failed", row["conformer_id"]))
@@ -185,6 +199,7 @@ class PipelineRunner:
 
     def run_vina(self, profile_ids: Collection[str] | None = None) -> tuple[int, int]:
         """Dock every Meeko-prepared state against each selected receptor profile."""
+        self._check_cancelled()
         profiles = [profile for profile in self.repository.get_receptor_profiles()
                     if profile.get("enabled", False) and (profile_ids is None or str(profile.get("id")) in profile_ids)]
         if not profiles:
@@ -220,6 +235,7 @@ class PipelineRunner:
         self._emit("stage_started", "vina", total=total)
         index = 0
         for profile in profiles:
+            self._check_cancelled()
             profile_id = str(profile["id"])
             profile_name = str(profile.get("name", profile_id))
             receptor = self.repository.root / str(profile.get("receptor", ""))
@@ -249,6 +265,7 @@ class PipelineRunner:
             receptor_hash = file_sha256(receptor)
             settings_fp = fingerprint(settings=run_settings, inputs={"receptor": receptor_hash}, tool_version=executable_hash)
             for state in states:
+                self._check_cancelled()
                 index += 1
                 self._emit("item_started", "vina", state["state_id"], index, total,
                            receptor_profile_id=profile_id, receptor_profile_name=profile_name,
@@ -280,7 +297,7 @@ class PipelineRunner:
                             (run_id, state["state_id"], receptor_hash, settings_fp, StageStatus.RUNNING,
                              json.dumps({"settings": run_settings, "argv": []}, sort_keys=True),
                              utc_now(), profile_id, profile_name, workflow_run_id))
-                    result = backend.run(executable=executable, receptor=receptor, ligand=ligand, output=output, log=log, settings=run_settings)
+                    result = backend.run(executable=executable, receptor=receptor, ligand=ligand, output=output, log=log, settings=run_settings, cancelled=self.cancelled)
                     raw_artifact = self.repository.add_artifact(output, "vina_output_pdbqt", "vina") if output.exists() else None
                     log_artifact = self.repository.add_artifact(log, "vina_log_txt", "vina")
                     with self.repository.connection() as conn:
@@ -299,6 +316,16 @@ class PipelineRunner:
                                succeeded=succeeded, failed=failed, receptor_profile_id=profile_id, receptor_profile_name=profile_name,
                                message=f"{profile_name}: complete" if result.poses else f"{profile_name}: no valid Vina poses")
                 except Exception as exc:
+                    if isinstance(exc, InterruptedError):
+                        with self.repository.connection() as conn:
+                            conn.execute("UPDATE docking_runs SET status=?, ended_at=?, reason=?, is_current=0 WHERE run_id=?",
+                                         (StageStatus.CANCELLED, utc_now(), "Pipeline stopped safely", run_id))
+                        self.repository.update_workflow_stage(workflow_run_id, "vina", StageStatus.CANCELLED.value,
+                                                              summary={"total": total, "succeeded": succeeded, "failed": failed, "reused": reused},
+                                                              error="Pipeline stopped safely")
+                        self.repository.finish_workflow_run(workflow_run_id, StageStatus.CANCELLED.value,
+                                                            error="Pipeline stopped safely")
+                        raise
                     failed += 1
                     with self.repository.connection() as conn:
                         conn.execute("UPDATE docking_runs SET is_current=0 WHERE state_id=? AND receptor_profile_id=? AND run_id<>?", (state["state_id"], profile_id, run_id))
@@ -323,6 +350,7 @@ class PipelineRunner:
         return succeeded, failed
 
     def run_postdock(self) -> tuple[int, int]:
+        self._check_cancelled()
         settings = self.repository.get_settings().get("postdock", {})
         mode = str(settings.get("mode", "split_and_sdf"))
         limit = max(1, int(settings.get("poses_per_compound", 3)))
@@ -344,6 +372,7 @@ class PipelineRunner:
         self._emit("stage_started", "postdock", total=len(runs))
         service = PostDockService()
         for profile_id in sorted({str(run["receptor_profile_id"]) for run in runs}):
+            self._check_cancelled()
             profile = profiles_by_id[profile_id]
             receptor_pdbqt = self.repository.root / str(profile["receptor"])
             prepared_pdb = receptor_pdbqt.parent / "receptor_prepared.pdb"
@@ -384,6 +413,7 @@ class PipelineRunner:
                 )
         success = failed = 0
         for run in runs:
+            self._check_cancelled()
             profile_root = self.repository.root / "For_PostDocking" / run["receptor_profile_id"]
             expected_folders = ("PDBQTs",) if mode == "split_only" else ("SDF",) if mode == "sdf_only" else ("SDF", "PDBQTs")
             export_root = lambda folder: profile_root / folder / run["parent_id"] / run["state_id"] / run["run_id"]
