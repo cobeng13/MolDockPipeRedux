@@ -362,7 +362,7 @@ class MainWindow(QMainWindow):
         if has_ligands:
             return
         candidate = self._project_input_csv()
-        if candidate:
+        if candidate and candidate.stat().st_size:
             count = self.repo.import_ligands_csv(candidate)
             self._write_log(f"Auto-loaded {count} ligands from {candidate}")
 
@@ -759,7 +759,7 @@ class MainWindow(QMainWindow):
         if not self.repo or self.stage_running:
             return
         candidate = self._project_input_csv()
-        if candidate:
+        if candidate and candidate.stat().st_size:
             try:
                 result = self.repo.sync_ligands_csv(candidate)
             except Exception as exc:

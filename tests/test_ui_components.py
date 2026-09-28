@@ -95,3 +95,16 @@ def test_dashboard_refresh_defines_profile_metadata(tmp_path) -> None:
     MainWindow._update_dashboard(fake, 0, 0, 0, 0, 0)
 
     assert fake.docked_export_action.enabled is False
+
+
+def test_auto_import_skips_empty_starter_csv(tmp_path) -> None:
+    repo = ProjectRepository.create(tmp_path / "project")
+    fake = SimpleNamespace(
+        repo=repo,
+        _project_input_csv=lambda: repo.root / "input" / "input.csv",
+    )
+
+    MainWindow._auto_import_input(fake)
+
+    with repo.connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM parent_ligands").fetchone()[0] == 0
