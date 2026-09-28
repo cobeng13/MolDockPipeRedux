@@ -108,3 +108,13 @@ def test_auto_import_skips_empty_starter_csv(tmp_path) -> None:
 
     with repo.connection() as conn:
         assert conn.execute("SELECT COUNT(*) FROM parent_ligands").fetchone()[0] == 0
+
+
+def test_input_csv_has_ligand_rows_excludes_header_only_file(tmp_path) -> None:
+    path = tmp_path / "input.csv"
+    path.write_text("id,smiles,notes,params_json\n", encoding="utf-8")
+
+    assert MainWindow._input_csv_has_ligand_rows(path) is False
+
+    path.write_text("id,smiles,notes,params_json\nlig1,CCO,,\n", encoding="utf-8")
+    assert MainWindow._input_csv_has_ligand_rows(path) is True

@@ -13,7 +13,18 @@ def test_new_project_includes_empty_input_csv(tmp_path) -> None:
 
     input_csv = root / "inputs" / "input.csv"
     assert input_csv.is_file()
-    assert input_csv.read_text(encoding="utf-8") == ""
+    assert input_csv.read_text(encoding="utf-8") == "id,smiles,notes,params_json\n"
+
+
+def test_project_creation_preserves_existing_input_csv(tmp_path) -> None:
+    root = tmp_path / "project"
+    input_csv = root / "inputs" / "input.csv"
+    input_csv.parent.mkdir(parents=True)
+    input_csv.write_text("id,smiles,notes,params_json\nlig1,CCO,,\n", encoding="utf-8")
+
+    ProjectRepository.create(root)
+
+    assert input_csv.read_text(encoding="utf-8") == "id,smiles,notes,params_json\nlig1,CCO,,\n"
 
 
 def test_repeated_chemistry_stages_reuse_artifacts(tmp_path) -> None:

@@ -72,7 +72,9 @@ class ProjectRepository:
         root.mkdir(parents=True, exist_ok=True)
         for relative in ("inputs", "inputs/receptors", "artifacts/sdf", "artifacts/pdbqt", "artifacts/docking", "logs", "exports", "For_PostDocking", "tools/vina"):
             (root / relative).mkdir(parents=True, exist_ok=True)
-        (root / "inputs" / "input.csv").touch(exist_ok=True)
+        input_csv = root / "inputs" / "input.csv"
+        if not input_csv.exists():
+            input_csv.write_text("id,smiles,notes,params_json\n", encoding="utf-8")
         config = {
             "name": name or root.name,
             "schema_version": SCHEMA_VERSION,

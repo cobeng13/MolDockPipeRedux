@@ -362,9 +362,15 @@ class MainWindow(QMainWindow):
         if has_ligands:
             return
         candidate = self._project_input_csv()
-        if candidate and candidate.stat().st_size:
+        if candidate and self._input_csv_has_ligand_rows(candidate):
             count = self.repo.import_ligands_csv(candidate)
             self._write_log(f"Auto-loaded {count} ligands from {candidate}")
+
+    @staticmethod
+    def _input_csv_has_ligand_rows(path: Path) -> bool:
+        """Return whether a CSV contains data rows rather than only its header."""
+        with path.open(encoding="utf-8-sig") as handle:
+            return sum(1 for line in handle if line.strip()) > 1
 
     def _project_input_csv(self) -> Path | None:
         """Return the project-owned ligand input CSV, including the legacy path."""
@@ -759,7 +765,7 @@ class MainWindow(QMainWindow):
         if not self.repo or self.stage_running:
             return
         candidate = self._project_input_csv()
-        if candidate and candidate.stat().st_size:
+        if candidate and self._input_csv_has_ligand_rows(candidate):
             try:
                 result = self.repo.sync_ligands_csv(candidate)
             except Exception as exc:
