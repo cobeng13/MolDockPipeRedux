@@ -11,7 +11,7 @@ def test_new_project_includes_empty_input_csv(tmp_path) -> None:
 
     ProjectRepository.create(root)
 
-    input_csv = root / "input" / "input.csv"
+    input_csv = root / "inputs" / "input.csv"
     assert input_csv.is_file()
     assert input_csv.read_text(encoding="utf-8") == ""
 

@@ -101,7 +101,7 @@ def test_auto_import_skips_empty_starter_csv(tmp_path) -> None:
     repo = ProjectRepository.create(tmp_path / "project")
     fake = SimpleNamespace(
         repo=repo,
-        _project_input_csv=lambda: repo.root / "input" / "input.csv",
+        _project_input_csv=lambda: repo.root / "inputs" / "input.csv",
     )
 
     MainWindow._auto_import_input(fake)
