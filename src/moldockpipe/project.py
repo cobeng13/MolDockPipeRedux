@@ -70,8 +70,9 @@ class ProjectRepository:
     def create(cls, root: Path, name: str | None = None) -> "ProjectRepository":
         root = root.resolve()
         root.mkdir(parents=True, exist_ok=True)
-        for relative in ("inputs", "inputs/receptors", "artifacts/sdf", "artifacts/pdbqt", "artifacts/docking", "logs", "exports", "For_PostDocking", "tools/vina"):
+        for relative in ("input", "inputs", "inputs/receptors", "artifacts/sdf", "artifacts/pdbqt", "artifacts/docking", "logs", "exports", "For_PostDocking", "tools/vina"):
             (root / relative).mkdir(parents=True, exist_ok=True)
+        (root / "input" / "input.csv").touch(exist_ok=True)
         config = {
             "name": name or root.name,
             "schema_version": SCHEMA_VERSION,

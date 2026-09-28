@@ -6,6 +6,16 @@ from moldockpipe.pipeline import PipelineRunner
 from moldockpipe.project import ProjectRepository
 
 
+def test_new_project_includes_empty_input_csv(tmp_path) -> None:
+    root = tmp_path / "project"
+
+    ProjectRepository.create(root)
+
+    input_csv = root / "input" / "input.csv"
+    assert input_csv.is_file()
+    assert input_csv.read_text(encoding="utf-8") == ""
+
+
 def test_repeated_chemistry_stages_reuse_artifacts(tmp_path) -> None:
     pytest.importorskip("rdkit")
     pytest.importorskip("molscrub")
