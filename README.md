@@ -34,6 +34,13 @@ The worker runs the existing pipeline and writes the same portable project
 layout. Select individual stages with `--stages`, for example
 `moldockpipe run /path/to/project --stages screening molscrub meeko`.
 
+MolScrub generation has a 15-second time limit per molecule, adjustable in the
+MolScrub settings. Slow generation is stopped, recorded as failed, and skipped
+while the rest of the pipeline continues. Matching failures are reused on later
+runs; changing MolScrub settings permits another attempt. Disconnected molecular
+fragments fail before generation starts. Failed molecules remain visible in the
+dashboard and do not contribute states to ligand preparation or docking.
+
 ## Project Inputs
 
 In the UI, New Project asks for a project name and creates it under `Projects/`
@@ -134,6 +141,23 @@ Linux ARM requires separately supplied compatible tools. Generic `vina` and
 `vina_split` filenames remain supported on Linux and macOS. Tools can be placed in `tools/vina/`, supplied on `PATH`, or
 selected explicitly with `MOLDOCKPIPE_VINA` and `MOLDOCKPIPE_VINA_SPLIT`.
 Binaries under `tools/vina/` are tracked for fast development.
+
+Optional Vina-GPU docking can be selected in **Settings > Docking**. CPU Vina
+remains the default for existing and new projects, and receptor validation
+redocking continues to use CPU Vina. Install a compatible Vina-GPU executable
+and its matching `Kernel1_Opt.bin` and `Kernel2_Opt.bin` under `tools/vinagpu/`,
+or set `MOLDOCKPIPE_VINAGPU` to the executable with both kernels beside it.
+Automatic discovery checks only application/project `tools/vinagpu/` folders.
+For the supplied Windows runtime, the executable is `Vina-GPU+.exe`; no
+`VinaGPUConfig.txt`, kernel compiler executable, or AutoDock-GPU executable is needed.
+The adapter targets the bundled legacy Vina-GPU command interface; other
+builds must support the same flags. GPU-specific search controls default to
+8000 computing lanes and search depth 32. Receptor boxes, seed, number of modes,
+and energy range are shared; CPU count and exhaustiveness are not sent to GPU.
+Each molecular state runs separately with isolated kernel copies, logs, and
+normal pose artifacts. Executable, kernel, and GPU setting changes invalidate
+GPU resume matches. GPU and CPU scores may differ. Compatible GPU drivers and
+kernel binaries are required; no automatic CPU fallback occurs on GPU failure.
 
 Post-docking supports:
 

@@ -4,6 +4,7 @@ import csv
 from pathlib import Path
 
 import yaml
+import pytest
 
 from moldockpipe.pipeline import PipelineRunner
 from moldockpipe.project import ProjectRepository, SCHEMA_VERSION, utc_now
@@ -31,8 +32,19 @@ def test_legacy_vina_settings_migrate_to_default_profile(tmp_path: Path) -> None
     assert repo.get_settings()["schema_version"] == SCHEMA_VERSION
 
 
-def test_multidock_runs_and_reuses_each_receptor_independently(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("docking_backend", ["vina", "vinagpu"])
+def test_multidock_runs_and_reuses_each_receptor_independently(tmp_path: Path, monkeypatch, docking_backend: str) -> None:
     repo = ProjectRepository.create(tmp_path / "project")
+    if docking_backend == "vinagpu":
+        config = repo.get_settings()
+        config["docking"] = {"backend": "vinagpu", "thread": 8000, "search_depth": 32}
+        (repo.root / "project.yml").write_text(yaml.safe_dump(config), encoding="utf-8")
+        executable = repo.root / "tools" / "vinagpu" / "Vina-GPU+.exe"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"gpu executable")
+        for name in ("Kernel1_Opt.bin", "Kernel2_Opt.bin"):
+            (executable.parent / name).write_bytes(b"kernel")
+        monkeypatch.setattr("moldockpipe.pipeline.find_vinagpu_executable", lambda _: executable)
     csv_path = tmp_path / "ligands.csv"
     csv_path.write_text("id,smiles\nlig1,CCO\n", encoding="utf-8")
     repo.import_ligands_csv(csv_path)
@@ -106,6 +118,7 @@ USER_CHARGES
             return FakeResult(float(settings["test_score"]))
 
     monkeypatch.setattr("moldockpipe.pipeline.VinaDockingBackend", FakeBackend)
+    monkeypatch.setattr("moldockpipe.pipeline.VinaGpuDockingBackend", FakeBackend)
     events = []
     runner = PipelineRunner(repo, progress=events.append)
     assert runner.run_vina() == (2, 0)
@@ -169,7 +182,7 @@ USER_CHARGES
     assert runner.run_vina() == (2, 0)
     assert calls == []
 
-    profiles[1]["exhaustiveness"] = 12
+    profiles[1]["size_x"] = 22
     repo.save_receptor_profiles(profiles)
     assert runner.run_vina({"rec-b"}) == (1, 0)
     assert calls == ["rec-b"]
@@ -177,6 +190,18 @@ USER_CHARGES
         assert conn.execute("SELECT COUNT(*) FROM docking_runs WHERE receptor_profile_id='rec-a'").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM docking_runs WHERE receptor_profile_id='rec-b'").fetchone()[0] == 2
         assert conn.execute("SELECT COUNT(*) FROM docking_runs WHERE receptor_profile_id='rec-b' AND is_current=1").fetchone()[0] == 1
+
+    if docking_backend == "vinagpu":
+        calls.clear()
+        (executable.parent / "Kernel1_Opt.bin").write_bytes(b"changed kernel")
+        assert runner.run_vina() == (2, 0)
+        assert calls == ["rec-a", "rec-b"]
+        calls.clear()
+        config = repo.get_settings()
+        config["docking"]["search_depth"] = 64
+        (repo.root / "project.yml").write_text(yaml.safe_dump(config), encoding="utf-8")
+        assert runner.run_vina() == (2, 0)
+        assert calls == ["rec-a", "rec-b"]
 
     manifest_outputs = export_manifest_csv(repo)
     leaderboard_outputs = export_leaderboard_csv(repo)
@@ -197,3 +222,11 @@ USER_CHARGES
     (repo.root / damaged).write_text("damaged pose", encoding="utf-8")
     assert runner.run_vina() == (2, 0)
     assert calls == ["rec-a"]
+
+    if docking_backend == "vinagpu":
+        calls.clear()
+        config = repo.get_settings()
+        config["docking"]["backend"] = "vina"
+        (repo.root / "project.yml").write_text(yaml.safe_dump(config), encoding="utf-8")
+        assert runner.run_vina() == (2, 0)
+        assert calls == ["rec-a", "rec-b"]  # GPU runs are never reused as CPU runs.

@@ -10,6 +10,8 @@ dist/
 !tools/
 !tools/vina/
 !tools/vina/*.exe
+!tools/vinagpu/
+!tools/vinagpu/*.exe
 
 # User-created docking projects and generated scientific artifacts
 Test_Bench/

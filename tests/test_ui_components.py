@@ -96,6 +96,33 @@ def test_dashboard_refresh_defines_profile_metadata(tmp_path) -> None:
 
     assert fake.docked_export_action.enabled is False
 
+    # Legacy failure notes must remain visible after reopening a project.
+    csv_path = tmp_path / "input.csv"
+    csv_path.write_text("id,smiles\nlig1,CCO\nlig2,CC\n", encoding="utf-8")
+    fake.repo.import_ligands_csv(csv_path)
+    with fake.repo.connection() as conn:
+        conn.execute("UPDATE parent_ligands SET parse_reason='MolScrub failed: ETKDG failed'")
+    MainWindow._update_dashboard(fake, 2, 0, 0, 0, 0)
+    assert fake.stat_cards["failed"].text == "2"
+    assert "0 generated; 2 failed" in fake.stage_buttons["molscrub"].text
+    assert "Failed 3D Structure Generation: 2" in fake.stat_details["failed"].text
+
+    class Progress:
+        def reset(self): self.states = {}
+        def update(self): pass
+        def complete_stage(self, stage): self.states[stage] = "complete"
+        def start_stage(self, stage): self.states[stage] = "active"
+
+    fake.overall_progress = Progress()
+    fake._update_dashboard = lambda *values: MainWindow._update_dashboard(fake, *values)
+    MainWindow._refresh_checkpoint_state(fake)
+    assert fake.overall_progress.states["molscrub"] == "warning"
+    # An incomplete batch must not become complete after the first result.
+    with fake.repo.connection() as conn:
+        conn.execute("UPDATE parent_ligands SET parse_reason=NULL WHERE parent_id='lig2'")
+    MainWindow._refresh_checkpoint_state(fake)
+    assert fake.overall_progress.states["molscrub"] == "active"
+
 
 def test_auto_import_skips_empty_starter_csv(tmp_path) -> None:
     repo = ProjectRepository.create(tmp_path / "project")

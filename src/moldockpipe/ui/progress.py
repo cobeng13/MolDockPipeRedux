@@ -38,8 +38,8 @@ class CheckpointProgress(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         width = self.width()
         segment = width / len(self.STAGES)
-        colors = {"pending": "#d9534f", "active": "#f0ad4e", "complete": "#5cb85c"}
-        labels = {"screening": "Screening", "molscrub": "MolScrub", "meeko": "Meeko", "vina": "Vina"}
+        colors = {"pending": "#d9534f", "active": "#f0ad4e", "complete": "#5cb85c", "warning": "#f59e0b"}
+        labels = {"screening": "Screening", "molscrub": "MolScrub", "meeko": "Meeko", "vina": "Vina", "postdock": "Export"}
         y = 18
         painter.setPen(Qt.PenStyle.NoPen)
         for index, stage in enumerate(self.STAGES):

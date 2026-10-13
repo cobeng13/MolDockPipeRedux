@@ -14,6 +14,7 @@ from .services.meeko import MeekoService
 from .services.screening import screen_smiles
 from .services.validation import validate_pdbqt
 from .services.vina import VinaDockingBackend, find_vina_executable, find_vina_split_executable
+from .services.vinagpu import VinaGpuDockingBackend, find_vinagpu_executable, vinagpu_tool_hash
 from .services.postdock import PostDockService, receptor_export_filename
 
 
@@ -89,7 +90,7 @@ class PipelineRunner:
         self._emit("stage_completed", "screening", total=len(parents), succeeded=completed, skipped=skipped, failed=failed)
         return completed, failed
 
-    def run_molscrub(self) -> tuple[int, int]:
+    def run_molscrub(self, *, retry_failed: bool = False) -> tuple[int, int]:
         self._check_cancelled()
         project = self.repository.get_settings()
         settings = project.get("molscrub", {})
@@ -111,11 +112,21 @@ class PipelineRunner:
         for index, row in enumerate(allowed, 1):
             self._check_cancelled()
             self._emit("item_started", "molscrub", row["parent_id"], index, len(allowed))
+            run_fingerprint = fingerprint(settings=settings, inputs={"smiles": row["source_smiles"]}, tool_version=version)
             with self.repository.connection() as conn:
+                previous = conn.execute("""SELECT fingerprint,status,reason FROM stage_runs
+                    WHERE stage_name='molscrub' AND entity_type='parent' AND entity_id=?
+                    ORDER BY rowid DESC LIMIT 1""", (row["parent_id"],)).fetchone()
                 existing = conn.execute("""SELECT s.state_structure_hash,s.generation_fingerprint,
                     a.relative_path,a.sha256 FROM molecular_states s LEFT JOIN conformers c ON c.state_id=s.state_id
                     LEFT JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id
                     WHERE s.parent_id=? AND s.active=1""", (row["parent_id"],)).fetchall()
+            if not retry_failed and previous and previous["status"] == StageStatus.FAILED and previous["fingerprint"] == run_fingerprint:
+                failed += 1
+                skipped += 1
+                self._emit("item_skipped", "molscrub", row["parent_id"], index, len(allowed),
+                           failed=failed, skipped=skipped, message=f"Known failure skipped: {previous['reason']}")
+                continue
             if existing and all(
                 state["generation_fingerprint"] == fingerprint(settings=settings,
                     inputs={"state": state["state_structure_hash"]}, tool_version=version)
@@ -126,16 +137,29 @@ class PipelineRunner:
                 skipped += 1
                 self._emit("item_skipped", "molscrub", row["parent_id"], index, len(allowed), skipped=skipped, message=f"{len(existing)} existing states reused")
                 continue
+            run_id = str(uuid.uuid4())
+            with self.repository.connection() as conn:
+                conn.execute("INSERT INTO stage_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                             (run_id, "molscrub", "parent", row["parent_id"], run_fingerprint, StageStatus.RUNNING, utc_now(), None, None))
             try:
-                states, truncated = service.generate(row["source_smiles"], ph=float(settings.get("ph", 7.4)), enumerate_states=bool(settings.get("enumerate_states", True)), max_states=int(settings.get("max_states", 32)))
+                states, truncated = service.generate(row["source_smiles"], ph=float(settings.get("ph", 7.4)), enumerate_states=bool(settings.get("enumerate_states", True)), max_states=int(settings.get("max_states", 32)), timeout_seconds=float(settings.get("timeout_seconds", 15)))
+                if not states:
+                    raise ValueError("MolScrub returned no molecular states")
                 self._persist_states(row["parent_id"], states, truncated, settings)
+                with self.repository.connection() as conn:
+                    conn.execute("UPDATE stage_runs SET status=?, ended_at=? WHERE stage_run_id=?", (StageStatus.COMPLETED, utc_now(), run_id))
+                    conn.execute("UPDATE parent_ligands SET parse_reason=NULL WHERE parent_id=? AND parse_reason LIKE 'MolScrub failed:%'", (row["parent_id"],))
                 created += len(states)
                 self._emit("item_succeeded", "molscrub", row["parent_id"], index, len(allowed), succeeded=1)
             except Exception as exc:
                 failed += 1
                 with self.repository.connection() as conn:
                     conn.execute("UPDATE parent_ligands SET parse_reason=? WHERE parent_id=?", (f"MolScrub failed: {exc}", row["parent_id"]))
-                self._emit("item_failed", "molscrub", row["parent_id"], index, len(allowed), failed=1, message=str(exc))
+                    conn.execute("UPDATE stage_runs SET status=?, ended_at=?, reason=? WHERE stage_run_id=?", (StageStatus.FAILED, utc_now(), str(exc), run_id))
+                    # Partial or stale states from a failed parent must not enter downstream stages.
+                    conn.execute("UPDATE molecular_states SET active=0 WHERE parent_id=?", (row["parent_id"],))
+                    conn.execute("UPDATE docking_runs SET is_current=0 WHERE state_id IN (SELECT state_id FROM molecular_states WHERE parent_id=?)", (row["parent_id"],))
+                self._emit("item_failed", "molscrub", row["parent_id"], index, len(allowed), failed=failed, message=str(exc))
         self._emit("stage_completed", "molscrub", total=len(allowed), succeeded=created, skipped=skipped, failed=failed)
         return created, failed
 
@@ -243,7 +267,18 @@ class PipelineRunner:
             raise RuntimeError("No enabled receptor profiles are configured")
         # Vina is an application-level tool, shared by projects. A project-local
         # copy remains supported for portable runs.
-        executable = find_vina_executable(self.repository.root)
+        docking_settings = self.repository.get_settings().get("docking", {})
+        backend_name = docking_settings.get("backend", "vina")
+        if backend_name not in ("vina", "vinagpu"):
+            raise ValueError(f"Unknown docking backend: {backend_name}")
+        if backend_name == "vinagpu":
+            executable = find_vinagpu_executable(self.repository.root)
+            tool_hash = vinagpu_tool_hash(executable)
+            backend = VinaGpuDockingBackend()
+        else:
+            executable = find_vina_executable(self.repository.root)
+            tool_hash = file_sha256(executable)
+            backend = VinaDockingBackend()
         executable_hash = file_sha256(executable)
         with self.repository.connection() as conn:
             states = conn.execute("""SELECT s.state_id, s.parent_id, a.relative_path
@@ -258,9 +293,10 @@ class PipelineRunner:
             "requested_dockings": len(states) * len(profiles),
             "vina_executable": str(executable),
             "vina_executable_sha256": executable_hash,
+            "docking_backend": backend_name,
+            "docking_tool_hash": tool_hash,
         }
         workflow_run_id = self.repository.start_workflow_run("docking", campaign_settings)
-        backend = VinaDockingBackend()
         succeeded = failed = reused = 0
         total = len(states) * len(profiles)
         self.repository.update_workflow_stage(workflow_run_id, "vina", StageStatus.RUNNING.value,
@@ -279,9 +315,14 @@ class PipelineRunner:
             run_settings = {key: value for key, value in profile.items()
                             if key not in {"id", "name", "enabled", "archived", "receptor"} and value is not None}
             run_settings["cpu"] = run_settings.pop("cpu_count", 1)
+            if backend_name == "vinagpu":
+                run_settings.pop("cpu", None)
+                run_settings.pop("exhaustiveness", None)
+                run_settings.update(backend="vinagpu", thread=docking_settings.get("thread", 8000),
+                                    search_depth=docking_settings.get("search_depth", 32))
             if not receptor.is_file():
                 reason = f"Prepared receptor not found: {receptor}"
-                missing_fp = fingerprint(settings=run_settings, inputs={"receptor": "missing"}, tool_version=executable_hash)
+                missing_fp = fingerprint(settings=run_settings, inputs={"receptor": "missing"}, tool_version=tool_hash)
                 for state in states:
                     index += 1
                     failed += 1
@@ -300,7 +341,7 @@ class PipelineRunner:
                                message=reason)
                 continue
             receptor_hash = file_sha256(receptor)
-            settings_fp = fingerprint(settings=run_settings, inputs={"receptor": receptor_hash}, tool_version=executable_hash)
+            settings_fp = fingerprint(settings=run_settings, inputs={"receptor": receptor_hash}, tool_version=tool_hash)
             for state in states:
                 self._check_cancelled()
                 index += 1
@@ -384,7 +425,7 @@ class PipelineRunner:
         )
         self.repository.finish_workflow_run(workflow_run_id, final_status,
                                             error=None if failed == 0 else f"{failed} docking item(s) failed")
-        self.repository.record_tool("vina", executable.name, executable)
+        self.repository.record_tool(backend_name, executable.name, executable)
         return succeeded, failed
 
     def run_postdock(self) -> tuple[int, int]:

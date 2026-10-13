@@ -29,6 +29,7 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._screening_tab(settings.get("screening", {})), "Screening")
         tabs.addTab(self._molscrub_tab(settings.get("molscrub", {})), "MolScrub")
         tabs.addTab(self._meeko_tab(settings.get("meeko", {})), "Meeko")
+        tabs.addTab(self._docking_tab(settings.get("docking", {})), "Docking")
         tabs.addTab(self._postdock_tab(settings.get("postdock", {})), "Post-docking")
         tabs.addTab(self._workflow_maintenance_tab(), "Workflow Maintenance")
         layout = QVBoxLayout(self)
@@ -98,11 +99,31 @@ class SettingsDialog(QDialog):
         self.fields["molscrub.enumerate_states"] = enumerate_box
         form.addRow("", enumerate_box)
         self._integer(form, "Maximum states", "molscrub.max_states", values.get("max_states", 32), 1, 10000)
+        self._integer(form, "Time limit per molecule (seconds)", "molscrub.timeout_seconds", values.get("timeout_seconds", 15), 1, 3600)
         widget = QWidget(); widget.setLayout(form); return widget
 
     def _meeko_tab(self, values: dict[str, object]) -> QWidget:
         form = QFormLayout()
         self._integer(form, "Parallel workers", "meeko.workers", values.get("workers", 4), 1, 32)
+        widget = QWidget(); widget.setLayout(form); return widget
+
+    def _docking_tab(self, values: dict[str, object]) -> QWidget:
+        form = QFormLayout()
+        backend = QComboBox()
+        backend.addItem("Vina (CPU)", "vina")
+        backend.addItem("Vina-GPU", "vinagpu")
+        backend.setCurrentIndex(max(0, backend.findData(values.get("backend", "vina"))))
+        self.fields["docking.backend"] = backend
+        form.addRow("Docking engine", backend)
+        self._integer(form, "GPU computing lanes", "docking.thread", values.get("thread", 8000), 1000, 1000000)
+        self._integer(form, "GPU search depth", "docking.search_depth", values.get("search_depth", 32), 1, 10000)
+        for key in ("docking.thread", "docking.search_depth"):
+            self.fields[key].setEnabled(backend.currentData() == "vinagpu")
+        backend.currentIndexChanged.connect(lambda: [self.fields[key].setEnabled(backend.currentData() == "vinagpu")
+                                                   for key in ("docking.thread", "docking.search_depth")])
+        note = QLabel("Receptor boxes, seed, pose count, and energy range come from Receptors. GPU uses computing lanes and search depth; CPU count and exhaustiveness apply to CPU Vina. Receptor validation redocking uses CPU Vina.")
+        note.setWordWrap(True)
+        form.addRow(note)
         widget = QWidget(); widget.setLayout(form); return widget
 
     def _vina_tab(self, values: dict[str, object]) -> QWidget:
@@ -169,7 +190,7 @@ class SettingsDialog(QDialog):
         form.addRow(label, field)
 
     def values(self) -> dict[str, dict[str, object]]:
-        values: dict[str, dict[str, object]] = {"screening": {}, "molscrub": {}, "meeko": {}, "postdock": {}}
+        values: dict[str, dict[str, object]] = {"screening": {}, "molscrub": {}, "meeko": {}, "docking": {}, "postdock": {}}
         values["postdock"]["selected_parents"] = list(self.settings.get("postdock", {}).get("selected_parents", []))
         for key, field in self.fields.items():
             if isinstance(field, QLineEdit):

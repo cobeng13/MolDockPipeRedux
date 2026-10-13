@@ -107,6 +107,18 @@ class ProjectRepository:
         finally:
             conn.close()
 
+    def molscrub_failures(self) -> list[sqlite3.Row]:
+        """Return current parent failures, including notes from older projects."""
+        with self.connection() as conn:
+            return conn.execute("""SELECT p.parent_id, COALESCE(r.reason, p.parse_reason) AS reason
+                FROM parent_ligands p LEFT JOIN stage_runs r ON r.rowid=(
+                    SELECT MAX(latest.rowid) FROM stage_runs latest
+                    WHERE latest.stage_name='molscrub' AND latest.entity_type='parent'
+                    AND latest.entity_id=p.parent_id)
+                WHERE p.active=1 AND (r.status='failed' OR
+                    (r.stage_run_id IS NULL AND p.parse_reason LIKE 'MolScrub failed:%'))
+                ORDER BY p.parent_id""").fetchall()
+
     def migrate(self) -> None:
         with self.connection() as conn:
             conn.executescript("""

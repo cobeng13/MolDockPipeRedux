@@ -394,10 +394,16 @@ class MainWindow(QMainWindow):
         profiles = [profile for profile in self.repo.get_receptor_profiles() if profile.get("enabled")]
         profile_ids = [str(profile["id"]) for profile in profiles]
         placeholders = ",".join("?" for _ in profile_ids)
+        structure_failed = len(self.repo.molscrub_failures())
         with self.repo.connection() as conn:
             parents = conn.execute("SELECT COUNT(*) FROM parent_ligands").fetchone()[0]
             screened = conn.execute("SELECT COUNT(*) FROM screening_results s JOIN parent_ligands p USING(parent_id) WHERE s.active=1 AND s.status IN ('completed','failed')").fetchone()[0]
             states = conn.execute("SELECT COUNT(*) FROM molecular_states WHERE active=1").fetchone()[0]
+            structure_passed = conn.execute("SELECT COUNT(DISTINCT parent_id) FROM molecular_states WHERE active=1").fetchone()[0]
+            structure_total = conn.execute("""SELECT COUNT(*) FROM parent_ligands p
+                LEFT JOIN screening_results s ON s.parent_id=p.parent_id AND s.active=1
+                WHERE s.decision NOT IN ('fail') OR ?='annotate_only'""",
+                (self.repo.get_settings().get("screening", {}).get("policy", "annotate_only"),)).fetchone()[0]
             prepared = conn.execute("SELECT COUNT(*) FROM conformers c JOIN molecular_states s USING(state_id) WHERE s.active=1 AND c.status='pdbqt_ready'").fetchone()[0]
             conformers = conn.execute("SELECT COUNT(*) FROM conformers c JOIN molecular_states s USING(state_id) WHERE s.active=1").fetchone()[0]
             meeko_terminal = conn.execute("SELECT COUNT(*) FROM conformers c JOIN molecular_states s USING(state_id) WHERE s.active=1 AND c.status IN ('pdbqt_ready','pdbqt_failed')").fetchone()[0]
@@ -412,8 +418,14 @@ class MainWindow(QMainWindow):
             self.overall_progress.complete_stage("screening")
         elif screened:
             self.overall_progress.start_stage("screening")
-        if states:
-            self.overall_progress.complete_stage("molscrub")
+        if structure_total and structure_passed + structure_failed >= structure_total:
+            if structure_failed:
+                self.overall_progress.states["molscrub"] = "warning"
+                self.overall_progress.update()
+            else:
+                self.overall_progress.complete_stage("molscrub")
+        elif structure_passed or structure_failed:
+            self.overall_progress.start_stage("molscrub")
         if conformers and meeko_terminal == conformers:
             self.overall_progress.complete_stage("meeko")
         elif prepared:
@@ -433,10 +445,13 @@ class MainWindow(QMainWindow):
         profiles = [profile for profile in self.repo.get_receptor_profiles() if profile.get("enabled")]
         profile_ids = [str(profile["id"]) for profile in profiles]
         placeholders = ",".join("?" for _ in profile_ids)
+        structure_failures = self.repo.molscrub_failures()
         with self.repo.connection() as conn:
             passed = conn.execute("SELECT COUNT(*) FROM screening_results s JOIN parent_ligands p USING(parent_id) WHERE s.active=1 AND s.decision != 'fail'").fetchone()[0]
             failed = conn.execute("SELECT COUNT(*) FROM screening_results s JOIN parent_ligands p USING(parent_id) WHERE s.active=1 AND s.decision = 'fail'").fetchone()[0]
-            structure_failed = conn.execute("SELECT COUNT(*) FROM parent_ligands WHERE parse_reason LIKE 'MolScrub failed:%'").fetchone()[0]
+            structure_failed = len(structure_failures)
+            screening_failed_ids = {row[0] for row in conn.execute("SELECT parent_id FROM screening_results WHERE active=1 AND decision='fail'")}
+            failed_ligands = len(screening_failed_ids | {row["parent_id"] for row in structure_failures})
             structure_passed = conn.execute("SELECT COUNT(DISTINCT parent_id) FROM molecular_states WHERE active=1").fetchone()[0]
             pdbqt_failed = conn.execute("SELECT COUNT(DISTINCT s.parent_id) FROM molecular_states s JOIN parent_ligands p USING(parent_id) WHERE s.active=1 AND s.status='pdbqt_failed'").fetchone()[0]
             pdbqt_passed = conn.execute("SELECT COUNT(DISTINCT s.parent_id) FROM molecular_states s JOIN parent_ligands p USING(parent_id) JOIN conformers c USING(state_id) WHERE s.active=1 AND c.status='pdbqt_ready'").fetchone()[0]
@@ -472,7 +487,7 @@ class MainWindow(QMainWindow):
             ).fetchall()}
         self.stat_cards["ligands"].setText(str(parents))
         self.stat_cards["passed"].setText(str(passed))
-        self.stat_cards["failed"].setText(str(failed))
+        self.stat_cards["failed"].setText(str(failed_ligands))
         self.stat_cards["running"].setText("Running" if self.stage_running else "Idle" if stage_runs else "Staging")
         screening_percent = (failed / parents * 100) if parents else 0
         self.stat_details["passed"].setText(
@@ -512,16 +527,19 @@ class MainWindow(QMainWindow):
         self.docked_export_action.setEnabled(has_docking_exports)
         labels = {
             "screening": f"Screening\n{passed} passed; {failed} failed",
-            "molscrub": f"States\n{states} generated",
+            "molscrub": f"States\n{states} generated; {structure_failed} failed",
             "meeko": f"Ligands\n{prepared} prepared",
             "vina": f"Docking\n{docked} receptor-state runs complete",
             "postdock": f"Export\n{export_status}",
         }
         for stage, button in self.stage_buttons.items():
             status = self.overall_progress.states.get(stage, "pending")
-            icon = "\u2713" if status == "complete" else "\u27f3" if status == "active" else "\u25cb"
+            icon = "\u2713" if status == "complete" else "\u27f3" if status == "active" else "\u26a0" if status == "warning" else "\u25cb"
             button.setText(f"{icon} {labels[stage]}")
             button.setToolTip(labels[stage].replace("\n", "\n"))
+            if stage == "molscrub" and structure_failures:
+                button.setToolTip(labels[stage] + "\n" + "\n".join(
+                    f"{row['parent_id']}: {row['reason']}" for row in structure_failures[:6]))
             if stage == "postdock":
                 button.setEnabled(has_docking_exports)
             if status == "complete":
@@ -710,7 +728,8 @@ class MainWindow(QMainWindow):
         item = getattr(event, "item_id", None)
         message = getattr(event, "message", "")
         self.statusBar().showMessage(f"{stage}: {item or ''} {message}")
-        if getattr(event, "event", "") in {"item_failed", "stage_completed"}:
+        if (getattr(event, "event", "") in {"item_failed", "stage_completed"}
+                or (getattr(event, "event", "") == "item_skipped" and getattr(event, "failed", 0))):
             self._write_log(self._event_summary(event))
         if getattr(event, "event", "") == "stage_completed":
             self.refresh_tables()
