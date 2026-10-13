@@ -6,7 +6,7 @@ from pathlib import Path
 import yaml
 
 from moldockpipe.pipeline import PipelineRunner
-from moldockpipe.project import ProjectRepository, utc_now
+from moldockpipe.project import ProjectRepository, SCHEMA_VERSION, utc_now
 from moldockpipe.csv_exports import export_leaderboard_csv, export_manifest_csv
 
 
@@ -28,7 +28,7 @@ def test_legacy_vina_settings_migrate_to_default_profile(tmp_path: Path) -> None
     assert profiles[0]["center_x"] == 7.5
     assert profiles[0]["cpu_count"] == 3
     assert (root / profiles[0]["receptor"]).read_text(encoding="utf-8") == "RECEPTOR"
-    assert repo.get_settings()["schema_version"] == 6
+    assert repo.get_settings()["schema_version"] == SCHEMA_VERSION
 
 
 def test_multidock_runs_and_reuses_each_receptor_independently(tmp_path: Path, monkeypatch) -> None:
@@ -149,6 +149,23 @@ USER_CHARGES
     assert (first_root / "reference_ligand_heavy.mol2").is_file()
 
     calls.clear()
+    # A replacement CSV adds another batch and never archives the docked one.
+    csv_path.write_text("id,smiles\nlig2,CCN\n", encoding="utf-8")
+    assert repo.sync_ligands_csv(csv_path).added == 1
+    assert repo.sync_ligands_csv(csv_path).unchanged == 1
+    assert runner.run_vina() == (2, 0)
+    assert calls == []
+
+    # Upgrading a legacy CSV-archived compound restores its result without docking.
+    with repo.connection() as conn:
+        conn.execute("DELETE FROM schema_migrations WHERE version=7")
+        conn.execute("UPDATE parent_ligands SET active=0,archived_at='now' WHERE parent_id='lig1'")
+        conn.execute("UPDATE molecular_states SET active=0,status='obsolete' WHERE parent_id='lig1'")
+        conn.execute("UPDATE conformers SET status='obsolete'")
+        conn.execute("UPDATE docking_runs SET is_current=0")
+        conn.execute("UPDATE artifacts SET active=0 WHERE created_stage IN ('molscrub','vina')")
+    repo.migrate()
+    repo.migrate()  # Upgrade is idempotent.
     assert runner.run_vina() == (2, 0)
     assert calls == []
 
@@ -168,5 +185,15 @@ USER_CHARGES
         manifest_rows = list(csv.DictReader(handle))
     with (repo.root / "exports" / "leaderboard.csv").open(encoding="utf-8", newline="") as handle:
         leaderboard_rows = list(csv.DictReader(handle))
-    assert {(row["receptor_id"], row["id"]) for row in manifest_rows} == {("rec-a", "lig1"), ("rec-b", "lig1")}
+    assert {(row["receptor_id"], row["id"]) for row in manifest_rows} == {
+        ("rec-a", "lig1"), ("rec-b", "lig1"), ("rec-a", "lig2"), ("rec-b", "lig2")}
     assert {(row["receptor_id"], row["parent_id"]) for row in leaderboard_rows} == {("rec-a", "lig1"), ("rec-b", "lig1")}
+
+    # A damaged completed output retries only the affected receptor.
+    calls.clear()
+    with repo.connection() as conn:
+        damaged = conn.execute("""SELECT a.relative_path FROM docking_runs d JOIN artifacts a
+            ON a.artifact_id=d.raw_output_artifact_id WHERE d.receptor_profile_id='rec-a' AND d.is_current=1""").fetchone()[0]
+    (repo.root / damaged).write_text("damaged pose", encoding="utf-8")
+    assert runner.run_vina() == (2, 0)
+    assert calls == ["rec-a"]

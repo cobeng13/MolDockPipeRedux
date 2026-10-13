@@ -38,7 +38,7 @@ def export_manifest_csv(repository: ProjectRepository) -> list[Path]:
         parents = conn.execute("""SELECT p.*, COALESCE(s.reason, '') screening_reason,
             COALESCE(s.status, '') screening_status FROM parent_ligands p
             LEFT JOIN screening_results s ON s.parent_id=p.parent_id AND s.active=1
-            WHERE p.active=1 ORDER BY p.parent_id""").fetchall()
+            ORDER BY p.parent_id""").fetchall()
         for profile in profiles:
             profile_id = str(profile["id"]); rows = []
             for parent in parents:
@@ -92,7 +92,7 @@ def export_leaderboard_csv(repository: ProjectRepository) -> list[Path]:
                     ROW_NUMBER() OVER (PARTITION BY s.parent_id ORDER BY p.affinity ASC) pose_rank
                     FROM docking_poses p JOIN docking_runs d ON d.run_id=p.run_id
                     JOIN molecular_states s ON s.state_id=d.state_id JOIN parent_ligands l ON l.parent_id=s.parent_id
-                    WHERE l.active=1 AND s.active=1 AND d.is_current=1 AND d.status='completed' AND d.receptor_profile_id=?)
+                    WHERE s.active=1 AND d.is_current=1 AND d.status='completed' AND d.receptor_profile_id=?)
                 WHERE pose_rank<=3 ORDER BY affinity,parent_id,pose_rank""", (profile_id,)).fetchall()
             rows = [{"receptor_id": profile_id, "receptor_name": profile.get("name", profile_id), **dict(row)} for row in query_rows]
             combined.extend(rows)

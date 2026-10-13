@@ -59,6 +59,8 @@ def main() -> int:
         from .pipeline import PipelineRunner
 
         repo = ProjectRepository(args.project)
+        repo.migrate()
+        repo.import_project_input()
         repo.recover_interrupted_runs()
         runner = PipelineRunner(repo)
         methods = {

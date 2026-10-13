@@ -19,7 +19,7 @@ from .fingerprints import file_sha256, fingerprint
 from .models import ScreeningPolicy, StageStatus
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 DEFAULT_VINA_PROFILE: dict[str, Any] = {
@@ -52,7 +52,7 @@ class LigandSyncResult:
 
     @property
     def reprocess_required(self) -> int:
-        return self.added + self.changed
+        return self.added
 
 
 def utc_now() -> str:
@@ -240,9 +240,54 @@ class ProjectRepository:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_receptor_preparation_profile ON receptor_preparation_runs(receptor_profile_id, started_at)")
             for row in conn.execute("SELECT parent_id, source_smiles, notes, params_json FROM parent_ligands WHERE input_fingerprint IS NULL OR input_fingerprint='' ").fetchall():
                 conn.execute("UPDATE parent_ligands SET input_fingerprint=? WHERE parent_id=?", (self._input_fingerprint(row["source_smiles"], row["notes"], row["params_json"]), row["parent_id"]))
+            if not conn.execute("SELECT 1 FROM schema_migrations WHERE version=7").fetchone():
+                self._restore_archived_library(conn)
             conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)", (SCHEMA_VERSION, utc_now()))
             conn.execute("INSERT OR IGNORE INTO projects(project_id, name, root_path, created_at) VALUES (?, ?, ?, ?)", (str(uuid.uuid4()), self.root.name, str(self.root), utc_now()))
         self._migrate_vina_profiles()
+
+    def _restore_archived_library(self, conn: sqlite3.Connection) -> None:
+        """Restore CSV-archived compounds once when upgrading to cumulative imports.
+
+        Keep obsolete states from earlier edits obsolete. Only states produced
+        after the latest screening of the stored input can be restored.
+        """
+        archived = conn.execute("SELECT parent_id FROM parent_ligands WHERE active=0").fetchall()
+        for parent in archived:
+            parent_id = parent["parent_id"]
+            conn.execute("UPDATE screening_results SET active=1 WHERE parent_id=?", (parent_id,))
+            states = conn.execute("""SELECT s.state_id FROM molecular_states s
+                LEFT JOIN screening_results r ON r.parent_id=s.parent_id
+                WHERE s.parent_id=? AND s.created_at>=COALESCE(r.created_at,s.created_at)""",
+                (parent_id,)).fetchall()
+            for state in states:
+                state_id = state["state_id"]
+                pdbqt = self.root / "artifacts" / "pdbqt" / parent_id / state_id / "ligand.pdbqt"
+                status = "pdbqt_ready" if pdbqt.is_file() else "ready"
+                conn.execute("UPDATE molecular_states SET active=1,status=? WHERE state_id=?",
+                             ("pdbqt_ready" if pdbqt.is_file() else "sdf_ready", state_id))
+                conn.execute("UPDATE conformers SET status=? WHERE state_id=?", (status, state_id))
+                conn.execute("""UPDATE artifacts SET active=1 WHERE artifact_id IN
+                    (SELECT sdf_artifact_id FROM conformers WHERE state_id=?)
+                    OR artifact_id IN (SELECT raw_output_artifact_id FROM docking_runs WHERE state_id=?)
+                    OR artifact_id IN (SELECT log_artifact_id FROM docking_runs WHERE state_id=?)""",
+                    (state_id, state_id, state_id))
+                conn.execute("""WITH ranked AS (
+                    SELECT run_id,ROW_NUMBER() OVER (PARTITION BY receptor_profile_id
+                    ORDER BY COALESCE(ended_at,started_at,'') DESC,rowid DESC) rank
+                    FROM docking_runs WHERE state_id=?)
+                    UPDATE docking_runs SET is_current=(run_id IN
+                        (SELECT run_id FROM ranked WHERE rank=1)) WHERE state_id=?""", (state_id, state_id))
+        conn.execute("UPDATE parent_ligands SET active=1,archived_at=NULL")
+
+    def import_project_input(self) -> LigandSyncResult:
+        """Import the current project CSV before processing; an empty file is a no-op."""
+        for path in (self.root / "inputs" / "input.csv", self.root / "input" / "input.csv"):
+            if path.is_file():
+                if not path.read_text(encoding="utf-8-sig").strip():
+                    return LigandSyncResult()
+                return self.sync_ligands_csv(path)
+        return LigandSyncResult()
 
     def _migrate_vina_profiles(self) -> None:
         """Convert the legacy flat Vina block into a portable receptor profile."""
@@ -530,7 +575,9 @@ class ProjectRepository:
         seen: set[str] = set()
         with path.open(newline="", encoding="utf-8-sig") as handle:
             reader = csv.DictReader(handle)
-            if not reader.fieldnames or "id" not in reader.fieldnames or "smiles" not in reader.fieldnames:
+            if not reader.fieldnames:
+                return rows
+            if "id" not in reader.fieldnames or "smiles" not in reader.fieldnames:
                 raise ValueError("Ligand CSV must contain stable 'id' and 'smiles' columns")
             for line_number, row in enumerate(reader, 2):
                 parent_id = (row.get("id") or "").strip()
@@ -549,44 +596,34 @@ class ProjectRepository:
                     "notes": (row.get("notes") or "").strip(),
                     "params_json": (row.get("params_json") or "").strip(),
                 })
-        if not rows:
-            raise ValueError("Ligand CSV contains no usable rows")
         return rows
 
     def preview_ligand_sync(self, path: Path) -> LigandSyncResult:
         incoming = self._read_ligand_rows(path)
         with self.connection() as conn:
-            existing = {row["parent_id"]: row for row in conn.execute("SELECT parent_id, active, input_fingerprint FROM parent_ligands").fetchall()}
-        incoming_ids = {str(row["parent_id"]) for row in incoming}
+            existing = {row["parent_id"]: row for row in conn.execute("SELECT * FROM parent_ligands").fetchall()}
         added = unchanged = changed = 0
         for row in incoming:
             parent_id = str(row["parent_id"])
             current = existing.get(parent_id)
             input_fp = self._input_fingerprint(str(row["source_smiles"]), row["notes"], row["params_json"])
-            if current and int(current["active"]) == 1 and current["input_fingerprint"] == input_fp:
+            if current and current["source_smiles"] != row["source_smiles"]:
+                raise ValueError(f"Ligand id '{parent_id}' already belongs to a different SMILES; use a new id")
+            if current and current["input_fingerprint"] == input_fp:
                 unchanged += 1
             elif current:
                 changed += 1
             else:
                 added += 1
-        archived = sum(1 for parent_id, row in existing.items() if int(row["active"]) == 1 and parent_id not in incoming_ids)
-        return LigandSyncResult(added=added, unchanged=unchanged, changed=changed, archived=archived)
-
-    def _invalidate_parent(self, conn: sqlite3.Connection, parent_id: str) -> None:
-        conn.execute("UPDATE screening_results SET active=0 WHERE parent_id=?", (parent_id,))
-        conn.execute("UPDATE molecular_states SET active=0, status='obsolete' WHERE parent_id=?", (parent_id,))
-        conn.execute("""UPDATE conformers SET status='obsolete' WHERE state_id IN
-            (SELECT state_id FROM molecular_states WHERE parent_id=?)""", (parent_id,))
-        conn.execute("""UPDATE docking_runs SET is_current=0 WHERE state_id IN
-            (SELECT state_id FROM molecular_states WHERE parent_id=?)""", (parent_id,))
-        conn.execute("""UPDATE artifacts SET active=0 WHERE artifact_id IN
-            (SELECT c.sdf_artifact_id FROM conformers c JOIN molecular_states s ON s.state_id=c.state_id WHERE s.parent_id=? AND c.sdf_artifact_id IS NOT NULL)
-            OR artifact_id IN (SELECT d.log_artifact_id FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id WHERE s.parent_id=? AND d.log_artifact_id IS NOT NULL)
-            OR artifact_id IN (SELECT d.raw_output_artifact_id FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id WHERE s.parent_id=? AND d.raw_output_artifact_id IS NOT NULL)""", (parent_id, parent_id, parent_id))
+        return LigandSyncResult(added=added, unchanged=unchanged, changed=changed)
 
     def sync_ligands_csv(self, path: Path) -> LigandSyncResult:
+        """Add to the permanent project library; omissions never remove compounds.
+
+        IDs are immutable chemical identities. Notes and input metadata may be
+        updated without invalidating scientific results.
+        """
         incoming = self._read_ligand_rows(path)
-        incoming_ids = {str(row["parent_id"]) for row in incoming}
         with self.connection() as conn:
             existing = {row["parent_id"]: row for row in conn.execute("SELECT * FROM parent_ligands").fetchall()}
             counts = {"added": 0, "unchanged": 0, "changed": 0, "archived": 0}
@@ -595,25 +632,21 @@ class ProjectRepository:
                 parent_id = str(row["parent_id"])
                 input_fp = self._input_fingerprint(str(row["source_smiles"]), row["notes"], row["params_json"])
                 current = existing.get(parent_id)
-                if current and int(current["active"]) == 1 and current["input_fingerprint"] == input_fp:
+                if current and current["source_smiles"] != row["source_smiles"]:
+                    raise ValueError(f"Ligand id '{parent_id}' already belongs to a different SMILES; use a new id")
+                if current and current["input_fingerprint"] == input_fp:
                     counts["unchanged"] += 1
                     continue
                 if current:
-                    self._invalidate_parent(conn, parent_id)
-                    conn.execute("""UPDATE parent_ligands SET source_id=?, source_smiles=?, notes=?, params_json=?,
-                        canonical_source_smiles=NULL, parent_inchikey=NULL, parse_status=?, parse_reason=NULL,
-                        active=1, input_fingerprint=?, archived_at=NULL WHERE parent_id=?""", (row["source_id"], row["source_smiles"], row["notes"], row["params_json"], StageStatus.PENDING, input_fp, parent_id))
+                    conn.execute("""UPDATE parent_ligands SET notes=?, params_json=?,
+                        input_fingerprint=? WHERE parent_id=?""",
+                        (row["notes"], row["params_json"], input_fp, parent_id))
                     counts["changed"] += 1
                 else:
                     conn.execute("""INSERT INTO parent_ligands
                         (parent_id, source_id, source_smiles, notes, params_json, parse_status, created_at, active, input_fingerprint)
                         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)""", (parent_id, row["source_id"], row["source_smiles"], row["notes"], row["params_json"], StageStatus.PENDING, now, input_fp))
                     counts["added"] += 1
-            for parent_id, current in existing.items():
-                if int(current["active"]) == 1 and parent_id not in incoming_ids:
-                    self._invalidate_parent(conn, parent_id)
-                    conn.execute("UPDATE parent_ligands SET active=0, archived_at=? WHERE parent_id=?", (now, parent_id))
-                    counts["archived"] += 1
         return LigandSyncResult(**counts)
 
     def import_ligands_csv(self, path: Path) -> int:

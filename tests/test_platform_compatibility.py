@@ -53,6 +53,12 @@ def test_headless_run_does_not_require_qt(tmp_path: Path, monkeypatch: pytest.Mo
         def __init__(self, root: Path):
             self.root = root
 
+        def migrate(self):
+            calls.append("migrate")
+
+        def import_project_input(self):
+            calls.append("import")
+
         def recover_interrupted_runs(self) -> int:
             calls.append("recover")
             return 0
@@ -77,7 +83,7 @@ def test_headless_run_does_not_require_qt(tmp_path: Path, monkeypatch: pytest.Mo
     monkeypatch.setattr("sys.argv", ["moldockpipe", "run", str(project), "--stages", "screening"])
 
     assert __main__.main() == 0
-    assert calls == ["recover", "screening"]
+    assert calls == ["migrate", "import", "recover", "screening"]
     assert json.loads(capsys.readouterr().out) == {"screening": [2, 0]}
 
 

@@ -142,7 +142,7 @@ class SettingsDialog(QDialog):
             rows = conn.execute(f"""SELECT s.parent_id, MIN(p.affinity) best_affinity FROM docking_runs d
                 JOIN molecular_states s ON s.state_id=d.state_id JOIN docking_poses p ON p.run_id=d.run_id
                 JOIN parent_ligands l ON l.parent_id=s.parent_id
-                WHERE l.active=1 AND s.active=1 AND d.status='completed' AND d.is_current=1
+                WHERE s.active=1 AND d.status='completed' AND d.is_current=1
                 AND d.receptor_profile_id IN ({placeholders}) GROUP BY s.parent_id ORDER BY best_affinity ASC, s.parent_id""", profile_ids).fetchall() if profile_ids else []
         dialog = CompoundSelectorDialog(rows, set(self.fields.get("postdock.selected_parents", [])), self.repository, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:

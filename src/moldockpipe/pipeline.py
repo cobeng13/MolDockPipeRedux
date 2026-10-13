@@ -34,6 +34,12 @@ class PipelineRunner:
         if self.progress:
             self.progress(ProgressEvent(event, stage, item_id, index, total, **kwargs))
 
+    def _artifact_matches(self, relative_path: str | None, sha256: str | None) -> bool:
+        if not relative_path or not sha256:
+            return False
+        path = self.repository.root / relative_path
+        return path.is_file() and file_sha256(path) == sha256
+
     def run_screening(self) -> tuple[int, int]:
         self._check_cancelled()
         settings = self.repository.get_settings().get("screening", {})
@@ -46,21 +52,24 @@ class PipelineRunner:
             raise RuntimeError("RDKit must be installed before screening") from exc
         completed = failed = 0
         with self.repository.connection() as conn:
-            parents = conn.execute("SELECT parent_id, source_smiles FROM parent_ligands WHERE active=1 ORDER BY parent_id").fetchall()
+            parents = conn.execute("SELECT parent_id, source_smiles FROM parent_ligands ORDER BY parent_id").fetchall()
         self._emit("stage_started", "screening", total=len(parents))
         skipped = 0
         for index, parent in enumerate(parents, 1):
             self._check_cancelled()
             self._emit("item_started", "screening", parent["parent_id"], index, len(parents))
-            result = screen_smiles(parent["source_smiles"], enabled, policy)
             run_fingerprint = fingerprint(settings={"enabled": enabled, "policy": policy.value}, inputs={"smiles": parent["source_smiles"]}, tool_version=rdkit_version)
             with self.repository.connection() as conn:
                 previous = conn.execute("SELECT fingerprint,status FROM screening_results WHERE parent_id=? AND active=1", (parent["parent_id"],)).fetchone()
-            if previous and previous["fingerprint"] == run_fingerprint and previous["status"] == StageStatus.COMPLETED:
+            if previous and previous["fingerprint"] == run_fingerprint and previous["status"] in (StageStatus.COMPLETED, StageStatus.FAILED):
                 skipped += 1
-                completed += 1
+                if previous["status"] == StageStatus.COMPLETED:
+                    completed += 1
+                else:
+                    failed += 1
                 self._emit("item_skipped", "screening", parent["parent_id"], index, len(parents), skipped=skipped, message="Matching screening result reused")
                 continue
+            result = screen_smiles(parent["source_smiles"], enabled, policy)
             run_id = str(uuid.uuid4())
             with self.repository.connection() as conn:
                 conn.execute("INSERT INTO stage_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (run_id, "screening", "parent", parent["parent_id"], run_fingerprint, StageStatus.RUNNING, utc_now(), None, None))
@@ -89,21 +98,33 @@ class PipelineRunner:
         with self.repository.connection() as conn:
             rows = conn.execute("""SELECT p.parent_id, p.source_smiles, s.decision FROM parent_ligands p
                 LEFT JOIN screening_results s ON s.parent_id=p.parent_id AND s.active=1
-                WHERE p.active=1 ORDER BY p.parent_id""").fetchall()
+                ORDER BY p.parent_id""").fetchall()
         allowed = [row for row in rows if row["decision"] not in ("fail", None) or policy == ScreeningPolicy.ANNOTATE_ONLY.value]
         service = MolScrubService()
+        try:
+            import molscrub
+            version = getattr(molscrub, "__version__", "unknown")
+        except ImportError:
+            version = "unknown"
         created = failed = skipped = 0
         self._emit("stage_started", "molscrub", total=len(allowed))
         for index, row in enumerate(allowed, 1):
             self._check_cancelled()
             self._emit("item_started", "molscrub", row["parent_id"], index, len(allowed))
             with self.repository.connection() as conn:
-                existing = conn.execute("""SELECT COUNT(*) FROM molecular_states s JOIN conformers c ON c.state_id=s.state_id
-                    JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id WHERE s.parent_id=? AND s.active=1 AND c.status IN ('ready','pdbqt_ready') AND a.active=1""", (row["parent_id"],)).fetchone()[0]
-            if existing:
-                created += existing
+                existing = conn.execute("""SELECT s.state_structure_hash,s.generation_fingerprint,
+                    a.relative_path,a.sha256 FROM molecular_states s LEFT JOIN conformers c ON c.state_id=s.state_id
+                    LEFT JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id
+                    WHERE s.parent_id=? AND s.active=1""", (row["parent_id"],)).fetchall()
+            if existing and all(
+                state["generation_fingerprint"] == fingerprint(settings=settings,
+                    inputs={"state": state["state_structure_hash"]}, tool_version=version)
+                and self._artifact_matches(state["relative_path"], state["sha256"])
+                for state in existing
+            ):
+                created += len(existing)
                 skipped += 1
-                self._emit("item_skipped", "molscrub", row["parent_id"], index, len(allowed), skipped=skipped, message=f"{existing} existing states reused")
+                self._emit("item_skipped", "molscrub", row["parent_id"], index, len(allowed), skipped=skipped, message=f"{len(existing)} existing states reused")
                 continue
             try:
                 states, truncated = service.generate(row["source_smiles"], ph=float(settings.get("ph", 7.4)), enumerate_states=bool(settings.get("enumerate_states", True)), max_states=int(settings.get("max_states", 32)))
@@ -125,6 +146,10 @@ class PipelineRunner:
             version = getattr(molscrub, "__version__", "unknown")
         except ImportError:
             version = "unknown"
+        with self.repository.connection() as conn:
+            conn.execute("UPDATE molecular_states SET active=0 WHERE parent_id=?", (parent_id,))
+            conn.execute("""UPDATE docking_runs SET is_current=0 WHERE state_id IN
+                (SELECT state_id FROM molecular_states WHERE parent_id=?)""", (parent_id,))
         for state in states:
             state_id = f"{parent_id}-{state.structure_hash[:16]}"
             state_fingerprint = fingerprint(settings=settings, inputs={"state": state.structure_hash}, tool_version=version)
@@ -135,9 +160,12 @@ class PipelineRunner:
             writer.write(state.molecule)
             writer.close()
             with self.repository.connection() as conn:
-                conn.execute("""INSERT OR REPLACE INTO molecular_states
+                conn.execute("""INSERT INTO molecular_states
                     (state_id,parent_id,state_smiles,state_isomeric_smiles,state_inchikey,formal_charge,tautomer_index,protomer_index,state_structure_hash,generation_fingerprint,status,reason,enumeration_truncated,created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (state_id, parent_id, state.state_smiles, state.state_isomeric_smiles, state.state_inchikey, state.formal_charge, state.tautomer_index, state.protomer_index, state.structure_hash, state_fingerprint, "sdf_ready", None, int(truncated), utc_now()))
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(state_id) DO UPDATE SET generation_fingerprint=excluded.generation_fingerprint,
+                    status=excluded.status,reason=NULL,enumeration_truncated=excluded.enumeration_truncated,
+                    created_at=excluded.created_at,active=1""", (state_id, parent_id, state.state_smiles, state.state_isomeric_smiles, state.state_inchikey, state.formal_charge, state.tautomer_index, state.protomer_index, state.structure_hash, state_fingerprint, "sdf_ready", None, int(truncated), utc_now()))
             artifact_id = self.repository.add_artifact(sdf_path, "state_sdf", "molscrub")
             with self.repository.connection() as conn:
                 conn.execute("INSERT OR REPLACE INTO conformers VALUES (?, ?, ?, ?, ?, ?)", (f"{state_id}-conf-1", state_id, 1, artifact_id, "ready", utc_now()))
@@ -152,8 +180,17 @@ class PipelineRunner:
             all_states = conn.execute("SELECT COUNT(*) FROM molecular_states WHERE active=1").fetchone()[0]
             rows = conn.execute("""SELECT s.state_id, s.parent_id, c.conformer_id, a.relative_path
                 FROM molecular_states s JOIN conformers c ON c.state_id=s.state_id
-                JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id WHERE s.active=1 AND c.status='ready' AND a.active=1
+                JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id WHERE s.active=1 AND a.active=1
                 ORDER BY s.parent_id, s.state_id""").fetchall()
+            reusable = []
+            for row in rows:
+                pdbqt = self.repository.root / "artifacts" / "pdbqt" / row["parent_id"] / row["state_id"] / "ligand.pdbqt"
+                artifact = conn.execute("SELECT relative_path,sha256 FROM artifacts WHERE relative_path=? AND active=1",
+                    (pdbqt.relative_to(self.repository.root).as_posix(),)).fetchone()
+                conformer = conn.execute("SELECT status FROM conformers WHERE conformer_id=?", (row["conformer_id"],)).fetchone()
+                if conformer["status"] == "pdbqt_ready" and artifact and self._artifact_matches(artifact["relative_path"], artifact["sha256"]):
+                    reusable.append(row["conformer_id"])
+            rows = [row for row in rows if row["conformer_id"] not in reusable]
         self._emit("stage_started", "meeko", total=len(rows))
         skipped = max(0, all_states - len(rows))
         def prepare(row: object) -> tuple[object, Path, Path, str | None]:
@@ -276,12 +313,13 @@ class PipelineRunner:
                 output = run_dir / "vina_output.pdbqt"
                 log = run_dir / "vina.log.txt"
                 with self.repository.connection() as conn:
-                    reusable = conn.execute("""SELECT d.run_id, raw.relative_path AS raw_path, log.relative_path AS log_path
+                    reusable = conn.execute("""SELECT d.run_id, raw.relative_path AS raw_path, log.relative_path AS log_path,
+                        raw.sha256 AS raw_sha256, log.sha256 AS log_sha256
                         FROM docking_runs d LEFT JOIN artifacts raw ON raw.artifact_id=d.raw_output_artifact_id
                         LEFT JOIN artifacts log ON log.artifact_id=d.log_artifact_id
                         WHERE d.state_id=? AND d.receptor_profile_id=? AND d.settings_fingerprint=? AND d.status=? AND d.is_current=1""",
                         (state["state_id"], profile_id, settings_fp, StageStatus.COMPLETED)).fetchone()
-                if reusable and reusable["raw_path"] and reusable["log_path"] and (self.repository.root / reusable["raw_path"]).is_file() and (self.repository.root / reusable["log_path"]).is_file():
+                if reusable and self._artifact_matches(reusable["raw_path"], reusable["raw_sha256"]) and self._artifact_matches(reusable["log_path"], reusable["log_sha256"]):
                     succeeded += 1
                     reused += 1
                     self._emit("item_skipped", "vina", state["state_id"], index, total, skipped=1,

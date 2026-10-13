@@ -304,23 +304,14 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Import failed", str(exc))
             return
-        if preview.changed or preview.archived:
-            answer = QMessageBox.question(
-                self,
-                "Synchronize ligand set?",
-                f"Add {preview.added}, change {preview.changed}, and archive {preview.archived} compounds?\n\nUnchanged compounds and their results will be preserved.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
         try:
             result = self.repo.sync_ligands_csv(csv_path)
         except Exception as exc:
             QMessageBox.critical(self, "Import failed", str(exc))
             return
         self._write_log(
-            f"Synchronized ligands from {path}: added={result.added}, unchanged={result.unchanged}, "
-            f"changed={result.changed}, archived={result.archived}"
+            f"Imported into project library from {path}: added={result.added}, unchanged={result.unchanged}, "
+            f"metadata updated={result.changed}"
         )
         self.refresh_tables()
         self._refresh_checkpoint_state()
@@ -357,14 +348,14 @@ class MainWindow(QMainWindow):
     def _auto_import_input(self) -> None:
         if not self.repo:
             return
-        with self.repo.connection() as conn:
-            has_ligands = conn.execute("SELECT EXISTS(SELECT 1 FROM parent_ligands WHERE active=1)").fetchone()[0]
-        if has_ligands:
-            return
         candidate = self._project_input_csv()
-        if candidate and self._input_csv_has_ligand_rows(candidate):
-            count = self.repo.import_ligands_csv(candidate)
-            self._write_log(f"Auto-loaded {count} ligands from {candidate}")
+        if candidate and MainWindow._input_csv_has_ligand_rows(candidate):
+            try:
+                result = self.repo.import_project_input()
+            except Exception as exc:
+                QMessageBox.critical(self, "Input import failed", str(exc))
+                return
+            self._write_log(f"Imported project input: added={result.added}, unchanged={result.unchanged}")
 
     @staticmethod
     def _input_csv_has_ligand_rows(path: Path) -> bool:
@@ -387,8 +378,8 @@ class MainWindow(QMainWindow):
             parents = conn.execute("""SELECT p.parent_id, p.source_smiles, p.canonical_source_smiles, p.parent_inchikey,
                 p.parse_status, COALESCE(s.decision, 'not screened') AS decision
                 FROM parent_ligands p LEFT JOIN screening_results s ON s.parent_id=p.parent_id AND s.active=1
-                WHERE p.active=1 ORDER BY p.parent_id""").fetchall()
-            states = conn.execute("SELECT state_id, parent_id, state_isomeric_smiles, formal_charge, status, enumeration_truncated FROM molecular_states WHERE active=1 ORDER BY parent_id, state_id").fetchall()
+                ORDER BY p.parent_id""").fetchall()
+            states = conn.execute("SELECT state_id, parent_id, state_isomeric_smiles, formal_charge, status, enumeration_truncated FROM molecular_states ORDER BY parent_id, state_id").fetchall()
             results = conn.execute("""SELECT s.parent_id, MIN(p.affinity) score, s.state_id,
                 SUM(CASE WHEN s.status='prepared' THEN 1 ELSE 0 END) prepared, COUNT(p.pose_id) docked
                 FROM molecular_states s LEFT JOIN docking_runs d ON d.state_id=s.state_id AND d.is_current=1
@@ -404,8 +395,8 @@ class MainWindow(QMainWindow):
         profile_ids = [str(profile["id"]) for profile in profiles]
         placeholders = ",".join("?" for _ in profile_ids)
         with self.repo.connection() as conn:
-            parents = conn.execute("SELECT COUNT(*) FROM parent_ligands WHERE active=1").fetchone()[0]
-            screened = conn.execute("SELECT COUNT(*) FROM screening_results s JOIN parent_ligands p USING(parent_id) WHERE p.active=1 AND s.active=1 AND s.status IN ('completed','failed')").fetchone()[0]
+            parents = conn.execute("SELECT COUNT(*) FROM parent_ligands").fetchone()[0]
+            screened = conn.execute("SELECT COUNT(*) FROM screening_results s JOIN parent_ligands p USING(parent_id) WHERE s.active=1 AND s.status IN ('completed','failed')").fetchone()[0]
             states = conn.execute("SELECT COUNT(*) FROM molecular_states WHERE active=1").fetchone()[0]
             prepared = conn.execute("SELECT COUNT(*) FROM conformers c JOIN molecular_states s USING(state_id) WHERE s.active=1 AND c.status='pdbqt_ready'").fetchone()[0]
             conformers = conn.execute("SELECT COUNT(*) FROM conformers c JOIN molecular_states s USING(state_id) WHERE s.active=1").fetchone()[0]
@@ -443,27 +434,27 @@ class MainWindow(QMainWindow):
         profile_ids = [str(profile["id"]) for profile in profiles]
         placeholders = ",".join("?" for _ in profile_ids)
         with self.repo.connection() as conn:
-            passed = conn.execute("SELECT COUNT(*) FROM screening_results s JOIN parent_ligands p USING(parent_id) WHERE p.active=1 AND s.active=1 AND s.decision != 'fail'").fetchone()[0]
-            failed = conn.execute("SELECT COUNT(*) FROM screening_results s JOIN parent_ligands p USING(parent_id) WHERE p.active=1 AND s.active=1 AND s.decision = 'fail'").fetchone()[0]
-            structure_failed = conn.execute("SELECT COUNT(*) FROM parent_ligands WHERE active=1 AND parse_reason LIKE 'MolScrub failed:%'").fetchone()[0]
+            passed = conn.execute("SELECT COUNT(*) FROM screening_results s JOIN parent_ligands p USING(parent_id) WHERE s.active=1 AND s.decision != 'fail'").fetchone()[0]
+            failed = conn.execute("SELECT COUNT(*) FROM screening_results s JOIN parent_ligands p USING(parent_id) WHERE s.active=1 AND s.decision = 'fail'").fetchone()[0]
+            structure_failed = conn.execute("SELECT COUNT(*) FROM parent_ligands WHERE parse_reason LIKE 'MolScrub failed:%'").fetchone()[0]
             structure_passed = conn.execute("SELECT COUNT(DISTINCT parent_id) FROM molecular_states WHERE active=1").fetchone()[0]
-            pdbqt_failed = conn.execute("SELECT COUNT(DISTINCT s.parent_id) FROM molecular_states s JOIN parent_ligands p USING(parent_id) WHERE p.active=1 AND s.active=1 AND s.status='pdbqt_failed'").fetchone()[0]
-            pdbqt_passed = conn.execute("SELECT COUNT(DISTINCT s.parent_id) FROM molecular_states s JOIN parent_ligands p USING(parent_id) JOIN conformers c USING(state_id) WHERE p.active=1 AND s.active=1 AND c.status='pdbqt_ready'").fetchone()[0]
+            pdbqt_failed = conn.execute("SELECT COUNT(DISTINCT s.parent_id) FROM molecular_states s JOIN parent_ligands p USING(parent_id) WHERE s.active=1 AND s.status='pdbqt_failed'").fetchone()[0]
+            pdbqt_passed = conn.execute("SELECT COUNT(DISTINCT s.parent_id) FROM molecular_states s JOIN parent_ligands p USING(parent_id) JOIN conformers c USING(state_id) WHERE s.active=1 AND c.status='pdbqt_ready'").fetchone()[0]
             if profile_ids:
                 docking_failed = conn.execute(f"""SELECT COUNT(DISTINCT s.parent_id || ':' || d.receptor_profile_id)
                     FROM docking_runs d JOIN molecular_states s USING(state_id) JOIN parent_ligands p USING(parent_id)
-                    WHERE p.active=1 AND s.active=1 AND d.status IN ('failed','interrupted') AND d.is_current=1
+                    WHERE s.active=1 AND d.status IN ('failed','interrupted') AND d.is_current=1
                     AND d.receptor_profile_id IN ({placeholders})""", profile_ids).fetchone()[0]
                 docking_passed = conn.execute(f"""SELECT COUNT(DISTINCT s.parent_id || ':' || d.receptor_profile_id)
                     FROM docking_runs d JOIN molecular_states s USING(state_id) JOIN parent_ligands p USING(parent_id)
-                    WHERE p.active=1 AND s.active=1 AND d.status='completed' AND d.is_current=1
+                    WHERE s.active=1 AND d.status='completed' AND d.is_current=1
                     AND d.receptor_profile_id IN ({placeholders})""", profile_ids).fetchone()[0]
             else:
                 docking_failed = docking_passed = 0
             stage_runs = conn.execute("SELECT COUNT(*) FROM stage_runs").fetchone()[0]
             screening_failures = conn.execute("""SELECT p.parent_id, COALESCE(s.reason, 'Screening rule failure')
                 FROM screening_results s JOIN parent_ligands p USING(parent_id)
-                WHERE p.active=1 AND s.active=1 AND s.decision='fail' ORDER BY p.parent_id LIMIT 6""").fetchall()
+                WHERE s.active=1 AND s.decision='fail' ORDER BY p.parent_id LIMIT 6""").fetchall()
             pdbqt_failures = conn.execute("""SELECT state_id, COALESCE(reason, 'PDBQT generation failed')
                 FROM molecular_states WHERE active=1 AND status='pdbqt_failed' ORDER BY state_id LIMIT 6""").fetchall()
             docking_failures = conn.execute("""SELECT s.state_id, CASE
@@ -474,7 +465,7 @@ class MainWindow(QMainWindow):
                 WHERE s.active=1 AND d.status IN ('failed','interrupted') GROUP BY d.run_id, s.state_id ORDER BY s.state_id LIMIT 6""").fetchall()
             docked_exports = [tuple(row) for row in conn.execute(f"""SELECT DISTINCT d.receptor_profile_id, s.parent_id, s.state_id, d.run_id
                 FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id JOIN parent_ligands p USING(parent_id)
-                WHERE p.active=1 AND s.active=1 AND d.status='completed' AND d.is_current=1
+                WHERE s.active=1 AND d.status='completed' AND d.is_current=1
                 AND d.receptor_profile_id IN ({placeholders})""", profile_ids).fetchall()] if profile_ids else []
             validated_profiles = {str(row[0]) for row in conn.execute(
                 "SELECT DISTINCT receptor_profile_id FROM redocking_runs WHERE status='ARTIFACTS_READY'"
@@ -550,8 +541,8 @@ class MainWindow(QMainWindow):
         with self.repo.connection() as conn:
             docked = conn.execute(f"SELECT COUNT(*) FROM docking_runs d JOIN molecular_states s USING(state_id) WHERE s.active=1 AND d.status='completed' AND d.is_current=1 AND d.receptor_profile_id IN ({placeholders})", profile_ids).fetchone()[0] if profile_ids else 0
             values = (
-                conn.execute("SELECT COUNT(*) FROM parent_ligands WHERE active=1").fetchone()[0],
-                conn.execute("SELECT COUNT(*) FROM screening_results s JOIN parent_ligands p USING(parent_id) WHERE p.active=1 AND s.active=1 AND s.status IN ('completed','failed')").fetchone()[0],
+                conn.execute("SELECT COUNT(*) FROM parent_ligands").fetchone()[0],
+                conn.execute("SELECT COUNT(*) FROM screening_results s JOIN parent_ligands p USING(parent_id) WHERE s.active=1 AND s.status IN ('completed','failed')").fetchone()[0],
                 conn.execute("SELECT COUNT(*) FROM molecular_states WHERE active=1").fetchone()[0],
                 conn.execute("SELECT COUNT(*) FROM conformers c JOIN molecular_states s USING(state_id) WHERE s.active=1 AND c.status='pdbqt_ready'").fetchone()[0],
                 docked,
@@ -652,7 +643,7 @@ class MainWindow(QMainWindow):
                 FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id
                 JOIN parent_ligands l ON l.parent_id=s.parent_id
                 JOIN docking_poses p ON p.run_id=d.run_id
-                WHERE l.active=1 AND s.active=1 AND d.status='completed' AND d.is_current=1
+                WHERE s.active=1 AND d.status='completed' AND d.is_current=1
                 AND d.receptor_profile_id IN ({placeholders})
                 GROUP BY s.parent_id ORDER BY best_affinity ASC, s.parent_id""", profile_ids).fetchall() if profile_ids else []
         current = self.repo.get_settings().get("postdock", {}).get("selected_parents", [])
@@ -773,7 +764,7 @@ class MainWindow(QMainWindow):
                 return
             self._write_log(
                 f"Reloaded ligands from {candidate}: added={result.added}, unchanged={result.unchanged}, "
-                f"changed={result.changed}, archived={result.archived}"
+                f"metadata updated={result.changed}"
             )
         self.refresh_tables()
         self._refresh_checkpoint_state()

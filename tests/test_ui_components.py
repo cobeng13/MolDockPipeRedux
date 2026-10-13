@@ -68,11 +68,11 @@ def test_pipeline_worker_routes_requested_stage(monkeypatch) -> None:
 
     monkeypatch.setattr(workers, "PipelineRunner", FakeRunner)
     summaries = []
-    worker = PipelineWorker(object(), ["meeko"])
+    worker = PipelineWorker(SimpleNamespace(import_project_input=lambda: calls.append("import")), ["meeko"])
     worker.finished.connect(summaries.append)
     worker.run()
 
-    assert calls == ["meeko"]
+    assert calls == ["import", "meeko"]
     assert summaries == [{"meeko": (1, 0)}]
 
 

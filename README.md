@@ -56,11 +56,15 @@ The CSV columns are:
 id,smiles,notes,params_json
 ```
 
-`id` must be a stable, unique identifier. Re-importing the CSV synchronizes the
-project incrementally: unchanged compounds retain their results, new compounds
-are added as pending, changed compounds are reprocessed from screening, and
-compounds removed from the CSV are archived rather than deleted. CSV rows with
-missing or duplicate IDs are rejected without changing the project.
+`id` must be a stable, unique identifier. Imports are cumulative per project:
+new compounds are added as pending and previously imported compounds and their
+results remain in the library even when absent from the next CSV. A header-only
+CSV is a no-op. Reimporting the same ID and SMILES preserves completed work;
+notes and metadata updates do not reset processing. An existing ID with a
+different SMILES is rejected: use a new ID for a different compound. CSV rows
+with missing or duplicate IDs are rejected without changing the project.
+Identity is based on ID and the submitted SMILES string; different IDs are
+separate compounds, even if their SMILES match.
 
 Use the ribbon **Receptors** manager to import one or more prepared receptor
 PDBQT files. Imported files are copied into the portable project:
@@ -69,9 +73,10 @@ PDBQT files. Imported files are copied into the portable project:
 project/inputs/receptors/profile_id/receptor.pdbqt
 ```
 
-Opening a project automatically loads `inputs/input.csv` when no active ligand
-set is already present. Importing another CSV synchronizes it with the current
-ligand set after confirmation when changes or archived compounds are detected.
+Opening a project, refreshing, and starting pipeline stages load the latest
+`inputs/input.csv` into the cumulative library. The command-line run also imports
+it before processing. Emptying the file never empties the library. Existing
+projects upgrade archived compounds back into the library on opening.
 
 ## Workflow
 
@@ -91,8 +96,13 @@ Run All and individual stages execute in the background. The interface shows:
 - Current-stage item progress.
 - Current ligand/state and explicit succeeded/skipped/failed summaries.
 
-Completed work is reused when fingerprints and artifacts match. Failed or missing
-artifacts are retried. Closing during work marks unfinished runs as interrupted when
+The project database is the processing ledger; exported CSVs are snapshots,
+not required for resuming work. Screening checks its settings/input fingerprint
+before calculating descriptors. MolScrub reuses matching generated states and
+verified SDFs, Meeko skips verified prepared PDBQTs, and Vina reuses completed
+runs per state and receptor when receptor/settings/tool fingerprints and output
+checksums match. Changed scientific settings can require fresh work. Failed
+preparation/docking or missing/damaged artifacts are retried. Closing during work marks unfinished runs as interrupted when
 the project is reopened.
 
 ## Settings
@@ -152,5 +162,6 @@ project/exports/profile_id/leaderboard.csv
 
 Each manifest includes receptor identity and its reproducibility hashes. Each
 leaderboard contains the top three poses per parent compound for that receptor,
-sorted by most-negative affinity. Workflow Maintenance can clear generated data
+sorted by most-negative affinity, across the cumulative project library.
+Regenerating exports includes all imported batches. Workflow Maintenance can clear generated data
 while preserving inputs and `project.yml`.

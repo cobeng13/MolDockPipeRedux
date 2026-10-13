@@ -129,14 +129,42 @@ def test_ligand_sync_is_idempotent_and_incremental(tmp_path: Path) -> None:
             (parent_id, fingerprint, status, descriptors_json, rules_json, decision, reason, created_at, active)
             VALUES ('a', 'old', 'completed', '{}', '{}', 'warning', NULL, 'now', 1)""")
 
-    source.write_text("id,smiles,notes,params_json\na,CCC,changed,{}\nc,COC,new,{}\n", encoding="utf-8")
+    source.write_text("id,smiles,notes,params_json\na,CCO,changed,{}\nc,COC,new,{}\n", encoding="utf-8")
     result = repo.sync_ligands_csv(source)
-    assert (result.added, result.unchanged, result.changed, result.archived) == (1, 0, 1, 1)
+    assert (result.added, result.unchanged, result.changed, result.archived) == (1, 0, 1, 0)
     with repo.connection() as conn:
         rows = conn.execute("SELECT parent_id, active, source_smiles FROM parent_ligands ORDER BY parent_id").fetchall()
         screening = conn.execute("SELECT active FROM screening_results WHERE parent_id='a'").fetchone()[0]
-    assert [tuple(row) for row in rows] == [("a", 1, "CCC"), ("b", 0, "CCN"), ("c", 1, "COC")]
-    assert screening == 0
+    assert [tuple(row) for row in rows] == [("a", 1, "CCO"), ("b", 1, "CCN"), ("c", 1, "COC")]
+    assert screening == 1
+
+
+def test_conflicting_id_rejects_the_entire_import(tmp_path: Path) -> None:
+    repo = ProjectRepository.create(tmp_path / "example")
+    source = tmp_path / "input.csv"
+    source.write_text("id,smiles\na,CCO\n", encoding="utf-8")
+    repo.sync_ligands_csv(source)
+    source.write_text("id,smiles\nb,CCN\na,CCC\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="different SMILES"):
+        repo.preview_ligand_sync(source)
+    with pytest.raises(ValueError, match="different SMILES"):
+        repo.sync_ligands_csv(source)
+    with repo.connection() as conn:
+        assert [tuple(row) for row in conn.execute("SELECT parent_id,source_smiles FROM parent_ligands")] == [("a", "CCO")]
+
+
+def test_empty_project_input_preserves_cumulative_library(tmp_path: Path) -> None:
+    repo = ProjectRepository.create(tmp_path / "example")
+    source = repo.root / "inputs" / "input.csv"
+    source.write_text("id,smiles\na,CCO\n", encoding="utf-8")
+    assert repo.import_project_input().added == 1
+    for text in ("id,smiles\n", ""):
+        source.write_text(text, encoding="utf-8")
+        assert repo.import_project_input().added == 0
+    source.write_text("id,smiles\nb,CCN\n", encoding="utf-8")
+    assert repo.import_project_input().added == 1
+    with repo.connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM parent_ligands").fetchone()[0] == 2
 
 
 def test_ligand_sync_rejects_missing_or_duplicate_ids_atomically(tmp_path: Path) -> None:

@@ -77,7 +77,7 @@ class ReportDataBuilder:
             tools = [dict(row) for row in conn.execute("SELECT * FROM tool_installations ORDER BY tool_name").fetchall()]
             environment_row = conn.execute("SELECT value_json FROM project_settings WHERE key='environment'").fetchone()
             flow = {
-                "active_parent_compounds": conn.execute("SELECT COUNT(*) FROM parent_ligands WHERE active=1").fetchone()[0],
+                "active_parent_compounds": conn.execute("SELECT COUNT(*) FROM parent_ligands").fetchone()[0],
                 "screening_completed": conn.execute("SELECT COUNT(*) FROM screening_results WHERE active=1 AND status='completed'").fetchone()[0],
                 "screening_failed": conn.execute("SELECT COUNT(*) FROM screening_results WHERE active=1 AND status='failed'").fetchone()[0],
                 "active_molecular_states": conn.execute("SELECT COUNT(*) FROM molecular_states WHERE active=1").fetchone()[0],
@@ -156,7 +156,7 @@ class ReportDataBuilder:
                 FROM docking_poses p JOIN docking_runs d ON d.run_id=p.run_id
                 JOIN molecular_states s ON s.state_id=d.state_id JOIN parent_ligands l ON l.parent_id=s.parent_id
                 WHERE d.receptor_profile_id=? AND d.is_current=1 AND d.status='completed'
-                    AND s.active=1 AND l.active=1)
+                    AND s.active=1)
                 SELECT parent_id,state_id,run_id,mode_index,affinity FROM ranked WHERE rank=1
                 ORDER BY affinity ASC,parent_id""", (profile_id,)).fetchall()
             failure_rows = conn.execute("""SELECT COALESCE(d.reason,'Unspecified failure') reason,COUNT(*) count

@@ -25,7 +25,7 @@ class DockingResultsDialog(QDialog):
         table = QTableWidget(0, len(headers)); table.setHorizontalHeaderLabels(headers)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         with self.repository.connection() as conn:
-            parents = conn.execute("SELECT parent_id FROM parent_ligands WHERE active=1 ORDER BY parent_id").fetchall()
+            parents = conn.execute("SELECT parent_id FROM parent_ligands ORDER BY parent_id").fetchall()
             best = {row["parent_id"]: row for row in conn.execute("""WITH ranked AS (
                     SELECT s.parent_id, s.state_id, p.affinity, p.mode_index,
                            ROW_NUMBER() OVER (PARTITION BY s.parent_id ORDER BY p.affinity, s.state_id, p.mode_index) rank

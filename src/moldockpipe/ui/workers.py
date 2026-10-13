@@ -42,6 +42,7 @@ class PipelineWorker(QObject):
     def run(self) -> None:
         try:
             runner = PipelineRunner(self.repository, progress=self.progress.emit)
+            self.repository.import_project_input()
             runner.cancelled = self.cancel_event.is_set
             summary = {}
             if self.stages is None or not self.stages or "screening" in self.stages:
