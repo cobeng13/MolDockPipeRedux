@@ -9,6 +9,8 @@ from PyQt6.QtWidgets import (
 )
 
 from ..project import ProjectRepository
+from ..parallel import logical_cpu_count
+from ..execution_lock import exclusive_project
 from ..csv_exports import export_leaderboard_csv, export_manifest_csv
 from .compound_selector import CompoundSelectorDialog
 
@@ -55,14 +57,22 @@ class SettingsDialog(QDialog):
         answer = QMessageBox.warning(self, "Purge workflow data", "This removes generated states, PDBQT files, docking outputs, logs, reports, and database workflow rows. Inputs and project settings are preserved. Continue?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
         if answer != QMessageBox.StandardButton.Yes:
             return
+        try:
+            self._clear_workflow_files()
+        except RuntimeError as exc:
+            QMessageBox.warning(self, "Project is busy", str(exc))
+            return
+        QMessageBox.information(self, "Purge complete", "Generated workflow data was removed. The input files and project.yml were preserved.")
+        self.workflow_reset.emit()
+
+    @exclusive_project
+    def _clear_workflow_files(self) -> None:
         self.repository.clear_workflow_data()
         for name in ("artifacts", "logs", "exports", "For_PostDocking"):
             target = self.repository.root / name
             if target.exists():
                 shutil.rmtree(target)
             target.mkdir(parents=True, exist_ok=True)
-        QMessageBox.information(self, "Purge complete", "Generated workflow data was removed. The input files and project.yml were preserved.")
-        self.workflow_reset.emit()
 
     def _export_manifest(self) -> None:
         if not self.repository:
@@ -100,12 +110,18 @@ class SettingsDialog(QDialog):
         form.addRow("", enumerate_box)
         self._integer(form, "Maximum states", "molscrub.max_states", values.get("max_states", 32), 1, 10000)
         self._integer(form, "Time limit per molecule (seconds)", "molscrub.timeout_seconds", values.get("timeout_seconds", 15), 1, 3600)
+        self._workers(form, "molscrub.workers", values)
         widget = QWidget(); widget.setLayout(form); return widget
 
     def _meeko_tab(self, values: dict[str, object]) -> QWidget:
         form = QFormLayout()
-        self._integer(form, "Parallel workers", "meeko.workers", values.get("workers", 4), 1, 32)
+        self._workers(form, "meeko.workers", values)
         widget = QWidget(); widget.setLayout(form); return widget
+
+    def _workers(self, form: QFormLayout, key: str, values: dict[str, object]) -> None:
+        cpus = logical_cpu_count()
+        self._integer(form, "Parallel workers", key, values.get("workers", 0), 0, max(256, cpus))
+        self.fields[key].setSpecialValueText(f"Automatic ({cpus} logical CPUs)")
 
     def _docking_tab(self, values: dict[str, object]) -> QWidget:
         form = QFormLayout()

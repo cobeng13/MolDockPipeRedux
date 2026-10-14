@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Collection, Callable
 
 from .fingerprints import file_sha256, fingerprint
 from .models import ProgressCallback, ProgressEvent, ScreeningPolicy, StageStatus
 from .project import ProjectRepository, utc_now
+from .parallel import bounded_futures, worker_count
+from .execution_lock import exclusive_project
 from .services.molscrub import MolScrubService
 from .services.meeko import MeekoService
 from .services.screening import screen_smiles
@@ -83,6 +84,7 @@ class PipelineRunner:
                 return run
         return None
 
+    @exclusive_project
     def run_screening(self) -> tuple[int, int]:
         self._check_cancelled()
         settings = self.repository.get_settings().get("screening", {})
@@ -132,6 +134,7 @@ class PipelineRunner:
         self._emit("stage_completed", "screening", total=len(parents), succeeded=completed, skipped=skipped, failed=failed)
         return completed, failed
 
+    @exclusive_project
     def run_molscrub(self, *, retry_failed: bool = False) -> tuple[int, int]:
         self._check_cancelled()
         project = self.repository.get_settings()
@@ -150,43 +153,74 @@ class PipelineRunner:
         except ImportError:
             version = "unknown"
         created = failed = skipped = 0
-        self._emit("stage_started", "molscrub", total=len(allowed))
-        for index, row in enumerate(allowed, 1):
-            self._check_cancelled()
-            self._emit("item_started", "molscrub", row["parent_id"], index, len(allowed))
-            run_fingerprint = fingerprint(settings=settings, inputs={"smiles": row["source_smiles"]}, tool_version=version)
+        completed = 0
+        workers = worker_count(settings, len(allowed))
+        # Worker count affects scheduling, not chemical identity or failure
+        # eligibility. Retain compatibility with fingerprints from serial runs.
+        cache_settings = {key: value for key, value in settings.items() if key != "workers"}
+        generation_settings = {key: value for key, value in cache_settings.items() if key != "timeout_seconds"}
+        self._emit("stage_started", "molscrub", total=len(allowed), message=f"Using {workers} parallel workers")
+
+        def jobs():
+            nonlocal created, failed, skipped, completed
+            for row in allowed:
+                if self.cancelled and self.cancelled():
+                    return
+                run_fingerprint = fingerprint(settings=cache_settings,
+                    inputs={"smiles": row["source_smiles"]}, tool_version=version)
+                with self.repository.connection() as conn:
+                    previous = conn.execute("""SELECT fingerprint,status,reason FROM stage_runs
+                        WHERE stage_name='molscrub' AND entity_type='parent' AND entity_id=?
+                        ORDER BY rowid DESC LIMIT 1""", (row["parent_id"],)).fetchone()
+                    existing = conn.execute("""SELECT s.state_structure_hash,s.generation_fingerprint,
+                        a.relative_path,a.sha256 FROM molecular_states s LEFT JOIN conformers c ON c.state_id=s.state_id
+                        LEFT JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id
+                        WHERE s.parent_id=? AND s.active=1""", (row["parent_id"],)).fetchall()
+                if not retry_failed and previous and previous["status"] == StageStatus.FAILED and previous["fingerprint"] == run_fingerprint:
+                    failed += 1
+                    skipped += 1
+                    completed += 1
+                    self._emit("item_skipped", "molscrub", row["parent_id"], completed, len(allowed),
+                               failed=failed, skipped=skipped, message=f"Known failure skipped: {previous['reason']}")
+                    continue
+                if (previous and previous["status"] == StageStatus.COMPLETED and existing and all(
+                    state["generation_fingerprint"] in {
+                        fingerprint(settings=candidate, inputs={"state": state["state_structure_hash"]}, tool_version=version)
+                        for candidate in (generation_settings, cache_settings)}
+                    and self._artifact_matches(state["relative_path"], state["sha256"])
+                    for state in existing
+                )):
+                    created += len(existing)
+                    skipped += 1
+                    completed += 1
+                    self._emit("item_skipped", "molscrub", row["parent_id"], completed, len(allowed),
+                               skipped=skipped, message=f"{len(existing)} existing states reused")
+                    continue
+                run_id = str(uuid.uuid4())
+                with self.repository.connection() as conn:
+                    conn.execute("INSERT INTO stage_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                 (run_id, "molscrub", "parent", row["parent_id"], run_fingerprint, StageStatus.RUNNING, utc_now(), None, None))
+                self._emit("item_started", "molscrub", row["parent_id"], completed, len(allowed))
+                yield row, run_id
+
+        def generate(job):
+            row, _ = job
+            return service.generate(row["source_smiles"], ph=float(settings.get("ph", 7.4)),
+                enumerate_states=bool(settings.get("enumerate_states", True)),
+                max_states=int(settings.get("max_states", 32)),
+                timeout_seconds=float(settings.get("timeout_seconds", 15)))
+
+        def discard(job):
+            _, run_id = job
             with self.repository.connection() as conn:
-                previous = conn.execute("""SELECT fingerprint,status,reason FROM stage_runs
-                    WHERE stage_name='molscrub' AND entity_type='parent' AND entity_id=?
-                    ORDER BY rowid DESC LIMIT 1""", (row["parent_id"],)).fetchone()
-                existing = conn.execute("""SELECT s.state_structure_hash,s.generation_fingerprint,
-                    a.relative_path,a.sha256 FROM molecular_states s LEFT JOIN conformers c ON c.state_id=s.state_id
-                    LEFT JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id
-                    WHERE s.parent_id=? AND s.active=1""", (row["parent_id"],)).fetchall()
-            if not retry_failed and previous and previous["status"] == StageStatus.FAILED and previous["fingerprint"] == run_fingerprint:
-                failed += 1
-                skipped += 1
-                self._emit("item_skipped", "molscrub", row["parent_id"], index, len(allowed),
-                           failed=failed, skipped=skipped, message=f"Known failure skipped: {previous['reason']}")
-                continue
-            generation_settings = {key: value for key, value in settings.items() if key != "timeout_seconds"}
-            if (previous and previous["status"] == StageStatus.COMPLETED and existing and all(
-                state["generation_fingerprint"] in {
-                    fingerprint(settings=candidate, inputs={"state": state["state_structure_hash"]}, tool_version=version)
-                    for candidate in (generation_settings, settings)}
-                and self._artifact_matches(state["relative_path"], state["sha256"])
-                for state in existing
-            )):
-                created += len(existing)
-                skipped += 1
-                self._emit("item_skipped", "molscrub", row["parent_id"], index, len(allowed), skipped=skipped, message=f"{len(existing)} existing states reused")
-                continue
-            run_id = str(uuid.uuid4())
-            with self.repository.connection() as conn:
-                conn.execute("INSERT INTO stage_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                             (run_id, "molscrub", "parent", row["parent_id"], run_fingerprint, StageStatus.RUNNING, utc_now(), None, None))
+                conn.execute("UPDATE stage_runs SET status=?, ended_at=?, reason=? WHERE stage_run_id=?",
+                             (StageStatus.CANCELLED, utc_now(), "Stopped before generation started", run_id))
+
+        for (row, run_id), future in bounded_futures(generate, jobs(), workers,
+                cancelled=self.cancelled, name="molscrub", on_discard=discard):
+            completed += 1
             try:
-                states, truncated = service.generate(row["source_smiles"], ph=float(settings.get("ph", 7.4)), enumerate_states=bool(settings.get("enumerate_states", True)), max_states=int(settings.get("max_states", 32)), timeout_seconds=float(settings.get("timeout_seconds", 15)))
+                states, truncated = future.result()
                 if not states:
                     raise ValueError("MolScrub returned no molecular states")
                 self._persist_states(row["parent_id"], states, truncated, settings)
@@ -194,7 +228,7 @@ class PipelineRunner:
                     conn.execute("UPDATE stage_runs SET status=?, ended_at=? WHERE stage_run_id=?", (StageStatus.COMPLETED, utc_now(), run_id))
                     conn.execute("UPDATE parent_ligands SET parse_reason=NULL WHERE parent_id=? AND parse_reason LIKE 'MolScrub failed:%'", (row["parent_id"],))
                 created += len(states)
-                self._emit("item_succeeded", "molscrub", row["parent_id"], index, len(allowed), succeeded=1)
+                self._emit("item_succeeded", "molscrub", row["parent_id"], completed, len(allowed), succeeded=created)
             except Exception as exc:
                 failed += 1
                 with self.repository.connection() as conn:
@@ -203,7 +237,7 @@ class PipelineRunner:
                     # Partial or stale states from a failed parent must not enter downstream stages.
                     conn.execute("UPDATE molecular_states SET active=0 WHERE parent_id=?", (row["parent_id"],))
                     conn.execute("UPDATE docking_runs SET is_current=0 WHERE state_id IN (SELECT state_id FROM molecular_states WHERE parent_id=?)", (row["parent_id"],))
-                self._emit("item_failed", "molscrub", row["parent_id"], index, len(allowed), failed=failed, message=str(exc))
+                self._emit("item_failed", "molscrub", row["parent_id"], completed, len(allowed), failed=failed, message=str(exc))
         self._emit("stage_completed", "molscrub", total=len(allowed), succeeded=created, skipped=skipped, failed=failed)
         return created, failed
 
@@ -220,7 +254,7 @@ class PipelineRunner:
                 (SELECT state_id FROM molecular_states WHERE parent_id=?)""", (parent_id,))
         for state in states:
             state_id = f"{parent_id}-{state.structure_hash[:16]}"
-            generation_settings = {key: value for key, value in settings.items() if key != "timeout_seconds"}
+            generation_settings = {key: value for key, value in settings.items() if key not in {"timeout_seconds", "workers"}}
             state_fingerprint = fingerprint(settings=generation_settings, inputs={"state": state.structure_hash}, tool_version=version)
             state_dir = self.repository.root / "artifacts" / "sdf" / parent_id / state_id
             state_dir.mkdir(parents=True, exist_ok=True)
@@ -239,12 +273,12 @@ class PipelineRunner:
             with self.repository.connection() as conn:
                 conn.execute("INSERT OR REPLACE INTO conformers VALUES (?, ?, ?, ?, ?, ?)", (f"{state_id}-conf-1", state_id, 1, artifact_id, "ready", utc_now()))
 
+    @exclusive_project
     def run_meeko(self) -> tuple[int, int]:
         """Prepare every retained SDF state into a state-specific ligand PDBQT."""
         self._check_cancelled()
         prepared = failed = 0
         settings = self.repository.get_settings().get("meeko", {})
-        workers = max(1, min(32, int(settings.get("workers", 4))))
         with self.repository.connection() as conn:
             all_states = conn.execute("SELECT COUNT(*) FROM molecular_states WHERE active=1").fetchone()[0]
             rows = conn.execute("""SELECT s.state_id, s.parent_id, c.conformer_id, a.relative_path
@@ -252,15 +286,24 @@ class PipelineRunner:
                 JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id WHERE s.active=1 AND a.active=1
                 ORDER BY s.parent_id, s.state_id""").fetchall()
             reusable = set()
+            destinations: dict[Path, str] = {}
             for row in rows:
                 pdbqt = self.repository.root / "artifacts" / "pdbqt" / row["parent_id"] / row["state_id"] / "ligand.pdbqt"
+                log = self.repository.root / "logs" / "meeko" / f"{row['state_id']}.log"
+                for destination in (pdbqt.resolve(), log.resolve()):
+                    if destination in destinations:
+                        raise ValueError("Multiple Meeko preparation jobs target the same output file: "
+                                         f"{destinations[destination]} and {row['conformer_id']}. "
+                                         "Each state must have one active conformer.")
+                    destinations[destination] = row["conformer_id"]
                 artifact = conn.execute("SELECT relative_path,sha256 FROM artifacts WHERE relative_path=? AND active=1",
                     (pdbqt.relative_to(self.repository.root).as_posix(),)).fetchone()
                 conformer = conn.execute("SELECT status FROM conformers WHERE conformer_id=?", (row["conformer_id"],)).fetchone()
                 if conformer["status"] == "pdbqt_ready" and artifact and self._artifact_matches(artifact["relative_path"], artifact["sha256"]):
                     reusable.add(row["conformer_id"])
             rows = [row for row in rows if row["conformer_id"] not in reusable]
-        self._emit("stage_started", "meeko", total=len(rows))
+        workers = worker_count(settings, len(rows))
+        self._emit("stage_started", "meeko", total=len(rows), message=f"Using {workers} parallel workers")
         skipped = max(0, all_states - len(rows))
         def prepare(row: object) -> tuple[object, Path, Path, str | None]:
             sdf = self.repository.root / row["relative_path"]
@@ -276,10 +319,9 @@ class PipelineRunner:
             except Exception as exc:
                 return row, pdbqt, log, str(exc)
 
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="meeko") as pool:
-            futures = [pool.submit(prepare, row) for row in rows]
-            for index, future in enumerate(as_completed(futures), 1):
-                self._check_cancelled()
+        if rows:
+            for index, (_, future) in enumerate(bounded_futures(prepare, rows, workers,
+                    cancelled=self.cancelled, name="meeko"), 1):
                 row, pdbqt, log, error = future.result()
                 self._emit("item_started", "meeko", row["state_id"], index, len(rows))
                 try:
@@ -303,6 +345,7 @@ class PipelineRunner:
         self._emit("stage_completed", "meeko", total=len(rows), succeeded=prepared, skipped=skipped, failed=failed)
         return prepared, failed
 
+    @exclusive_project
     def run_vina(self, profile_ids: Collection[str] | None = None) -> tuple[int, int]:
         """Dock every Meeko-prepared state against each selected receptor profile."""
         self._check_cancelled()
@@ -479,6 +522,7 @@ class PipelineRunner:
         self.repository.record_tool(backend_name, executable.name, executable)
         return succeeded, failed
 
+    @exclusive_project
     def run_postdock(self) -> tuple[int, int]:
         self._check_cancelled()
         settings = self.repository.get_settings().get("postdock", {})

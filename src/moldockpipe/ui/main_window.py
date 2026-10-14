@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
 import yaml
 
 from ..project import ProjectRepository
+from ..execution_lock import project_execution_lock
 from ..csv_exports import export_leaderboard_csv as write_leaderboards, export_manifest_csv as write_manifests
 from ..reporting import generate_project_report
 from ..services.postdock import receptor_export_filename
@@ -32,6 +33,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.repo: ProjectRepository | None = None
         self.stage_running = False
+        self.pipeline_thread = None
+        self.pipeline_worker = None
+        self._close_after_pipeline = False
         self.stage_started_at = 0.0
         self.redocking_queue: RedockingQueueController | None = None
         self.setWindowTitle("MolDockPipe Redux")
@@ -252,6 +256,11 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._pipeline_active():
+            event.ignore()
+            self._close_after_pipeline = True
+            self.stop_pipeline()
+            return
         if self.redocking_queue and self.redocking_queue.is_running and not self.redocking_queue.shutdown():
             event.ignore()
             QMessageBox.warning(self, "Validation is stopping",
@@ -259,7 +268,26 @@ class MainWindow(QMainWindow):
             return
         super().closeEvent(event)
 
+    def _pipeline_active(self) -> bool:
+        thread = getattr(self, "pipeline_thread", None)
+        return self.stage_running or (thread is not None and thread.isRunning())
+
+    def _pipeline_thread_finished(self) -> None:
+        self.pipeline_thread = None
+        self.pipeline_worker = None
+        if self._close_after_pipeline:
+            self._close_after_pipeline = False
+            self.close()
+
+    def _block_project_change(self) -> bool:
+        if self._pipeline_active():
+            QMessageBox.warning(self, "Pipeline running", "Finish or stop the pipeline before changing projects or importing ligands.")
+            return True
+        return False
+
     def create_project(self) -> None:
+        if self._block_project_change():
+            return
         if self.redocking_queue and self.redocking_queue.is_running:
             QMessageBox.warning(self, "Validation running", "Wait for or cancel the active redocking validation before switching projects.")
             return
@@ -278,6 +306,8 @@ class MainWindow(QMainWindow):
         self._activate_project("Created")
 
     def open_project(self) -> None:
+        if self._block_project_change():
+            return
         if self.redocking_queue and self.redocking_queue.is_running:
             QMessageBox.warning(self, "Validation running", "Wait for or cancel the active redocking validation before switching projects.")
             return
@@ -288,12 +318,19 @@ class MainWindow(QMainWindow):
         if not repo.database_path.exists():
             QMessageBox.warning(self, "Not a project", "This folder does not contain project.sqlite.")
             return
-        repo.migrate()
-        interrupted = repo.recover_interrupted_runs()
+        try:
+            with project_execution_lock(repo.root):
+                repo.migrate()
+                interrupted = repo.recover_interrupted_runs()
+        except RuntimeError as exc:
+            QMessageBox.warning(self, "Project is busy", str(exc))
+            return
         self.repo = repo
         self._activate_project("Opened" + (f"; recovered {interrupted} interrupted stage runs" if interrupted else ""))
 
     def import_csv(self) -> None:
+        if self._block_project_change():
+            return
         if not self.repo:
             return
         path, _ = QFileDialog.getOpenFileName(self, "Import ligand CSV", filter="CSV files (*.csv)")
@@ -594,7 +631,7 @@ class MainWindow(QMainWindow):
         self._start_pipeline(["meeko"], "Meeko")
 
     def _start_pipeline(self, stages: list[str], label: str) -> None:
-        if not self.repo or self.stage_running:
+        if not self.repo or self._pipeline_active():
             return
         self.stage_running = True
         self.stage_started_at = time.monotonic()
@@ -621,11 +658,12 @@ class MainWindow(QMainWindow):
         self.pipeline_worker.failed.connect(self.pipeline_thread.quit)
         self.pipeline_worker.stopped.connect(self.pipeline_thread.quit)
         self.pipeline_thread.finished.connect(self.pipeline_worker.deleteLater)
+        self.pipeline_thread.finished.connect(self._pipeline_thread_finished)
         self.pipeline_thread.finished.connect(self.pipeline_thread.deleteLater)
         self.pipeline_thread.start()
 
     def stop_pipeline(self) -> None:
-        if not self.stage_running or not hasattr(self, "pipeline_worker"):
+        if not self.stage_running or self.pipeline_worker is None:
             return
         self.stop_action.setEnabled(False)
         self.dashboard_status.setText("Stopping safely…")
@@ -836,9 +874,10 @@ class MainWindow(QMainWindow):
             return
         config_path = self.repo.root / "project.yml"
         try:
-            config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-            config.update(dialog.values())
-            config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+            with project_execution_lock(self.repo.root):
+                config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+                config.update(dialog.values())
+                config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
             self._write_log(f"Updated docking settings in {config_path}")
         except Exception as exc:
             QMessageBox.critical(self, "Settings update failed", str(exc))

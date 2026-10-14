@@ -17,6 +17,7 @@ import yaml
 
 from .fingerprints import file_sha256, fingerprint
 from .models import ScreeningPolicy, StageStatus
+from .execution_lock import exclusive_project
 
 
 SCHEMA_VERSION = 7
@@ -78,9 +79,10 @@ class ProjectRepository:
         config = {
             "name": name or root.name,
             "schema_version": SCHEMA_VERSION,
+            "preparation_defaults_version": 1,
             "screening": {"policy": ScreeningPolicy.ANNOTATE_ONLY.value, "lipinski": True, "veber": True, "egan": False, "ghose": False, "boiled_egg": False},
-            "molscrub": {"ph": 7.4, "enumerate_states": True, "max_states": 32, "stereochemistry_policy": "warn_and_continue", "fragment_policy": "manual_review"},
-            "meeko": {"workers": 4},
+            "molscrub": {"ph": 7.4, "enumerate_states": True, "max_states": 32, "workers": 0, "stereochemistry_policy": "warn_and_continue", "fragment_policy": "manual_review"},
+            "meeko": {"workers": 0},
             "postdock": {"mode": "split_and_sdf", "poses_per_compound": 3, "selected_parents": []},
             # A receptor is project-specific. New projects deliberately start
             # empty so a placeholder cannot accidentally participate in runs.
@@ -119,6 +121,7 @@ class ProjectRepository:
                     (r.stage_run_id IS NULL AND p.parse_reason LIKE 'MolScrub failed:%'))
                 ORDER BY p.parent_id""").fetchall()
 
+    @exclusive_project
     def migrate(self) -> None:
         with self.connection() as conn:
             conn.executescript("""
@@ -263,6 +266,22 @@ class ProjectRepository:
             conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)", (SCHEMA_VERSION, utc_now()))
             conn.execute("INSERT OR IGNORE INTO projects(project_id, name, root_path, created_at) VALUES (?, ?, ?, ?)", (str(uuid.uuid4()), self.root.name, str(self.root), utc_now()))
         self._migrate_vina_profiles()
+        self._migrate_preparation_defaults()
+
+    def _migrate_preparation_defaults(self) -> None:
+        """Replace the old fixed-four default once; retain later manual choices."""
+        path = self.root / "project.yml"
+        if not path.is_file():
+            return
+        config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if config.get("preparation_defaults_version", 0) >= 1:
+            return
+        meeko = dict(config.get("meeko", {}) or {})
+        if meeko.get("workers") in (None, 4):
+            meeko["workers"] = 0
+        config["meeko"] = meeko
+        config["preparation_defaults_version"] = 1
+        path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
 
     def _restore_archived_library(self, conn: sqlite3.Connection) -> None:
         """Restore CSV-archived compounds once when upgrading to cumulative imports.
@@ -340,12 +359,14 @@ class ProjectRepository:
             return []
         return [dict(profile) for profile in profiles if isinstance(profile, dict) and (include_archived or not profile.get("archived", False))]
 
+    @exclusive_project
     def save_receptor_profiles(self, profiles: list[dict[str, Any]]) -> None:
         path = self.root / "project.yml"
         config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         config["vina"] = {"profiles": profiles}
         path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
 
+    @exclusive_project
     def remove_receptor_profile(self, profile_id: str) -> bool:
         """Remove one receptor profile and only its receptor-owned files.
 
@@ -635,6 +656,7 @@ class ProjectRepository:
                 added += 1
         return LigandSyncResult(added=added, unchanged=unchanged, changed=changed)
 
+    @exclusive_project
     def sync_ligands_csv(self, path: Path) -> LigandSyncResult:
         """Add to the permanent project library; omissions never remove compounds.
 
@@ -672,6 +694,7 @@ class ProjectRepository:
         result = self.sync_ligands_csv(path)
         return result.added + result.changed
 
+    @exclusive_project
     def clear_workflow_data(self) -> None:
         """Clear current ligand/stage data while retaining project settings."""
         with self.connection() as conn:
@@ -695,6 +718,7 @@ class ProjectRepository:
                 artifact_type=excluded.artifact_type,created_stage=excluded.created_stage,validation_status=excluded.validation_status,active=1""", (artifact_id, relative, digest, path.stat().st_size, artifact_type, stage, validation_status, utc_now()))
             return artifact_id
 
+    @exclusive_project
     def recover_interrupted_runs(self) -> int:
         with self.connection() as conn:
             result = conn.execute("UPDATE stage_runs SET status=?, ended_at=?, reason=? WHERE status=?", (StageStatus.INTERRUPTED, utc_now(), "Application restarted before completion", StageStatus.RUNNING)).rowcount

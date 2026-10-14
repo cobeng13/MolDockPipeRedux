@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from .project import ProjectRepository
+from .execution_lock import project_execution_lock
 
 
 _DLL_DIRECTORY_HANDLES: list[object] = []
@@ -35,6 +36,28 @@ def configure_qt_runtime() -> None:
         os.environ["PATH"] = str(binaries) + os.pathsep + os.environ.get("PATH", "")
 
 
+def _run_project(project: Path, stages: list[str]) -> int:
+    from .pipeline import PipelineRunner
+
+    # Protect import and crash recovery too: neither may run concurrently with
+    # a GUI worker that is still writing this project's state and artifacts.
+    with project_execution_lock(project):
+        repo = ProjectRepository(project)
+        repo.migrate()
+        repo.import_project_input()
+        repo.recover_interrupted_runs()
+        runner = PipelineRunner(repo)
+        summary = {}
+        failed = 0
+        for stage in stages:
+            result = getattr(runner, f"run_{stage}")()
+            summary[stage] = result
+            if isinstance(result, tuple) and len(result) > 1:
+                failed += int(result[1])
+        print(json.dumps(summary, sort_keys=True))
+        return 1 if failed else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="moldockpipe")
     subparsers = parser.add_subparsers(dest="command")
@@ -56,29 +79,7 @@ def main() -> int:
     if args.command == "run":
         if not (args.project / "project.sqlite").is_file():
             parser.error(f"Not a MolDockPipe project: {args.project}")
-        from .pipeline import PipelineRunner
-
-        repo = ProjectRepository(args.project)
-        repo.migrate()
-        repo.import_project_input()
-        repo.recover_interrupted_runs()
-        runner = PipelineRunner(repo)
-        methods = {
-            "screening": runner.run_screening,
-            "molscrub": runner.run_molscrub,
-            "meeko": runner.run_meeko,
-            "vina": runner.run_vina,
-            "postdock": runner.run_postdock,
-        }
-        summary: dict[str, object] = {}
-        failed = 0
-        for stage in args.stages:
-            result = methods[stage]()
-            summary[stage] = result
-            if isinstance(result, tuple) and len(result) > 1:
-                failed += int(result[1])
-        print(json.dumps(summary, sort_keys=True))
-        return 1 if failed else 0
+        return _run_project(args.project, args.stages)
     try:
         configure_qt_runtime()
         from PyQt6.QtWidgets import QApplication

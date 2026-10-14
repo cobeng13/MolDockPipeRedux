@@ -7,6 +7,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from ..pipeline import PipelineRunner
 from ..project import ProjectRepository
+from ..execution_lock import project_execution_lock
 
 
 class VinaWorker(QObject):
@@ -54,20 +55,8 @@ class PipelineWorker(QObject):
 
     def run(self) -> None:
         try:
-            runner = PipelineRunner(self.repository, progress=self._report_progress)
-            self.repository.import_project_input()
-            runner.cancelled = self.cancel_event.is_set
-            summary = {}
-            if self.stages is None or not self.stages or "screening" in self.stages:
-                summary["screening"] = runner.run_screening()
-            if self.stages is None or not self.stages or "molscrub" in self.stages:
-                summary["molscrub"] = runner.run_molscrub()
-            if self.stages is None or not self.stages or "meeko" in self.stages:
-                summary["meeko"] = runner.run_meeko()
-            if self.stages is None or not self.stages or "vina" in self.stages:
-                summary["vina"] = runner.run_vina()
-            if self.stages is not None and "postdock" in self.stages:
-                summary["postdock"] = runner.run_postdock()
+            with project_execution_lock(self.repository.root):
+                summary = self._run_pipeline()
             if self.cancel_event.is_set():
                 self.stopped.emit()
             else:
@@ -76,3 +65,13 @@ class PipelineWorker(QObject):
             self.stopped.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
+
+    def _run_pipeline(self):
+        runner = PipelineRunner(self.repository, progress=self._report_progress,
+                                cancelled=self.cancel_event.is_set)
+        self.repository.import_project_input()
+        summary = {}
+        for stage in ("screening", "molscrub", "meeko", "vina", "postdock"):
+            if (stage != "postdock" and not self.stages) or (self.stages and stage in self.stages):
+                summary[stage] = getattr(runner, f"run_{stage}")()
+        return summary

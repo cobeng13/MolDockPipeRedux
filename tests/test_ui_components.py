@@ -39,11 +39,11 @@ def test_ui_components_import_and_expose_expected_contracts() -> None:
     assert DockingResultsDialog is not None
 
 
-def test_pipeline_worker_routes_requested_stage(monkeypatch) -> None:
+def test_pipeline_worker_routes_requested_stage(monkeypatch, tmp_path) -> None:
     calls: list[str] = []
 
     class FakeRunner:
-        def __init__(self, repository, progress=None) -> None:
+        def __init__(self, repository, progress=None, cancelled=None) -> None:
             self.repository = repository
 
         def run_screening(self):
@@ -68,7 +68,7 @@ def test_pipeline_worker_routes_requested_stage(monkeypatch) -> None:
 
     monkeypatch.setattr(workers, "PipelineRunner", FakeRunner)
     summaries = []
-    worker = PipelineWorker(SimpleNamespace(import_project_input=lambda: calls.append("import")), ["meeko"])
+    worker = PipelineWorker(SimpleNamespace(root=tmp_path, import_project_input=lambda: calls.append("import")), ["meeko"])
     worker.finished.connect(summaries.append)
     worker.run()
 
@@ -142,6 +142,34 @@ def test_docking_completion_distinguishes_new_work_from_reuse():
 
     event = ProgressEvent("stage_completed", "vina", succeeded=5000, skipped=4998, failed=1)
     assert MainWindow._event_summary(event) == "Docking completed: newly docked=2, reused=4998, failed=1"
+
+
+def test_finishing_thread_still_blocks_a_new_pipeline():
+    fake = SimpleNamespace(stage_running=False, pipeline_thread=SimpleNamespace(isRunning=lambda: True))
+    assert MainWindow._pipeline_active(fake)
+    fake.repo = object()
+    fake._pipeline_active = lambda: MainWindow._pipeline_active(fake)
+    # Must return before constructing a new QThread or changing the dashboard.
+    MainWindow._start_pipeline(fake, ["molscrub"], "MolScrub")
+
+
+@pytest.mark.parametrize("action", ["create_project", "open_project", "import_csv"])
+def test_project_changes_are_blocked_before_opening_dialogs(action):
+    fake = SimpleNamespace(_block_project_change=lambda: True)
+    getattr(MainWindow, action)(fake)
+
+
+def test_close_waits_for_pipeline_thread_cleanup():
+    stopped, ignored, closed = [], [], []
+    fake = SimpleNamespace(_pipeline_active=lambda: True, stop_pipeline=lambda: stopped.append(1),
+                           close=lambda: closed.append(1), pipeline_thread=object(), pipeline_worker=object())
+    MainWindow.closeEvent(fake, SimpleNamespace(ignore=lambda: ignored.append(1)))
+    assert ignored == stopped == [1]
+    assert closed == []
+    assert fake._close_after_pipeline
+    MainWindow._pipeline_thread_finished(fake)
+    assert fake.pipeline_thread is None and fake.pipeline_worker is None
+    assert closed == [1]
 
 
 def test_dashboard_refresh_defines_profile_metadata(tmp_path) -> None:

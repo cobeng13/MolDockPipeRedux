@@ -117,10 +117,27 @@ the project is reopened.
 The **Settings** button contains tabs for:
 
 - Screening: policy and Lipinski, Veber, Egan, Ghose, and BOILED-Egg (BBB/Yolk) rules.
-- MolScrub: pH, state enumeration, and state limit.
+- MolScrub: pH, state enumeration, state limit, per-compound timeout, and parallel worker count.
 - Meeko: parallel worker count.
 - Post-docking: split/export mode, poses per compound, and successfully docked compound selection.
 - Guardrails: purge generated workflow data and export data.
+
+MolScrub and Meeko default to **Automatic**, using one worker per detected
+logical CPU, limited by the number of compounds or states awaiting preparation.
+In `project.yml`, `workers: 0` selects Automatic; positive values set a manual
+limit. Older projects using Meeko's previous default of four workers switch to
+Automatic once on upgrade. Other manual limits and choices made after upgrading
+are preserved. Both stage Settings tabs offer Automatic and manual limits.
+
+Both stages keep only one batch of jobs in flight. Stop prevents new submissions
+and saves results from active jobs before exiting. MolScrub retains a separate
+timeout for each compound. Changing worker count does not invalidate completed
+states, prepared ligands, or docking results.
+
+A project allows one pipeline run at a time across application windows and
+terminal commands. Imports, recovery, and workflow resets cannot overlap that
+run. Different projects can run independently. Closing an active pipeline asks
+it to stop safely and waits for its worker thread before closing the window.
 
 The separate **Receptors** manager contains each receptor's search box,
 exhaustiveness, modes, energy range, seed, and CPU count. Docking runs every
