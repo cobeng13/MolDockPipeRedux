@@ -18,6 +18,19 @@ from .services.vinagpu import VinaGpuDockingBackend, find_vinagpu_executable, vi
 from .services.postdock import PostDockService, receptor_export_filename
 
 
+def _docking_parameters(settings: dict[str, object], backend: str) -> dict[str, object]:
+    """Fingerprint only arguments used by the selected docking executable."""
+    defaults = {"num_modes": 9, "energy_range": 3, "seed": 0}
+    if backend == "vinagpu":
+        defaults.update(thread=8000, search_depth=32)
+    else:
+        defaults.update(exhaustiveness=8, cpu=0)
+    names = ("center_x", "center_y", "center_z", "size_x", "size_y", "size_z", *defaults)
+    # JSON distinguishes 20 from 20.0, although Vina treats them identically.
+    return {"backend": backend, **{name: float(settings.get(name, defaults.get(name)))
+            for name in names if settings.get(name, defaults.get(name)) is not None}}
+
+
 class PipelineRunner:
     """Application service for small, independently resumable stage operations."""
 
@@ -40,6 +53,35 @@ class PipelineRunner:
             return False
         path = self.repository.root / relative_path
         return path.is_file() and file_sha256(path) == sha256
+
+    def _reusable_docking(self, state_id: str, profile_id: str, settings_fp: str,
+                          parameters: dict[str, object], receptor_hash: str,
+                          tool_hash: str, backend: str, ligand: Path, ligand_hash: str):
+        with self.repository.connection() as conn:
+            prepared = conn.execute("SELECT sha256 FROM artifacts WHERE relative_path=? AND active=1",
+                                   (ligand.relative_to(self.repository.root).as_posix(),)).fetchone()
+            candidates = conn.execute("""SELECT d.*, raw.relative_path AS raw_path,
+                raw.sha256 AS raw_sha256 FROM docking_runs d
+                JOIN artifacts raw ON raw.artifact_id=d.raw_output_artifact_id
+                WHERE d.state_id=? AND d.receptor_profile_id=? AND d.status='completed'
+                AND EXISTS (SELECT 1 FROM docking_poses p WHERE p.run_id=d.run_id)
+                ORDER BY d.is_current DESC, d.rowid DESC""", (state_id, profile_id)).fetchall()
+        for run in candidates:
+            matches = run["settings_fingerprint"] == settings_fp
+            if (not matches and run["is_current"] and run["receptor_hash"] == receptor_hash
+                    and prepared and prepared["sha256"] == ligand_hash):
+                # Keep compatible pre-fingerprint-upgrade results reusable. Old
+                # non-current runs lack the ligand hash needed to prove that
+                # regenerated coordinates are the same input, so cannot qualify.
+                command = json.loads(run["command_json"] or "{}")
+                previous = command.get("settings", {})
+                matches = ("inputs" not in command
+                    and _docking_parameters(previous, backend) == parameters
+                    and fingerprint(settings=previous, inputs={"receptor": receptor_hash},
+                                    tool_version=tool_hash) == run["settings_fingerprint"])
+            if matches and self._artifact_matches(run["raw_path"], run["raw_sha256"]):
+                return run
+        return None
 
     def run_screening(self) -> tuple[int, int]:
         self._check_cancelled()
@@ -127,12 +169,14 @@ class PipelineRunner:
                 self._emit("item_skipped", "molscrub", row["parent_id"], index, len(allowed),
                            failed=failed, skipped=skipped, message=f"Known failure skipped: {previous['reason']}")
                 continue
-            if existing and all(
-                state["generation_fingerprint"] == fingerprint(settings=settings,
-                    inputs={"state": state["state_structure_hash"]}, tool_version=version)
+            generation_settings = {key: value for key, value in settings.items() if key != "timeout_seconds"}
+            if (previous and previous["status"] == StageStatus.COMPLETED and existing and all(
+                state["generation_fingerprint"] in {
+                    fingerprint(settings=candidate, inputs={"state": state["state_structure_hash"]}, tool_version=version)
+                    for candidate in (generation_settings, settings)}
                 and self._artifact_matches(state["relative_path"], state["sha256"])
                 for state in existing
-            ):
+            )):
                 created += len(existing)
                 skipped += 1
                 self._emit("item_skipped", "molscrub", row["parent_id"], index, len(allowed), skipped=skipped, message=f"{len(existing)} existing states reused")
@@ -176,7 +220,8 @@ class PipelineRunner:
                 (SELECT state_id FROM molecular_states WHERE parent_id=?)""", (parent_id,))
         for state in states:
             state_id = f"{parent_id}-{state.structure_hash[:16]}"
-            state_fingerprint = fingerprint(settings=settings, inputs={"state": state.structure_hash}, tool_version=version)
+            generation_settings = {key: value for key, value in settings.items() if key != "timeout_seconds"}
+            state_fingerprint = fingerprint(settings=generation_settings, inputs={"state": state.structure_hash}, tool_version=version)
             state_dir = self.repository.root / "artifacts" / "sdf" / parent_id / state_id
             state_dir.mkdir(parents=True, exist_ok=True)
             sdf_path = state_dir / "input_conformer_0001.sdf"
@@ -206,14 +251,14 @@ class PipelineRunner:
                 FROM molecular_states s JOIN conformers c ON c.state_id=s.state_id
                 JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id WHERE s.active=1 AND a.active=1
                 ORDER BY s.parent_id, s.state_id""").fetchall()
-            reusable = []
+            reusable = set()
             for row in rows:
                 pdbqt = self.repository.root / "artifacts" / "pdbqt" / row["parent_id"] / row["state_id"] / "ligand.pdbqt"
                 artifact = conn.execute("SELECT relative_path,sha256 FROM artifacts WHERE relative_path=? AND active=1",
                     (pdbqt.relative_to(self.repository.root).as_posix(),)).fetchone()
                 conformer = conn.execute("SELECT status FROM conformers WHERE conformer_id=?", (row["conformer_id"],)).fetchone()
                 if conformer["status"] == "pdbqt_ready" and artifact and self._artifact_matches(artifact["relative_path"], artifact["sha256"]):
-                    reusable.append(row["conformer_id"])
+                    reusable.add(row["conformer_id"])
             rows = [row for row in rows if row["conformer_id"] not in reusable]
         self._emit("stage_started", "meeko", total=len(rows))
         skipped = max(0, all_states - len(rows))
@@ -341,7 +386,7 @@ class PipelineRunner:
                                message=reason)
                 continue
             receptor_hash = file_sha256(receptor)
-            settings_fp = fingerprint(settings=run_settings, inputs={"receptor": receptor_hash}, tool_version=tool_hash)
+            parameters = _docking_parameters(run_settings, backend_name)
             for state in states:
                 self._check_cancelled()
                 index += 1
@@ -353,17 +398,22 @@ class PipelineRunner:
                 run_dir = self.repository.root / "artifacts" / "docking" / profile_id / state["parent_id"] / state["state_id"] / run_id
                 output = run_dir / "vina_output.pdbqt"
                 log = run_dir / "vina.log.txt"
-                with self.repository.connection() as conn:
-                    reusable = conn.execute("""SELECT d.run_id, raw.relative_path AS raw_path, log.relative_path AS log_path,
-                        raw.sha256 AS raw_sha256, log.sha256 AS log_sha256
-                        FROM docking_runs d LEFT JOIN artifacts raw ON raw.artifact_id=d.raw_output_artifact_id
-                        LEFT JOIN artifacts log ON log.artifact_id=d.log_artifact_id
-                        WHERE d.state_id=? AND d.receptor_profile_id=? AND d.settings_fingerprint=? AND d.status=? AND d.is_current=1""",
-                        (state["state_id"], profile_id, settings_fp, StageStatus.COMPLETED)).fetchone()
-                if reusable and self._artifact_matches(reusable["raw_path"], reusable["raw_sha256"]) and self._artifact_matches(reusable["log_path"], reusable["log_sha256"]):
+                input_hashes = {"receptor": receptor_hash,
+                                "ligand": file_sha256(ligand) if ligand.is_file() else "missing"}
+                settings_fp = fingerprint(settings=parameters, inputs=input_hashes, tool_version=tool_hash)
+                reusable = (self._reusable_docking(state["state_id"], profile_id, settings_fp,
+                                                   parameters, receptor_hash, tool_hash, backend_name,
+                                                   ligand, input_hashes["ligand"])
+                            if ligand.is_file() else None)
+                if reusable:
+                    if not reusable["is_current"]:
+                        with self.repository.connection() as conn:
+                            conn.execute("UPDATE docking_runs SET is_current=0 WHERE state_id=? AND receptor_profile_id=?",
+                                         (state["state_id"], profile_id))
+                            conn.execute("UPDATE docking_runs SET is_current=1 WHERE run_id=?", (reusable["run_id"],))
                     succeeded += 1
                     reused += 1
-                    self._emit("item_skipped", "vina", state["state_id"], index, total, skipped=1,
+                    self._emit("item_skipped", "vina", state["state_id"], index, total, skipped=reused,
                                receptor_profile_id=profile_id, receptor_profile_name=profile_name,
                                message=f"{profile_name}: matching docking run reused")
                     continue
@@ -374,7 +424,7 @@ class PipelineRunner:
                              receptor_profile_id,receptor_profile_name,workflow_run_id)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             (run_id, state["state_id"], receptor_hash, settings_fp, StageStatus.RUNNING,
-                             json.dumps({"settings": run_settings, "argv": []}, sort_keys=True),
+                             json.dumps({"settings": run_settings, "inputs": input_hashes, "argv": []}, sort_keys=True),
                              utc_now(), profile_id, profile_name, workflow_run_id))
                     result = backend.run(executable=executable, receptor=receptor, ligand=ligand, output=output, log=log, settings=run_settings, cancelled=self.cancelled)
                     raw_artifact = self.repository.add_artifact(output, "vina_output_pdbqt", "vina") if output.exists() else None
@@ -385,7 +435,8 @@ class PipelineRunner:
                             return_code=?,ended_at=?,is_current=1,reason=?,command_json=? WHERE run_id=?""",
                             (StageStatus.COMPLETED if result.poses else StageStatus.FAILED, log_artifact, raw_artifact,
                              result.return_code, utc_now(), None if result.poses else "No valid Vina poses",
-                             json.dumps({"settings": run_settings, "argv": list(getattr(result, "command", ()))}, sort_keys=True), run_id))
+                             json.dumps({"settings": run_settings, "inputs": input_hashes,
+                                         "argv": list(getattr(result, "command", ()))}, sort_keys=True), run_id))
                         best_mode = min(result.poses, key=lambda pose: pose[1])[0] if result.poses else None
                         for mode, affinity, rmsd_lb, rmsd_ub in result.poses:
                             conn.execute("INSERT INTO docking_poses(pose_id,run_id,mode_index,affinity,rmsd_lb,rmsd_ub,is_best_for_state) VALUES (?, ?, ?, ?, ?, ?, ?)", (str(uuid.uuid4()), run_id, mode, affinity, rmsd_lb, rmsd_ub, int(mode == best_mode)))
@@ -412,7 +463,7 @@ class PipelineRunner:
                     self._emit("item_failed", "vina", state["state_id"], index, total, failed=failed,
                                receptor_profile_id=profile_id, receptor_profile_name=profile_name,
                                message=f"{profile_name}: {exc}")
-        self._emit("stage_completed", "vina", total=total, succeeded=succeeded, failed=failed)
+        self._emit("stage_completed", "vina", total=total, succeeded=succeeded, skipped=reused, failed=failed)
         summary = {"total": total, "succeeded": succeeded, "failed": failed, "reused": reused,
                    "newly_completed": max(0, succeeded - reused), "receptor_count": len(profiles),
                    "state_count": len(states)}

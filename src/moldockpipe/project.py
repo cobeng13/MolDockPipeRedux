@@ -250,6 +250,12 @@ class ProjectRepository:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_docking_runs_workflow ON docking_runs(workflow_run_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_workflow_runs_type_status ON workflow_runs(workflow_type, status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_receptor_preparation_profile ON receptor_preparation_runs(receptor_profile_id, started_at)")
+            # Latest per-parent history is queried both for resume and dashboard
+            # failures. Without this index each parent scans the entire history.
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_stage_runs_entity ON stage_runs(stage_name, entity_type, entity_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_states_parent_active ON molecular_states(parent_id, active)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_conformers_state ON conformers(state_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_docking_poses_run ON docking_poses(run_id)")
             for row in conn.execute("SELECT parent_id, source_smiles, notes, params_json FROM parent_ligands WHERE input_fingerprint IS NULL OR input_fingerprint='' ").fetchall():
                 conn.execute("UPDATE parent_ligands SET input_fingerprint=? WHERE parent_id=?", (self._input_fingerprint(row["source_smiles"], row["notes"], row["params_json"]), row["parent_id"]))
             if not conn.execute("SELECT 1 FROM schema_migrations WHERE version=7").fetchone():

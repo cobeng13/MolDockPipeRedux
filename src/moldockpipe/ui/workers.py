@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from threading import Event
+from time import monotonic
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
@@ -35,13 +36,25 @@ class PipelineWorker(QObject):
         self.repository = repository
         self.stages = stages
         self.cancel_event = Event()
+        self._last_progress_at = float("-inf")
+
+    def _report_progress(self, event: object) -> None:
+        """Bound routine Qt updates while always delivering failures and boundaries."""
+        now = monotonic()
+        kind = getattr(event, "event", "")
+        important = (kind in {"stage_started", "stage_completed", "item_failed"}
+                     or (kind == "item_skipped" and getattr(event, "failed", 0))
+                     or getattr(event, "index", 0) == getattr(event, "total", 0))
+        if important or now - self._last_progress_at >= 0.1:
+            self._last_progress_at = now
+            self.progress.emit(event)
 
     def stop(self) -> None:
         self.cancel_event.set()
 
     def run(self) -> None:
         try:
-            runner = PipelineRunner(self.repository, progress=self.progress.emit)
+            runner = PipelineRunner(self.repository, progress=self._report_progress)
             self.repository.import_project_input()
             runner.cancelled = self.cancel_event.is_set
             summary = {}

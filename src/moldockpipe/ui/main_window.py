@@ -236,6 +236,7 @@ class MainWindow(QMainWindow):
         self.data_tabs = tabs
         self.data_tabs.setVisible(False)
         self.log = QTextEdit()
+        self.log.document().setMaximumBlockCount(1000)
         self.log.setReadOnly(True)
         self.log.setMaximumHeight(120)
         self.log.setPlaceholderText("Structured pipeline events and execution logs appear here.")
@@ -373,6 +374,10 @@ class MainWindow(QMainWindow):
 
     def refresh_tables(self) -> None:
         if not self.repo:
+            return
+        # These views are currently hidden. Populating thousands of invisible
+        # table cells and sizing their columns still blocks the GUI thread.
+        if not self.data_tabs.isVisible():
             return
         with self.repo.connection() as conn:
             parents = conn.execute("""SELECT p.parent_id, p.source_smiles, p.canonical_source_smiles, p.parent_inchikey,
@@ -593,6 +598,7 @@ class MainWindow(QMainWindow):
             return
         self.stage_running = True
         self.stage_started_at = time.monotonic()
+        self._last_live_refresh_at = float("-inf")
         self.pipeline_is_full = not stages
         self.overall_progress.start_stage(stages[0] if stages else "screening")
         self._set_stage_actions(False)
@@ -724,7 +730,13 @@ class MainWindow(QMainWindow):
             remaining = max(total - index, 0)
             eta = remaining / (index / elapsed) if index else 0
             self.dashboard_status.setText(f"{stage.title()} | {rate:.1f}/min | ETA {eta / 60:.1f} min")
-        self._refresh_live_dashboard()
+        # Item events arrive in bursts, especially when reusing completed work.
+        # Full-project queries and export-file checks must not run per ligand.
+        now = time.monotonic()
+        if (getattr(event, "event", "") == "stage_completed"
+                or now - getattr(self, "_last_live_refresh_at", float("-inf")) >= 1.0):
+            self._last_live_refresh_at = now
+            self._refresh_live_dashboard()
         item = getattr(event, "item_id", None)
         message = getattr(event, "message", "")
         self.statusBar().showMessage(f"{stage}: {item or ''} {message}")
@@ -794,6 +806,11 @@ class MainWindow(QMainWindow):
         stage = getattr(event, "stage", "")
         kind = getattr(event, "event", "")
         if kind == "stage_completed":
+            if stage == "vina":
+                reused = getattr(event, "skipped", 0)
+                newly_docked = max(0, getattr(event, "succeeded", 0) - reused)
+                return (f"Docking completed: newly docked={newly_docked}, "
+                        f"reused={reused}, failed={getattr(event, 'failed', 0)}")
             return (f"{stage} completed: succeeded={getattr(event, 'succeeded', 0)}, "
                     f"skipped={getattr(event, 'skipped', 0)}, failed={getattr(event, 'failed', 0)}")
         return f"{stage} {kind}: {getattr(event, 'item_id', '')} {getattr(event, 'message', '')}".strip()

@@ -76,6 +76,74 @@ def test_pipeline_worker_routes_requested_stage(monkeypatch) -> None:
     assert summaries == [{"meeko": (1, 0)}]
 
 
+def test_bulk_progress_is_throttled_without_losing_failures_or_boundaries(monkeypatch):
+    from moldockpipe.models import ProgressEvent
+
+    monkeypatch.setattr(workers, "monotonic", lambda: 10.0)
+    worker = PipelineWorker(SimpleNamespace())
+    delivered = []
+    worker.progress.connect(delivered.append)
+    start = ProgressEvent("stage_started", "screening", total=5000)
+    worker._report_progress(start)
+    for index in range(1, 5001):
+        worker._report_progress(ProgressEvent("item_started", "screening", str(index), index, 5000))
+        worker._report_progress(ProgressEvent("item_succeeded", "screening", str(index), index, 5000))
+    failure = ProgressEvent("item_failed", "screening", "bad", 100, 5000, failed=1)
+    worker._report_progress(failure)
+    cached_failure = ProgressEvent("item_skipped", "screening", "bad", 101, 5000, failed=1)
+    worker._report_progress(cached_failure)
+    finish = ProgressEvent("stage_completed", "screening", total=5000)
+    worker._report_progress(finish)
+    assert delivered[0] == start
+    assert [(e.event, e.index) for e in delivered[1:3]] == [
+        ("item_started", 5000), ("item_succeeded", 5000)]
+    assert delivered[3:] == [failure, cached_failure, finish]
+    monkeypatch.setattr(workers, "monotonic", lambda: 10.2)
+    update = ProgressEvent("item_succeeded", "meeko", "next", 1, 5000)
+    worker._report_progress(update)
+    assert delivered[-1] == update
+
+
+def test_dashboard_queries_are_bounded_during_bulk_progress(monkeypatch):
+    from moldockpipe.models import ProgressEvent
+    import moldockpipe.ui.main_window as main_window
+
+    class Sink:
+        def setText(self, value): self.value = value
+        def text(self): return getattr(self, "value", "")
+        def setValue(self, value): pass
+        def setFormat(self, value): pass
+        def showMessage(self, value): pass
+
+    refreshes, checkpoints = [], []
+    fake = SimpleNamespace(
+        stage_progress=Sink(), current_stage_label=Sink(), current_item_label=Sink(),
+        current_task_label=Sink(), dashboard_status=Sink(), stat_cards={"running": Sink()},
+        stage_started_at=0.0, _refresh_live_dashboard=lambda: refreshes.append(1),
+        statusBar=lambda: Sink(), refresh_tables=lambda: None,
+        _refresh_checkpoint_state=lambda: checkpoints.append(1),
+        overall_progress=SimpleNamespace(complete_stage=lambda stage: None),
+        _write_log=lambda message: None, _event_summary=lambda event: "finished",
+    )
+    monkeypatch.setattr(main_window.time, "monotonic", lambda: 10.0)
+    for index in range(1, 5001):
+        MainWindow._on_pipeline_progress(fake, ProgressEvent("item_succeeded", "screening", str(index), index, 5000))
+    assert len(refreshes) == 1
+    monkeypatch.setattr(main_window.time, "monotonic", lambda: 11.1)
+    MainWindow._on_pipeline_progress(fake, ProgressEvent("item_succeeded", "screening", "next", 1, 5000))
+    assert len(refreshes) == 2
+    MainWindow._on_pipeline_progress(fake, ProgressEvent("stage_completed", "screening", total=5000))
+    assert len(refreshes) == 3
+    assert checkpoints == [1]
+
+
+def test_docking_completion_distinguishes_new_work_from_reuse():
+    from moldockpipe.models import ProgressEvent
+
+    event = ProgressEvent("stage_completed", "vina", succeeded=5000, skipped=4998, failed=1)
+    assert MainWindow._event_summary(event) == "Docking completed: newly docked=2, reused=4998, failed=1"
+
+
 def test_dashboard_refresh_defines_profile_metadata(tmp_path) -> None:
     class Sink:
         def setText(self, value): self.text = value

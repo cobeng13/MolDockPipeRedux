@@ -83,6 +83,65 @@ def test_meeko_failure_message_identifies_excess_bond_residues(tmp_path: Path) -
     assert "did not delete residues automatically" in message
 
 
+def test_cif_long_ligand_names_preserve_identity_and_coordinates(tmp_path: Path) -> None:
+    import gemmi
+
+    structure = gemmi.read_pdb_string(PDB)
+    chain = structure[0][0]
+    chain[1].name = "A1D5J"
+    # Share the same three-character prefix, including a genuine short name.
+    for number, name in ((402, "A1D6J"), (403, "A1D")):
+        other = chain[1].clone()
+        other.seqid = gemmi.SeqId(number, " ")
+        other.name = name
+        chain.add_residue(other)
+    source = tmp_path / "long_names.cif"
+    structure.make_mmcif_document().write_file(str(source))
+    analysis = analyze_structure(source)
+    ligand = next(c for c in analysis.components if c.key.name == "A1D5J")
+    plan = ReceptorPreparationPlan("test", "Test", source, 0, ("A",), ligand.key,
+        (ResidueKey("A", 402, "", "A1D6J"),), (), (0, 0, 0), (20, 20, 20), "manual")
+    pdb_text = structure_as_pdb(source)
+    cleaned, reference = tmp_path / "cleaned.pdb", tmp_path / "reference.pdb"
+    write_cleaned_receptor(pdb_text, plan, cleaned)
+    write_reference_ligand(pdb_text, plan, reference)
+    cleaned_structure = gemmi.read_structure(str(cleaned))
+    assert {r.seqid.num for r in cleaned_structure[0][0]} == {1, 403, 501, 601}
+    assert next(r for r in cleaned_structure[0][0] if r.seqid.num == 403).name == "A1D"
+    reference_structure = gemmi.read_structure(str(reference))
+    reference_structure.restore_full_ccd_codes()
+    extracted = reference_structure[0][0][0]
+    assert extracted.name == "A1D5J"
+    assert [(a.name.strip(), a.pos.x, a.pos.y, a.pos.z) for a in extracted] == [
+        (a.name, a.x, a.y, a.z) for a in ligand.atoms]
+
+
+def test_cif_long_ligand_name_respects_explicit_altloc(tmp_path: Path) -> None:
+    import gemmi
+
+    structure = gemmi.read_pdb_string(PDB)
+    residue = structure[0][0][1]
+    residue.name = "A1D5J"
+    for atom_record in residue:
+        atom_record.altloc = "B"
+    alternatives = [atom_record.clone() for atom_record in residue]
+    for alternative in alternatives:
+        alternative.altloc = "C"
+        alternative.pos.x += 3
+        residue.add_atom(alternative)
+    source = tmp_path / "long_name_altloc.cif"
+    structure.make_mmcif_document().write_file(str(source))
+    key = ResidueKey("A", 401, "", "A1D5J")
+    plan = ReceptorPreparationPlan("test", "Test", source, 0, ("A",), key,
+        (), (), (0, 0, 0), (20, 20, 20), "manual", altloc_choices={key: "C"})
+    reference = tmp_path / "reference.pdb"
+    write_reference_ligand(structure_as_pdb(source), plan, reference)
+    extracted = gemmi.read_structure(str(reference))[0][0][0]
+    assert len(extracted) == 5
+    assert extracted[0].pos.x == 17
+    assert all(atom_record.altloc == "\x00" for atom_record in extracted)
+
+
 def test_mm_cif_style_altloc_selection_uses_complete_conformer(tmp_path: Path) -> None:
     # This represents a residue whose only side-chain conformer is B.  The old
     # hard-coded A selection silently dropped CB before Meeko saw the PDB.

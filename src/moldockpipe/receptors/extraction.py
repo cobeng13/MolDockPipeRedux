@@ -11,14 +11,35 @@ def structure_as_pdb(path: Path) -> str:
     except ImportError as exc:
         raise RuntimeError("Gemmi is required to read receptor structures") from exc
     structure = gemmi.read_structure(str(path))
+    # Use Gemmi's reversible aliases instead of silently truncating CCD names.
+    # The full names are recorded in the generated HETNAM records.
+    structure.shorten_ccd_codes()
     return structure.make_pdb_string()
 
 
-def _line_key(line: str) -> ResidueKey:
-    return ResidueKey(line[21:22].strip(), int(line[22:26]), line[26:27].strip(), line[17:20].strip())
+def _residue_names(pdb_text: str) -> dict[str, str]:
+    """Read Gemmi's extended-CCD HETNAM alias-to-original-name mapping."""
+    return {line[11:14].strip(): line[71:79].strip()
+            for line in pdb_text.splitlines()
+            if line.startswith("HETNAM") and line[11:14].startswith("~") and line[71:79].strip()}
+
+
+def _line_key(line: str, residue_names: dict[str, str] | None = None) -> ResidueKey:
+    name = line[17:20].strip()
+    if residue_names:
+        name = residue_names.get(name, name)
+    return ResidueKey(line[21:22].strip(), int(line[22:26]), line[26:27].strip(), name)
+
+
+def _write_atom_lines(pdb_text: str, lines: list[str], destination: Path) -> None:
+    names = {line[17:20].strip() for line in lines}
+    headers = [line for line in pdb_text.splitlines()
+               if line.startswith("HETNAM") and line[11:14].strip() in names]
+    destination.write_text("\n".join(headers + lines + ["END", ""]), encoding="ascii")
 
 
 def _selected_atom_lines(pdb_text: str, plan: ReceptorPreparationPlan) -> list[str]:
+    residue_names = _residue_names(pdb_text)
     candidates: dict[ResidueKey, list[str]] = {}
     current_model = 0
     explicit_models = False
@@ -37,7 +58,7 @@ def _selected_atom_lines(pdb_text: str, plan: ReceptorPreparationPlan) -> list[s
             continue
         if explicit_models and current_model != plan.selected_model:
             continue
-        key = _line_key(line)
+        key = _line_key(line, residue_names)
         if plan.included_chains and key.chain not in plan.included_chains:
             continue
         candidates.setdefault(key, []).append(line)
@@ -67,22 +88,24 @@ def _selected_atom_lines(pdb_text: str, plan: ReceptorPreparationPlan) -> list[s
 
 
 def write_cleaned_receptor(pdb_text: str, plan: ReceptorPreparationPlan, destination: Path) -> None:
+    residue_names = _residue_names(pdb_text)
     removed = set(plan.removed_residues) | set(plan.excluded_receptor_residues)
     if plan.reference_ligand:
         removed.add(plan.reference_ligand)
-    lines = [line for line in _selected_atom_lines(pdb_text, plan) if _line_key(line) not in removed]
+    lines = [line for line in _selected_atom_lines(pdb_text, plan) if _line_key(line, residue_names) not in removed]
     if not lines:
         raise ValueError("The receptor composition removed every atom")
-    destination.write_text("\n".join(lines + ["END", ""]), encoding="ascii")
+    _write_atom_lines(pdb_text, lines, destination)
 
 
 def write_reference_ligand(pdb_text: str, plan: ReceptorPreparationPlan, destination: Path) -> None:
     if not plan.reference_ligand:
         return
-    lines = [line for line in _selected_atom_lines(pdb_text, plan) if _line_key(line) == plan.reference_ligand]
+    residue_names = _residue_names(pdb_text)
+    lines = [line for line in _selected_atom_lines(pdb_text, plan) if _line_key(line, residue_names) == plan.reference_ligand]
     if not lines:
         raise ValueError(f"Reference ligand {plan.reference_ligand.label()} was not found")
-    destination.write_text("\n".join(lines + ["END", ""]), encoding="ascii")
+    _write_atom_lines(pdb_text, lines, destination)
 
 
 def write_box_pdb(center: tuple[float, float, float], size: tuple[float, float, float], destination: Path) -> None:
