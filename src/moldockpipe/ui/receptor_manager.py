@@ -4,6 +4,7 @@ import shutil
 import json
 import uuid
 import zipfile
+from copy import deepcopy
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -16,6 +17,7 @@ from ..project import DEFAULT_VINA_PROFILE, ProjectRepository
 from .redocking_dialog import RedockingSetupDialog
 from .redocking_queue import RedockingQueueController, RedockingQueueDialog
 from ..redocking.runner import validate_redocking_prerequisites
+from ..execution_lock import exclusive_project
 
 
 class ReceptorProfileDialog(QDialog):
@@ -91,7 +93,7 @@ class ReceptorManagerDialog(QDialog):
         super().__init__(parent)
         self.repository = repository
         self.profiles = repository.get_receptor_profiles(include_archived=True)
-        self.original_profiles = {str(profile["id"]): dict(profile) for profile in self.profiles}
+        self.original_profiles = {str(profile["id"]): deepcopy(profile) for profile in self.profiles}
         self.sources: dict[str, Path] = {}
         self.import_packages: dict[str, Path] = {}
         self.deleted_profile_ids: list[str] = []
@@ -144,7 +146,8 @@ class ReceptorManagerDialog(QDialog):
             QMessageBox.warning(self, "Redocking cannot start", "Missing:\n• " + "\n• ".join(missing) + "\n\nReturn to Receptor Preparation to complete the profile."); return
         setup = RedockingSetupDialog(self.repository, profile, self, action_label="Add to Queue")
         if setup.exec() != QDialog.DialogCode.Accepted: return
-        self.repository.save_receptor_profiles(self.profiles)
+        if not self._save_profiles():
+            return
         try:
             self.queue_controller.enqueue(profile, setup.settings())
         except ValueError as exc:
@@ -158,7 +161,19 @@ class ReceptorManagerDialog(QDialog):
         RedockingQueueDialog(self.queue_controller, self).exec()
 
     def _activate_index(self, index: int) -> None:
-        self.profiles[index]["enabled"] = True; self.repository.save_receptor_profiles(self.profiles); self._refresh(); self.table.selectRow(index)
+        self.profiles[index]["enabled"] = True
+        if self._save_profiles():
+            self._refresh(); self.table.selectRow(index)
+
+    def _save_profiles(self) -> bool:
+        try:
+            self.repository.save_receptor_profiles(self.profiles,
+                expected_profiles=list(self.original_profiles.values()))
+        except (RuntimeError, ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Receptor profiles were not saved", str(exc))
+            return False
+        self.original_profiles = {str(profile["id"]): deepcopy(profile) for profile in self.profiles}
+        return True
 
     def _selected(self) -> int | None:
         rows = self.table.selectionModel().selectedRows()
@@ -330,6 +345,14 @@ class ReceptorManagerDialog(QDialog):
         self._refresh()
 
     def _save(self) -> None:
+        try:
+            self._save_locked()
+        except (RuntimeError, ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Receptor profiles were not saved", str(exc))
+
+    @exclusive_project
+    def _save_locked(self) -> None:
+        self.repository.check_receptor_profiles(list(self.original_profiles.values()))
         docking_keys = {"receptor", "center_x", "center_y", "center_z", "size_x", "size_y", "size_z",
                         "exhaustiveness", "num_modes", "energy_range", "seed", "cpu_count"}
         for profile in self.profiles:

@@ -345,14 +345,19 @@ class PipelineRunner:
         self._emit("stage_completed", "meeko", total=len(rows), succeeded=prepared, skipped=skipped, failed=failed)
         return prepared, failed
 
+    def validate_docking_configuration(self, profile_ids: Collection[str] | None = None):
+        profiles = [profile for profile in self.repository.get_receptor_profiles()
+                    if profile.get("enabled", False) and (profile_ids is None or str(profile.get("id")) in profile_ids)]
+        if not profiles:
+            raise RuntimeError("No enabled receptor profiles are configured. Open Receptors and enable an existing profile. "
+                               "If the list is unexpectedly empty, check project.yml.bak and the saved receptor files before re-importing.")
+        return profiles
+
     @exclusive_project
     def run_vina(self, profile_ids: Collection[str] | None = None) -> tuple[int, int]:
         """Dock every Meeko-prepared state against each selected receptor profile."""
         self._check_cancelled()
-        profiles = [profile for profile in self.repository.get_receptor_profiles()
-                    if profile.get("enabled", False) and (profile_ids is None or str(profile.get("id")) in profile_ids)]
-        if not profiles:
-            raise RuntimeError("No enabled receptor profiles are configured")
+        profiles = self.validate_docking_configuration(profile_ids)
         # Vina is an application-level tool, shared by projects. A project-local
         # copy remains supported for portable runs.
         docking_settings = self.repository.get_settings().get("docking", {})

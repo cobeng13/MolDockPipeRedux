@@ -11,8 +11,6 @@ from PyQt6.QtWidgets import (
     QTabWidget, QTextEdit, QToolBar, QToolButton, QVBoxLayout, QWidget, QMenu,
 )
 
-import yaml
-
 from ..project import ProjectRepository
 from ..execution_lock import project_execution_lock
 from ..csv_exports import export_leaderboard_csv as write_leaderboards, export_manifest_csv as write_manifests
@@ -322,8 +320,8 @@ class MainWindow(QMainWindow):
             with project_execution_lock(repo.root):
                 repo.migrate()
                 interrupted = repo.recover_interrupted_runs()
-        except RuntimeError as exc:
-            QMessageBox.warning(self, "Project is busy", str(exc))
+        except (RuntimeError, ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Unable to open project", str(exc))
             return
         self.repo = repo
         self._activate_project("Opened" + (f"; recovered {interrupted} interrupted stage runs" if interrupted else ""))
@@ -716,10 +714,7 @@ class MainWindow(QMainWindow):
         if not selected:
             QMessageBox.warning(self, "Select compounds", "Select at least one successfully docked compound to export.")
             return
-        config_path = self.repo.root / "project.yml"
-        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-        config.setdefault("postdock", {})["selected_parents"] = selected
-        config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+        self.repo.update_settings({"postdock": {"selected_parents": selected}})
         self._write_log(f"Export selected compounds: {len(selected)}")
         self.run_postdock()
 
@@ -874,10 +869,7 @@ class MainWindow(QMainWindow):
             return
         config_path = self.repo.root / "project.yml"
         try:
-            with project_execution_lock(self.repo.root):
-                config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-                config.update(dialog.values())
-                config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+            self.repo.update_settings(dialog.values())
             self._write_log(f"Updated docking settings in {config_path}")
         except Exception as exc:
             QMessageBox.critical(self, "Settings update failed", str(exc))
@@ -920,6 +912,7 @@ class MainWindow(QMainWindow):
         def succeeded(folder: str) -> None:
             assert self.repo
             profiles = self.repo.get_receptor_profiles(include_archived=True)
+            expected_profiles = list(profiles)
             profiles.append({
                 "id": plan.profile_id, "name": plan.profile_name, "enabled": activate, "archived": False,
                 "receptor": (Path(folder) / "receptor.pdbqt").relative_to(self.repo.root).as_posix(),
@@ -937,7 +930,12 @@ class MainWindow(QMainWindow):
                     "mapping": f"inputs/receptors/{plan.profile_id}/reference_ligand/chemistry_mapping.json" if plan.reference_ligand else None,
                 },
             })
-            self.repo.save_receptor_profiles(profiles)
+            try:
+                self.repo.save_receptor_profiles(profiles, expected_profiles=expected_profiles)
+            except (RuntimeError, ValueError, OSError) as exc:
+                QMessageBox.warning(self, "Receptor profile was not registered",
+                    f"{exc}\n\nPrepared files are saved in {folder}.")
+                return
             self._write_log(f"Created receptor profile '{plan.profile_name}' in {folder}")
             self._refresh_checkpoint_state()
             QMessageBox.information(self, "Receptor profile created", f"{plan.profile_name}\n\nBox: {plan.box_size[0]:.1f} × {plan.box_size[1]:.1f} × {plan.box_size[2]:.1f} Å")

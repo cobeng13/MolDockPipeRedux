@@ -13,11 +13,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-import yaml
-
 from .fingerprints import file_sha256, fingerprint
 from .models import ScreeningPolicy, StageStatus
 from .execution_lock import exclusive_project
+from .configuration import read_project_config, write_project_config
 
 
 SCHEMA_VERSION = 7
@@ -70,6 +69,8 @@ class ProjectRepository:
     @classmethod
     def create(cls, root: Path, name: str | None = None) -> "ProjectRepository":
         root = root.resolve()
+        if (root / "project.sqlite").exists():
+            raise FileExistsError(f"A project already exists at {root}. Open it instead of creating it again; its receptor profiles were preserved.")
         root.mkdir(parents=True, exist_ok=True)
         for relative in ("inputs", "inputs/receptors", "artifacts/sdf", "artifacts/pdbqt", "artifacts/docking", "logs", "exports", "For_PostDocking", "tools/vina"):
             (root / relative).mkdir(parents=True, exist_ok=True)
@@ -88,7 +89,7 @@ class ProjectRepository:
             # empty so a placeholder cannot accidentally participate in runs.
             "vina": {"profiles": []},
         }
-        (root / "project.yml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+        write_project_config(root / "project.yml", config)
         repo = cls(root)
         repo.migrate()
         repo.record_environment()
@@ -273,7 +274,7 @@ class ProjectRepository:
         path = self.root / "project.yml"
         if not path.is_file():
             return
-        config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        config = read_project_config(path)
         if config.get("preparation_defaults_version", 0) >= 1:
             return
         meeko = dict(config.get("meeko", {}) or {})
@@ -281,7 +282,7 @@ class ProjectRepository:
             meeko["workers"] = 0
         config["meeko"] = meeko
         config["preparation_defaults_version"] = 1
-        path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+        write_project_config(path, config)
 
     def _restore_archived_library(self, conn: sqlite3.Connection) -> None:
         """Restore CSV-archived compounds once when upgrading to cumulative imports.
@@ -331,12 +332,12 @@ class ProjectRepository:
         path = self.root / "project.yml"
         if not path.exists():
             return
-        config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        config = read_project_config(path)
         vina = dict(config.get("vina", {}) or {})
         if isinstance(vina.get("profiles"), list):
             if config.get("schema_version") != SCHEMA_VERSION:
                 config["schema_version"] = SCHEMA_VERSION
-                path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+                write_project_config(path, config)
             return
         profile = dict(DEFAULT_VINA_PROFILE)
         legacy_receptor = str(vina.get("receptor", "inputs/receptor_prepared.pdbqt"))
@@ -351,7 +352,7 @@ class ProjectRepository:
                 shutil.copy2(source, destination)
         config["schema_version"] = SCHEMA_VERSION
         config["vina"] = {"profiles": [profile]}
-        path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+        write_project_config(path, config)
 
     def get_receptor_profiles(self, *, include_archived: bool = False) -> list[dict[str, Any]]:
         profiles = self.get_settings().get("vina", {}).get("profiles", [])
@@ -360,11 +361,18 @@ class ProjectRepository:
         return [dict(profile) for profile in profiles if isinstance(profile, dict) and (include_archived or not profile.get("archived", False))]
 
     @exclusive_project
-    def save_receptor_profiles(self, profiles: list[dict[str, Any]]) -> None:
+    def save_receptor_profiles(self, profiles: list[dict[str, Any]], *,
+                               expected_profiles: list[dict[str, Any]] | None = None) -> None:
         path = self.root / "project.yml"
-        config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        self.check_receptor_profiles(expected_profiles)
+        config = read_project_config(path)
         config["vina"] = {"profiles": profiles}
-        path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+        write_project_config(path, config)
+
+    def check_receptor_profiles(self, expected_profiles: list[dict[str, Any]] | None) -> None:
+        if expected_profiles is not None and self.get_receptor_profiles(include_archived=True) != expected_profiles:
+            raise RuntimeError("Receptor profiles changed since this window was opened. "
+                               "Close and reopen Receptors to reload them; no profiles were overwritten.")
 
     @exclusive_project
     def remove_receptor_profile(self, profile_id: str) -> bool:
@@ -607,7 +615,18 @@ class ProjectRepository:
 
     def get_settings(self) -> dict[str, Any]:
         path = self.root / "project.yml"
-        return yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
+        return read_project_config(path) if path.exists() else {}
+
+    @exclusive_project
+    def update_settings(self, updates: dict[str, dict[str, Any]]) -> None:
+        """Merge only settings owned by the general Settings dialog."""
+        allowed = {"screening", "molscrub", "meeko", "docking", "postdock"}
+        if set(updates) - allowed:
+            raise ValueError("Receptor profiles must be edited through Receptors")
+        config = self.get_settings()
+        for section, values in updates.items():
+            config[section] = {**config.get(section, {}), **values}
+        write_project_config(self.root / "project.yml", config)
 
     def _read_ligand_rows(self, path: Path) -> list[dict[str, str | None]]:
         rows: list[dict[str, str | None]] = []

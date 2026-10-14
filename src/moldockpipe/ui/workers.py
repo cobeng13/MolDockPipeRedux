@@ -69,6 +69,8 @@ class PipelineWorker(QObject):
     def _run_pipeline(self):
         runner = PipelineRunner(self.repository, progress=self._report_progress,
                                 cancelled=self.cancel_event.is_set)
+        if not self.stages or "vina" in self.stages:
+            runner.validate_docking_configuration()
         self.repository.import_project_input()
         summary = {}
         for stage in ("screening", "molscrub", "meeko", "vina", "postdock"):

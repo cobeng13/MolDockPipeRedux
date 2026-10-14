@@ -76,6 +76,31 @@ def test_pipeline_worker_routes_requested_stage(monkeypatch, tmp_path) -> None:
     assert summaries == [{"meeko": (1, 0)}]
 
 
+def test_run_all_checks_receptor_before_import_or_chemistry(tmp_path):
+    repo = ProjectRepository.create(tmp_path / "project")
+    (repo.root / "inputs" / "input.csv").write_text("id,smiles\nlig1,CCO\n", encoding="utf-8")
+    worker = PipelineWorker(repo, [])
+    failures = []
+    worker.failed.connect(failures.append)
+    worker.run()
+    assert len(failures) == 1 and "Open Receptors" in failures[0]
+    with repo.connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM parent_ligands").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM stage_runs").fetchone()[0] == 0
+
+
+def test_stale_receptor_manager_checks_before_file_or_database_changes(tmp_path):
+    repo = ProjectRepository.create(tmp_path / "project")
+    original = {"id": "original", "name": "Original", "enabled": True}
+    repo.save_receptor_profiles([original])
+    fake = SimpleNamespace(repository=repo, original_profiles={"original": dict(original)})
+    newer = {"id": "newer", "name": "Newer", "enabled": True}
+    repo.save_receptor_profiles([original, newer])
+    with pytest.raises(RuntimeError, match="changed since"):
+        ReceptorManagerDialog._save_locked(fake)
+    assert repo.get_receptor_profiles() == [original, newer]
+
+
 def test_bulk_progress_is_throttled_without_losing_failures_or_boundaries(monkeypatch):
     from moldockpipe.models import ProgressEvent
 

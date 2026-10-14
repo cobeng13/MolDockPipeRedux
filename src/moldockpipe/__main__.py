@@ -44,9 +44,11 @@ def _run_project(project: Path, stages: list[str]) -> int:
     with project_execution_lock(project):
         repo = ProjectRepository(project)
         repo.migrate()
+        runner = PipelineRunner(repo)
+        if "vina" in stages:
+            runner.validate_docking_configuration()
         repo.import_project_input()
         repo.recover_interrupted_runs()
-        runner = PipelineRunner(repo)
         summary = {}
         failed = 0
         for stage in stages:
