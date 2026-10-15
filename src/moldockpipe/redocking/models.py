@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+
 from enum import Enum
+
+from ..parallel import logical_cpu_count
 
 
 class RedockingStatus(str, Enum):
@@ -19,7 +22,7 @@ class RedockingSettings:
     num_modes: int = 20
     energy_range: float = 5.0
     seed: int = 123456
-    cpu_count: int = 1
+    cpu_count: int = field(default_factory=logical_cpu_count)
 
     def as_dict(self) -> dict[str, int | float]:
         return asdict(self)

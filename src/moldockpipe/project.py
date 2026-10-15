@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from .parallel import logical_cpu_count
 from .fingerprints import file_sha256, fingerprint
 from .models import ScreeningPolicy, StageStatus
 from .execution_lock import exclusive_project
@@ -38,7 +39,7 @@ DEFAULT_VINA_PROFILE: dict[str, Any] = {
     "num_modes": 9,
     "energy_range": 3,
     "seed": 42,
-    "cpu_count": 1,
+    "cpu_count": logical_cpu_count(),
 }
 
 

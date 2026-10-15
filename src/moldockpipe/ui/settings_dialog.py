@@ -151,7 +151,7 @@ class SettingsDialog(QDialog):
         self._integer(form, "Number of modes", "vina.num_modes", values.get("num_modes", 9), 1, 100)
         self._double(form, "Energy range", "vina.energy_range", values.get("energy_range", 3), 0, 100)
         self._integer(form, "Random seed", "vina.seed", values.get("seed", 42), 0, 2147483647)
-        self._integer(form, "CPU count", "vina.cpu_count", values.get("cpu_count", 1), 1, 256)
+        self._integer(form, "CPU count", "vina.cpu_count", values.get("cpu_count", logical_cpu_count()), 1, max(256, logical_cpu_count()))
         widget = QWidget(); widget.setLayout(form); return widget
 
     def _postdock_tab(self, values: dict[str, object]) -> QWidget:

@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from ..parallel import logical_cpu_count
 from ..project import DEFAULT_VINA_PROFILE, ProjectRepository
 from .redocking_dialog import RedockingSetupDialog
 from .redocking_queue import RedockingQueueController, RedockingQueueDialog
@@ -45,7 +46,7 @@ class ReceptorProfileDialog(QDialog):
         for key, label, minimum, maximum, default in (
             ("exhaustiveness", "Exhaustiveness", 1, 10000, 8), ("num_modes", "Number of modes", 1, 100, 9),
             ("energy_range", "Energy range", 0, 100, 3), ("seed", "Random seed", 0, 2147483647, 42),
-            ("cpu_count", "CPU count", 1, 256, 1),
+            ("cpu_count", "CPU count", 1, max(256, logical_cpu_count()), logical_cpu_count()),
         ):
             field = QSpinBox(); field.setRange(minimum, maximum); field.setValue(int(profile.get(key, default)))
             self.numbers[key] = field; form.addRow(label, field)

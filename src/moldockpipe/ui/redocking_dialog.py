@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from ..parallel import logical_cpu_count
 from ..project import ProjectRepository
 from ..redocking.models import RedockingSettings
 from ..redocking.runner import RedockingRunner, STAGES, validate_redocking_prerequisites
@@ -52,9 +53,9 @@ class RedockingSetupDialog(QDialog):
         self.values: dict[str, QSpinBox | QDoubleSpinBox] = {}
         defaults = {"exhaustiveness": max(32, int(profile.get("exhaustiveness", 32))), "num_modes": max(20, int(profile.get("num_modes", 20))),
                     "energy_range": max(5.0, float(profile.get("energy_range", 5))), "seed": int(profile.get("seed", 123456)),
-                    "cpu_count": int(profile.get("cpu_count", 1))}
+                    "cpu_count": int(profile.get("cpu_count", logical_cpu_count()))}
         for key, label, minimum, maximum in (("exhaustiveness", "Exhaustiveness", 1, 10000), ("num_modes", "Modes", 1, 100),
-            ("energy_range", "Energy range", 0, 100), ("seed", "Seed", 0, 2147483647), ("cpu_count", "CPU count", 1, 256)):
+            ("energy_range", "Energy range", 0, 100), ("seed", "Seed", 0, 2147483647), ("cpu_count", "CPU count", 1, max(256, logical_cpu_count()))):
             spin = QDoubleSpinBox() if key == "energy_range" else QSpinBox(); spin.setRange(minimum, maximum); spin.setValue(defaults[key])
             self.values[key] = spin; form.addRow(label, spin)
         mapping_path = Path(str(reference.get("mapping", ""))); mapping_path = mapping_path if mapping_path.is_absolute() else repository.root / mapping_path

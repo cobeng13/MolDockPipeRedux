@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QTabWidget, QTextEdit, QToolBar, QToolButton, QVBoxLayout, QWidget, QMenu,
 )
 
+from ..parallel import logical_cpu_count
 from ..project import ProjectRepository
 from ..execution_lock import project_execution_lock
 from ..csv_exports import export_leaderboard_csv as write_leaderboards, export_manifest_csv as write_manifests
@@ -918,7 +919,7 @@ class MainWindow(QMainWindow):
                 "receptor": (Path(folder) / "receptor.pdbqt").relative_to(self.repo.root).as_posix(),
                 "center_x": plan.box_center[0], "center_y": plan.box_center[1], "center_z": plan.box_center[2],
                 "size_x": plan.box_size[0], "size_y": plan.box_size[1], "size_z": plan.box_size[2],
-                "exhaustiveness": 8, "num_modes": 9, "energy_range": 3, "seed": 42, "cpu_count": 1,
+                "exhaustiveness": 8, "num_modes": 9, "energy_range": 3, "seed": 42, "cpu_count": logical_cpu_count(),
                 "reference_ligand": {
                     "identity": plan.reference_ligand.label() if plan.reference_ligand else None,
                     "name": plan.reference_ligand.name if plan.reference_ligand else None,

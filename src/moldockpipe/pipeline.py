@@ -8,7 +8,7 @@ from typing import Collection, Callable
 from .fingerprints import file_sha256, fingerprint
 from .models import ProgressCallback, ProgressEvent, ScreeningPolicy, StageStatus
 from .project import ProjectRepository, utc_now
-from .parallel import bounded_futures, worker_count
+from .parallel import bounded_futures, logical_cpu_count, worker_count
 from .execution_lock import exclusive_project
 from .services.molscrub import MolScrubService
 from .services.meeko import MeekoService
@@ -407,7 +407,7 @@ class PipelineRunner:
             receptor = self.repository.root / str(profile.get("receptor", ""))
             run_settings = {key: value for key, value in profile.items()
                             if key not in {"id", "name", "enabled", "archived", "receptor"} and value is not None}
-            run_settings["cpu"] = run_settings.pop("cpu_count", 1)
+            run_settings["cpu"] = run_settings.pop("cpu_count", logical_cpu_count())
             if backend_name == "vinagpu":
                 run_settings.pop("cpu", None)
                 run_settings.pop("exhaustiveness", None)
