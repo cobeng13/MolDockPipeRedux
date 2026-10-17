@@ -41,6 +41,37 @@ runs; changing MolScrub settings permits another attempt. Disconnected molecular
 fragments fail before generation starts. Failed molecules remain visible in the
 dashboard and do not contribute states to ligand preparation or docking.
 
+## Troubleshooting student installations
+
+Open **Tools → Troubleshooter…** (no project is required), click **Run checks**,
+then copy or save the report. It records the app's Python executable, environment,
+package versions and locations, full errors, and suggested actions. Each check
+runs separately with a time limit, so an import crash does not stop other checks.
+Reports include local file paths; review them before sharing.
+
+The tests parse and embed a molecule with RDKit, generate 3D states through the
+MolScrub worker, prepare an ethanol PDBQT with Meeko, load its receptor/export
+commands, and run tiny docking jobs with Vina CPU and Vina GPU. GPU testing also
+checks the kernel files and exercises the OpenCL runtime. A missing GPU backend
+is expected if only CPU docking is installed. These are smoke tests, not checks
+of scientific docking accuracy or every receptor preparation scenario.
+
+The same checks work without the desktop UI:
+
+```powershell
+python -m moldockpipe doctor --output diagnostics.txt
+python -m moldockpipe doctor --project C:\path\to\project --json --output diagnostics.json
+```
+
+The command exits with code 1 if any check fails, including an unavailable optional
+GPU backend. It uses temporary fixtures and does not change project data.
+
+An installed package is not necessarily importable: a dependency, incompatible
+API, or native DLL may fail at import time. MolScrub errors now retain that cause.
+Compare the report's Python path with the environment where pip was run. Use
+`python -m pip check` and `python -m pip install -e ".[chemistry,dev]"` with that
+same environment activated, then restart the app. RDKit remains Conda-managed.
+
 ## Project Inputs
 
 In the UI, New Project asks for a project name and creates it under `Projects/`

@@ -48,7 +48,7 @@ class MolScrubService:
             raise RuntimeError(result.stderr.strip() or f"MolScrub worker exited with code {result.returncode}")
         response = json.loads(result.stdout)
         if "error" in response:
-            raise RuntimeError(response["error"])
+            raise RuntimeError(response["error"] + ("\n" + result.stderr.strip() if result.stderr.strip() else ""))
         states = []
         for record in response["states"]:
             record["molecule"] = Chem.Mol(base64.b64decode(record["molecule"]))
@@ -72,7 +72,10 @@ class MolScrubService:
             from rdkit import Chem
             from molscrub import Scrub
         except ImportError as exc:
-            raise RuntimeError("MolScrub and RDKit are required for ligand preparation") from exc
+            raise RuntimeError(
+                f"MolScrub/RDKit could not load in {sys.executable}: {type(exc).__name__}: {exc}. "
+                "Open Tools > Troubleshooter for the dependency report."
+            ) from exc
         source = self._source_molecule(smiles)
         scrubber = Scrub(ph_low=ph, ph_high=ph, num_etkdg_attempts=1, use_random_coords=False)
         molecules: Iterable[object] = scrubber(source) if enumerate_states else [source]

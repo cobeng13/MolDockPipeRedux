@@ -62,6 +62,7 @@ class MainWindow(QMainWindow):
         tools_button = QToolButton()
         tools_button.setText("Tools")
         tools_menu = QMenu(tools_button)
+        tools_menu.addAction("Troubleshooter…", self.show_troubleshooter)
         self.prepare_receptor_action = tools_menu.addAction("Receptor Preparation…")
         self.prepare_receptor_action.setEnabled(False)
         self.prepare_receptor_action.triggered.connect(self.prepare_receptor)
@@ -622,6 +623,12 @@ class MainWindow(QMainWindow):
 
     def run_screening(self) -> None:
         self._start_pipeline(["screening"], "Screening")
+
+    def show_troubleshooter(self) -> None:
+        from .troubleshooter import TroubleshooterDialog
+        from ..services.executables import application_root
+
+        TroubleshooterDialog(self.repo.root if self.repo else application_root(), self).exec()
 
     def run_molscrub(self) -> None:
         self._start_pipeline(["molscrub"], "MolScrub")

@@ -5,6 +5,7 @@ import base64
 import contextlib
 import json
 import sys
+import traceback
 
 from .molscrub import MolScrubService
 
@@ -19,6 +20,7 @@ def main() -> None:
                    for state in states]
         response = {"states": records, "truncated": truncated}
     except Exception as exc:
+        traceback.print_exc(file=sys.stderr)
         response = {"error": str(exc)}
     sys.stdout.write(json.dumps(response))
 

@@ -73,7 +73,20 @@ def main() -> int:
         help="Stages to run in order (default: the complete pipeline)",
     )
     subparsers.add_parser("ui", help="Open the desktop UI")
+    doctor = subparsers.add_parser("doctor", help="Test chemistry packages and docking engines")
+    doctor.add_argument("--project", type=Path, default=Path.cwd(), help="Project root for executable discovery")
+    doctor.add_argument("--json", action="store_true", help="Print the report as JSON")
+    doctor.add_argument("--output", type=Path, help="Also save the report to this file")
     args = parser.parse_args()
+    if args.command == "doctor":
+        from .diagnostics import format_report, run_diagnostics
+
+        report = run_diagnostics(args.project)
+        rendered = json.dumps(report, indent=2) if args.json else format_report(report)
+        if args.output:
+            args.output.write_text(rendered, encoding="utf-8")
+        print(rendered)
+        return int(any(check["status"] == "FAIL" for check in report["checks"]))
     if args.command == "create":
         repo = ProjectRepository.create(args.path)
         print(repo.root)

@@ -17,6 +17,7 @@ try:
     from moldockpipe.ui.results_dialog import DockingResultsDialog
     from moldockpipe.ui.settings_dialog import SettingsDialog
     from moldockpipe.ui.workers import PipelineWorker
+    from moldockpipe.ui.troubleshooter import TroubleshooterDialog
     import moldockpipe.ui.workers as workers
 except ImportError as exc:
     pytest.skip(f"Qt UI modules unavailable: {exc}", allow_module_level=True)
@@ -37,6 +38,27 @@ def test_ui_components_import_and_expose_expected_contracts() -> None:
     assert RedockingQueueController is not None
     assert RedockingQueueDialog is not None
     assert DockingResultsDialog is not None
+    assert TroubleshooterDialog is not None
+
+
+def test_troubleshooter_uses_open_project_or_application_root(monkeypatch, tmp_path):
+    import moldockpipe.ui.troubleshooter as troubleshooter
+    from moldockpipe.services import executables
+
+    roots = []
+
+    class Dialog:
+        def __init__(self, root, parent):
+            roots.append(root)
+
+        def exec(self):
+            pass
+
+    monkeypatch.setattr(troubleshooter, "TroubleshooterDialog", Dialog)
+    monkeypatch.setattr(executables, "application_root", lambda: tmp_path / "app")
+    MainWindow.show_troubleshooter(SimpleNamespace(repo=None))
+    MainWindow.show_troubleshooter(SimpleNamespace(repo=SimpleNamespace(root=tmp_path / "project")))
+    assert roots == [tmp_path / "app", tmp_path / "project"]
 
 
 def test_pipeline_worker_routes_requested_stage(monkeypatch, tmp_path) -> None:
