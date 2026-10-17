@@ -8,6 +8,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from ..pipeline import PipelineRunner
 from ..project import ProjectRepository
 from ..execution_lock import project_execution_lock
+from ..models import ProgressEvent
 
 
 class VinaWorker(QObject):
@@ -43,7 +44,7 @@ class PipelineWorker(QObject):
         """Bound routine Qt updates while always delivering failures and boundaries."""
         now = monotonic()
         kind = getattr(event, "event", "")
-        important = (kind in {"stage_started", "planning_completed", "stage_completed", "item_failed"}
+        important = (kind in {"stage_preparing", "stage_started", "planning_completed", "stage_completed", "item_failed"}
                      or (kind == "item_skipped" and getattr(event, "failed", 0))
                      or getattr(event, "index", 0) == getattr(event, "total", 0))
         if important or now - self._last_progress_at >= 0.1:
@@ -75,5 +76,11 @@ class PipelineWorker(QObject):
         summary = {}
         for stage in ("screening", "molscrub", "meeko", "vina", "postdock"):
             if (stage != "postdock" and not self.stages) or (self.stages and stage in self.stages):
+                if self.cancel_event.is_set():
+                    raise InterruptedError("Pipeline stopped safely")
+                self._report_progress(ProgressEvent("stage_preparing", stage,
+                    message=f"Preparing {stage}; loading dependencies and reading project inputs"))
+                if self.cancel_event.is_set():
+                    raise InterruptedError("Pipeline stopped safely")
                 summary[stage] = getattr(runner, f"run_{stage}")()
         return summary

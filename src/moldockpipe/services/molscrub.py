@@ -8,6 +8,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Iterable
+from time import monotonic
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,40 @@ class GeneratedState:
 
 
 class MolScrubService:
+    @staticmethod
+    def version(*, cancelled=None, timeout_seconds: float = 30) -> str:
+        """Read the exact legacy version value without an unbounded native import."""
+        if cancelled and cancelled():
+            raise InterruptedError("Pipeline stopped while loading MolScrub dependencies")
+        process = subprocess.Popen(
+            [sys.executable, "-m", "moldockpipe.services.molscrub_worker", "--version"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        deadline = monotonic() + timeout_seconds
+        try:
+            while True:
+                if cancelled and cancelled():
+                    raise InterruptedError("Pipeline stopped while loading MolScrub dependencies")
+                if monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Loading MolScrub dependencies exceeded {timeout_seconds:g}s in {sys.executable}. "
+                        "Open Tools > Troubleshooter to check this Python environment."
+                    )
+                try:
+                    stdout, stderr = process.communicate(timeout=0.1)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        except BaseException:
+            process.kill()
+            process.communicate()
+            raise
+        if process.returncode:
+            raise RuntimeError(f"MolScrub dependency check failed in {sys.executable}: {stderr.strip()}")
+        return json.loads(stdout)["version"]
+
     def generate(self, smiles: str, *, ph: float = 7.4, enumerate_states: bool = True, max_states: int = 32,
                  timeout_seconds: float = 15) -> tuple[list[GeneratedState], bool]:
         """Bound slow chemistry in a process that can be stopped on timeout."""

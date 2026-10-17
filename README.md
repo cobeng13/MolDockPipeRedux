@@ -78,6 +78,13 @@ Compare the report's Python path with the environment where pip was run. Use
 `python -m pip check` and `python -m pip install -e ".[chemistry,dev]"` with that
 same environment activated, then restart the app. RDKit remains Conda-managed.
 
+If a resumed run appears to pause after screening, the task display now names
+the next stage before its setup begins. MolScrub dependency loading runs in a
+separate process with a 30-second limit and responds to Stop; a stalled import
+produces a troubleshooting error instead of waiting indefinitely. Completed
+stages retain 100% progress. Active dashboard refreshes do not scan export
+directories; existing export checks remain in the export workflow.
+
 ## Project Inputs
 
 In the UI, New Project asks for a project name and creates it under `Projects/`

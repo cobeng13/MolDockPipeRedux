@@ -5,6 +5,82 @@ from moldockpipe.pipeline import PipelineRunner
 from moldockpipe.project import ProjectRepository
 
 
+def test_version_probe_preserves_fingerprint_version_value():
+    molscrub = pytest.importorskip("molscrub")
+    assert MolScrubService.version() == getattr(molscrub, "__version__", "unknown")
+
+
+@pytest.mark.parametrize("failure", ["timeout", "cancelled", "native_crash"])
+def test_version_probe_is_bounded_and_cancellable(monkeypatch, failure):
+    import subprocess
+    import moldockpipe.services.molscrub as service
+
+    class Process:
+        returncode = -1073741819 if failure == "native_crash" else None
+        killed = False
+        def communicate(self, timeout=None):
+            if self.killed or failure == "native_crash":
+                return "", "native DLL failure"
+            raise subprocess.TimeoutExpired("version check", timeout)
+        def kill(self): self.killed = True
+
+    process = Process()
+    monkeypatch.setattr(service.subprocess, "Popen", lambda *args, **kwargs: process)
+    ticks = iter([0, 0, 31])
+    monkeypatch.setattr(service, "monotonic", lambda: next(ticks))
+    cancelled = iter([False, True])
+    exception = {"timeout": TimeoutError, "cancelled": InterruptedError, "native_crash": RuntimeError}[failure]
+    with pytest.raises(exception) as error:
+        MolScrubService.version(cancelled=(lambda: next(cancelled)) if failure == "cancelled" else None)
+    assert process.killed == (failure != "native_crash")
+    if failure == "timeout":
+        assert "Troubleshooter" in str(error.value)
+    elif failure == "native_crash":
+        assert "native DLL failure" in str(error.value)
+
+
+def test_version_worker_preserves_unknown_on_import_error(monkeypatch, capsys):
+    import builtins
+    import json
+    from moldockpipe.services import molscrub_worker
+
+    original = builtins.__import__
+    def broken(name, *args, **kwargs):
+        if name == "molscrub":
+            raise ImportError("missing transitive dependency")
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", broken)
+    monkeypatch.setattr("sys.argv", ["molscrub_worker", "--version"])
+    molscrub_worker.main()
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"version": "unknown"}
+    assert "missing transitive dependency" in captured.err
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_hung_dependency_process_is_actually_stopped(monkeypatch, cancel):
+    import sys
+    import subprocess
+    from time import monotonic
+    import moldockpipe.services.molscrub as service
+
+    real_popen = subprocess.Popen
+    children = []
+    def hung_import(command, **kwargs):
+        process = real_popen([sys.executable, "-c", "import time; time.sleep(60)"], **kwargs)
+        children.append(process)
+        return process
+    monkeypatch.setattr(service.subprocess, "Popen", hung_import)
+    started = monotonic()
+    with pytest.raises(InterruptedError if cancel else TimeoutError):
+        MolScrubService.version(
+            timeout_seconds=30 if cancel else 0.2,
+            cancelled=(lambda: monotonic() - started > 0.2) if cancel else None,
+        )
+    assert len(children) == 1
+    assert children[0].poll() is not None
+
+
 def test_non_enumerating_generation_preserves_a_single_state() -> None:
     pytest.importorskip("rdkit")
     pytest.importorskip("molscrub")

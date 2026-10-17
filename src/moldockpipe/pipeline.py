@@ -252,11 +252,11 @@ class PipelineRunner:
                 ORDER BY p.parent_id""").fetchall()
         allowed = [row for row in rows if row["decision"] not in ("fail", None) or policy == ScreeningPolicy.ANNOTATE_ONLY.value]
         service = MolScrubService()
-        try:
-            import molscrub
-            version = getattr(molscrub, "__version__", "unknown")
-        except ImportError:
-            version = "unknown"
+        version = getattr(self, "_molscrub_tool_version", None)
+        if version is None:
+            self._emit("stage_preparing", "molscrub", message="Loading MolScrub dependencies (30-second limit; Stop is available)")
+            version = service.version(cancelled=self.cancelled)
+        self._molscrub_tool_version = version
         created = failed = skipped = 0
         completed = 0
         workers = worker_count(settings, len(allowed))
@@ -340,11 +340,9 @@ class PipelineRunner:
 
     def _persist_states(self, parent_id: str, states: list[object], truncated: bool, settings: dict[str, object]) -> None:
         from rdkit import Chem
-        try:
-            import molscrub
-            version = getattr(molscrub, "__version__", "unknown")
-        except ImportError:
-            version = "unknown"
+        version = getattr(self, "_molscrub_tool_version", None)
+        if version is None:
+            version = MolScrubService.version(cancelled=self.cancelled)
         with self.repository.connection() as conn:
             conn.execute("UPDATE molecular_states SET active=0 WHERE parent_id=?", (parent_id,))
             conn.execute("""UPDATE docking_runs SET is_current=0 WHERE state_id IN

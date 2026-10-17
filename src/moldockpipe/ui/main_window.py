@@ -520,13 +520,16 @@ class MainWindow(QMainWindow):
                 FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id
                 LEFT JOIN docking_poses p ON p.run_id=d.run_id
                 WHERE s.active=1 AND d.status IN ('failed','interrupted') GROUP BY d.run_id, s.state_id ORDER BY s.state_id LIMIT 6""").fetchall()
+            # Directory scans belong to idle refreshes. Walking thousands of
+            # exports here prevents Qt from delivering queued stage updates or Stop.
+            checking_exports = not self.stage_running
             docked_exports = [tuple(row) for row in conn.execute(f"""SELECT DISTINCT d.receptor_profile_id, s.parent_id, s.state_id, d.run_id
                 FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id JOIN parent_ligands p USING(parent_id)
                 WHERE s.active=1 AND d.status='completed' AND d.is_current=1
-                AND d.receptor_profile_id IN ({placeholders})""", profile_ids).fetchall()] if profile_ids else []
+                AND d.receptor_profile_id IN ({placeholders})""", profile_ids).fetchall()] if profile_ids and checking_exports else []
             validated_profiles = {str(row[0]) for row in conn.execute(
                 "SELECT DISTINCT receptor_profile_id FROM redocking_runs WHERE status='ARTIFACTS_READY'"
-            ).fetchall()}
+            ).fetchall()} if checking_exports else set()
         self.stat_cards["ligands"].setText(str(parents))
         self.stat_cards["passed"].setText(str(passed))
         self.stat_cards["failed"].setText(str(failed_ligands))
@@ -548,22 +551,23 @@ class MainWindow(QMainWindow):
         exported_root = self.repo.root / "For_PostDocking"
         mode = str(self.repo.get_settings().get("postdock", {}).get("mode", "split_and_sdf"))
         expected = ("PDBQTs",) if mode == "split_only" else ("SDF",) if mode == "sdf_only" else ("SDF", "PDBQTs")
-        pending_exports = []
+        pending_export = False
         for profile_id, parent_id, state_id, run_id in docked_exports:
             def complete(folder: str) -> bool:
                 target = exported_root / profile_id / folder / parent_id / state_id / run_id
                 suffix = "*.sdf" if folder == "SDF" else "*.pdbqt"
                 return target.is_dir() and any(target.glob(suffix))
             if not all(complete(folder) for folder in expected):
-                pending_exports.append((profile_id, parent_id, state_id, run_id))
+                pending_export = True
+                break
         profile_names = {str(profile["id"]): str(profile.get("name", profile["id"])) for profile in profiles}
         package_update_needed = any(
             not (exported_root / profile_id / receptor_export_filename(profile_names[profile_id])).is_file()
             or (profile_id in validated_profiles and not (exported_root / profile_id / "reference_ligand_heavy.mol2").is_file())
             for profile_id in {str(row[0]) for row in docked_exports}
         )
-        has_docking_exports = bool(docked_exports)
-        export_status = "Ready" if pending_exports or package_update_needed else "Complete" if has_docking_exports else "Pending"
+        has_docking_exports = bool(docked_exports) if checking_exports else bool(docking_passed)
+        export_status = ("Ready" if not checking_exports or pending_export or package_update_needed else "Complete") if has_docking_exports else "Pending"
         # Completed results remain exportable so users can refresh an existing
         # package when bundle contents or export settings change.
         self.docked_export_action.setEnabled(has_docking_exports)
@@ -679,6 +683,8 @@ class MainWindow(QMainWindow):
 
     def _pipeline_stopped(self) -> None:
         self.stage_running = False
+        self.stage_progress.setRange(0, 100)
+        self.stage_progress.setFormat("Stopped")
         self._set_stage_actions(True)
         self.run_all_action.setEnabled(True)
         self.refresh_action.setEnabled(True)
@@ -740,16 +746,27 @@ class MainWindow(QMainWindow):
         self.receptors_action.setEnabled(enabled)
 
     def _on_pipeline_progress(self, event: object) -> None:
-        stage_index = {"screening": 0, "molscrub": 1, "meeko": 2, "vina": 3, "postdock": 3}
+        kind = getattr(event, "event", "")
         stage = getattr(event, "stage", "")
         index = getattr(event, "index", 0)
         total = getattr(event, "total", 0)
-        if total:
+        if kind == "stage_preparing":
+            self.stage_started_at = time.monotonic()
+            self.stage_progress.setRange(0, 0)
+            self.stage_progress.setFormat("Preparing…")
+        elif kind == "stage_completed":
+            index = total
+            self.stage_progress.setRange(0, 100)
+            self.stage_progress.setValue(100)
+            self.stage_progress.setFormat(f"{total} / {total}   %p%")
+        elif total:
+            self.stage_progress.setRange(0, 100)
             self.stage_progress.setValue(int(index * 100 / total))
             self.stage_progress.setFormat(f"{index} / {total}   %p%")
         if getattr(event, "event", "") == "stage_started":
+            self.stage_progress.setRange(0, 100)
+            self.stage_started_at = time.monotonic()
             self.overall_progress.start_stage(stage)
-            self._update_dashboard(*self._dashboard_values)
         elif getattr(event, "event", "") == "stage_completed":
             if getattr(event, "failed", 0):
                 self.overall_progress.states[stage] = "warning"
@@ -762,9 +779,15 @@ class MainWindow(QMainWindow):
         profile_name = getattr(event, "receptor_profile_name", None)
         item_text = str(getattr(event, "item_id", "") or "")
         self.current_item_label.setText(f"{profile_name}: {item_text}" if profile_name else item_text)
-        self.current_task_label.setText(f"{display_stage}\n{self.current_item_label.text()}\n{index} / {total}")
+        detail = getattr(event, "message", "") if kind in {"stage_preparing", "stage_started", "planning_completed"} else self.current_item_label.text()
+        self.current_task_label.setText(f"{display_stage}\n{detail}\n{index} / {total}" if kind != "stage_preparing" else f"{display_stage}\n{detail}")
         self.dashboard_status.setText(self.current_stage_label.text())
         self.stat_cards["running"].setText("Running")
+        if kind == "stage_preparing":
+            self.statusBar().showMessage(f"{stage}: {detail}")
+            self._write_log(f"{stage}: {detail}")
+            # Show the handoff immediately, without blocking behind dashboard I/O.
+            return
         if total and index:
             elapsed = max(time.monotonic() - self.stage_started_at, 0.1)
             rate = index / elapsed * 60
@@ -786,7 +809,8 @@ class MainWindow(QMainWindow):
             self._write_log(self._event_summary(event))
         if getattr(event, "event", "") == "stage_completed":
             self.refresh_tables()
-            self._refresh_checkpoint_state()
+            if not getattr(self, "stage_running", False):
+                self._refresh_checkpoint_state()
 
     def _pipeline_finished(self, summary: object) -> None:
         self.stage_running = False
@@ -799,6 +823,7 @@ class MainWindow(QMainWindow):
         else:
             stage = next(iter(summary), "") if isinstance(summary, dict) else ""
             self.overall_progress.complete_stage(stage)
+        self.stage_progress.setRange(0, 100)
         self.stage_progress.setValue(100)
         self.current_stage_label.setText("Idle")
         self.current_item_label.setText("")
@@ -816,6 +841,13 @@ class MainWindow(QMainWindow):
 
     def _pipeline_failed(self, message: str) -> None:
         self.stage_running = False
+        self.stage_progress.setRange(0, 100)
+        self.stage_progress.setValue(0)
+        self.stage_progress.setFormat("Stopped")
+        self.current_stage_label.setText("Failed")
+        self.current_item_label.setText("")
+        self.current_task_label.setText(f"Stopped: {message}")
+        self.dashboard_status.setText("Pipeline failed")
         self._set_stage_actions(True)
         self.run_all_action.setEnabled(True)
         self.refresh_action.setEnabled(True)

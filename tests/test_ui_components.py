@@ -152,6 +152,9 @@ def test_bulk_progress_is_throttled_without_losing_failures_or_boundaries(monkey
     planned = ProgressEvent("planning_completed", "meeko", total=20, skipped=4980)
     worker._report_progress(planned)
     assert delivered[-1] == planned
+    preparing = ProgressEvent("stage_preparing", "molscrub", message="Loading dependencies")
+    worker._report_progress(preparing)
+    assert delivered[-1] == preparing
 
 
 def test_dashboard_queries_are_bounded_during_bulk_progress(monkeypatch):
@@ -161,21 +164,26 @@ def test_dashboard_queries_are_bounded_during_bulk_progress(monkeypatch):
     class Sink:
         def setText(self, value): self.value = value
         def text(self): return getattr(self, "value", "")
-        def setValue(self, value): pass
-        def setFormat(self, value): pass
+        def setValue(self, value): self.value = value
+        def setFormat(self, value): self.format = value
+        def setRange(self, low, high): self.range = (low, high)
         def showMessage(self, value): pass
 
     refreshes, checkpoints = [], []
     fake = SimpleNamespace(
         stage_progress=Sink(), current_stage_label=Sink(), current_item_label=Sink(),
         current_task_label=Sink(), dashboard_status=Sink(), stat_cards={"running": Sink()},
-        stage_started_at=0.0, _refresh_live_dashboard=lambda: refreshes.append(1),
+        stage_started_at=0.0, stage_running=True, _refresh_live_dashboard=lambda: refreshes.append(1),
         statusBar=lambda: Sink(), refresh_tables=lambda: None,
         _refresh_checkpoint_state=lambda: checkpoints.append(1),
         overall_progress=SimpleNamespace(complete_stage=lambda stage: None),
         _write_log=lambda message: None, _event_summary=lambda event: "finished",
     )
     monkeypatch.setattr(main_window.time, "monotonic", lambda: 10.0)
+    MainWindow._on_pipeline_progress(fake, ProgressEvent("stage_preparing", "molscrub", message="Loading dependencies"))
+    assert fake.current_stage_label.value == "Molecular States"
+    assert fake.stage_progress.range == (0, 0)
+    assert refreshes == []
     for index in range(1, 5001):
         MainWindow._on_pipeline_progress(fake, ProgressEvent("item_succeeded", "screening", str(index), index, 5000))
     assert len(refreshes) == 1
@@ -184,7 +192,9 @@ def test_dashboard_queries_are_bounded_during_bulk_progress(monkeypatch):
     assert len(refreshes) == 2
     MainWindow._on_pipeline_progress(fake, ProgressEvent("stage_completed", "screening", total=5000))
     assert len(refreshes) == 3
-    assert checkpoints == [1]
+    assert checkpoints == []  # do not rebuild the whole dashboard between stages
+    assert fake.stage_progress.value == 100
+    assert fake.stage_progress.format == "5000 / 5000   %p%"
 
 
 def test_docking_completion_distinguishes_new_work_from_reuse():
