@@ -150,6 +150,60 @@ def test_failed_attempt_does_not_hide_matching_completed_docking(docking_cache_p
         assert conn.execute("SELECT run_id FROM docking_runs WHERE is_current=1").fetchone()[0] == original
 
 
+@pytest.mark.parametrize("change", ["unchanged", "history", "pose", "pose_metadata", "legacy", "ligand"])
+def test_bulk_docking_candidates_make_same_reuse_decision_as_per_item_query(docking_cache_project, change):
+    from moldockpipe.fingerprints import file_sha256, fingerprint
+    from moldockpipe.pipeline import _docking_parameters
+
+    p = docking_cache_project
+    p.runner.run_vina()
+    if change == "history":
+        p.profile["size_x"] += 1
+        p.repo.save_receptor_profiles([p.profile])
+        p.runner.run_vina()
+        p.profile["size_x"] -= 1
+        p.repo.save_receptor_profiles([p.profile])
+    with p.repo.connection() as conn:
+        if change == "pose_metadata":
+            conn.execute("DELETE FROM docking_poses")
+        elif change == "legacy":
+            record = conn.execute("SELECT command_json FROM docking_runs").fetchone()
+            command = json.loads(record[0])
+            command.pop("inputs")
+            fp = fingerprint(settings=command["settings"], inputs={"receptor": file_sha256(p.receptor)},
+                             tool_version=file_sha256(p.executable))
+            conn.execute("UPDATE docking_runs SET command_json=?,settings_fingerprint=?", (json.dumps(command), fp))
+        elif change == "pose":
+            relative = conn.execute("SELECT relative_path FROM artifacts WHERE artifact_type='vina_output_pdbqt'").fetchone()[0]
+            (p.repo.root / relative).write_text("damaged")
+    if change == "ligand":
+        p.ligand.write_text("new coordinates")
+    with p.repo.connection() as conn:
+        states = conn.execute("SELECT state_id,parent_id FROM molecular_states WHERE active=1").fetchall()
+    state, prepared, candidates = next(p.runner._docking_plan_rows(states, "rec1"))
+    receptor_hash, tool_hash, ligand_hash = map(file_sha256, (p.receptor, p.executable, p.ligand))
+    run_settings = {key: value for key, value in p.profile.items()
+                    if key not in {"id", "name", "enabled", "archived", "receptor"} and value is not None}
+    run_settings["cpu"] = run_settings.pop("cpu_count")
+    parameters = _docking_parameters(run_settings, "vina")
+    settings_fp = fingerprint(settings=parameters, inputs={"receptor": receptor_hash, "ligand": ligand_hash}, tool_version=tool_hash)
+    args = (state["state_id"], "rec1", settings_fp, parameters, receptor_hash, tool_hash, "vina", p.ligand, ligand_hash)
+    # The original per-item reader remains the compatibility fallback; the
+    # optimized batch reader must return the exact same winning history entry.
+    old = p.runner._reusable_docking(*args)
+    new = p.runner._reusable_docking(*args, prepared=prepared, candidates=candidates)
+    assert (dict(new) if new else None) == (dict(old) if old else None)
+
+
+def test_bulk_docking_duplicate_state_observes_newly_completed_run(docking_cache_project):
+    p = docking_cache_project
+    with p.repo.connection() as conn:
+        row = conn.execute("SELECT sdf_artifact_id FROM conformers LIMIT 1").fetchone()
+        conn.execute("INSERT INTO conformers VALUES ('duplicate','state1',2,?,'pdbqt_ready','now')", (row[0],))
+    assert p.runner.run_vina() == (2, 0)
+    assert p.calls == [1]  # the duplicate reuses the first occurrence's new result
+
+
 def test_increasing_generation_timeout_preserves_completed_states(tmp_path, monkeypatch):
     pytest.importorskip("rdkit")
     pytest.importorskip("molscrub")

@@ -41,6 +41,12 @@ runs; changing MolScrub settings permits another attempt. Disconnected molecular
 fragments fail before generation starts. Failed molecules remain visible in the
 dashboard and do not contribute states to ligand preparation or docking.
 
+Resume planning batches screening, MolScrub, Meeko and docking metadata reads
+while retaining the existing fingerprints and full artifact-hash checks. Meeko
+shares missing-directory resolution during preflight and checks cancellation
+before dispatch. See [resume planning](docs/resume-planning.md) for behavior,
+validation and the separate persistent-work architecture proposal.
+
 ## Troubleshooting student installations
 
 Open **Tools → Troubleshooter…** (no project is required), click **Run checks**,

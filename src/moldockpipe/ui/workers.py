@@ -43,7 +43,7 @@ class PipelineWorker(QObject):
         """Bound routine Qt updates while always delivering failures and boundaries."""
         now = monotonic()
         kind = getattr(event, "event", "")
-        important = (kind in {"stage_started", "stage_completed", "item_failed"}
+        important = (kind in {"stage_started", "planning_completed", "stage_completed", "item_failed"}
                      or (kind == "item_skipped" and getattr(event, "failed", 0))
                      or getattr(event, "index", 0) == getattr(event, "total", 0))
         if important or now - self._last_progress_at >= 0.1:

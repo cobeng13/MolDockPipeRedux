@@ -149,6 +149,9 @@ def test_bulk_progress_is_throttled_without_losing_failures_or_boundaries(monkey
     update = ProgressEvent("item_succeeded", "meeko", "next", 1, 5000)
     worker._report_progress(update)
     assert delivered[-1] == update
+    planned = ProgressEvent("planning_completed", "meeko", total=20, skipped=4980)
+    worker._report_progress(planned)
+    assert delivered[-1] == planned
 
 
 def test_dashboard_queries_are_bounded_during_bulk_progress(monkeypatch):

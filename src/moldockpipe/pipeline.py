@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
+from collections import defaultdict
 from pathlib import Path
 from typing import Collection, Callable
 
@@ -17,6 +19,40 @@ from .services.validation import validate_pdbqt
 from .services.vina import VinaDockingBackend, find_vina_executable, find_vina_split_executable
 from .services.vinagpu import VinaGpuDockingBackend, find_vinagpu_executable, vinagpu_tool_hash
 from .services.postdock import PostDockService, receptor_export_filename
+
+
+PLANNING_BATCH_SIZE = 256
+
+
+def _resolve_destination(path: Path, cache: dict[Path, Path]) -> Path:
+    """Resolve existing paths normally; share ancestor work for missing outputs.
+
+    A missing output need not repeatedly resolve the same missing directories.
+    Existing entries (including symlinks, junctions and Windows aliases) still
+    use Path.resolve(), preserving physical destination collision checks.
+    The cache belongs only to the read-only preflight, before any worker writes.
+    """
+    if os.name == "nt":
+        # Windows realpath normalizes '..' before following junctions/links;
+        # POSIX realpath follows each component before interpreting '..'.
+        path = Path(os.path.normpath(path))
+    if path in cache:
+        return cache[path]
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        if path.parent == path:
+            resolved = path.resolve()
+        else:
+            parent = _resolve_destination(path.parent, cache)
+            resolved = parent.parent if path.name == ".." else parent / path.name
+    except OSError:
+        # Retain pathlib's platform-specific error handling for other failures.
+        resolved = path.resolve()
+    else:
+        resolved = path.resolve()
+    cache[path] = resolved
+    return resolved
 
 
 def _docking_parameters(settings: dict[str, object], backend: str) -> dict[str, object]:
@@ -55,18 +91,86 @@ class PipelineRunner:
         path = self.repository.root / relative_path
         return path.is_file() and file_sha256(path) == sha256
 
+    def _molscrub_plan_rows(self, rows):
+        """Read history/states in bounded batches without changing reuse rules."""
+        for offset in range(0, len(rows), PLANNING_BATCH_SIZE):
+            self._check_cancelled()
+            batch = rows[offset:offset + PLANNING_BATCH_SIZE]
+            ids = [row["parent_id"] for row in batch]
+            placeholders = ",".join("?" for _ in ids)
+            with self.repository.connection() as conn:
+                latest = {row["entity_id"]: row for row in conn.execute(f"""
+                    SELECT entity_id,fingerprint,status,reason FROM stage_runs WHERE rowid IN (
+                        SELECT MAX(rowid) FROM stage_runs WHERE stage_name='molscrub'
+                        AND entity_type='parent' AND entity_id IN ({placeholders}) GROUP BY entity_id)
+                    """, ids)}
+                states = defaultdict(list)
+                for state in conn.execute(f"""SELECT s.parent_id,s.state_structure_hash,s.generation_fingerprint,
+                    a.relative_path,a.sha256 FROM molecular_states s LEFT JOIN conformers c ON c.state_id=s.state_id
+                    LEFT JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id
+                    WHERE s.parent_id IN ({placeholders}) AND s.active=1""", ids):
+                    states[state["parent_id"]].append(state)
+            for row in batch:
+                yield row, latest.get(row["parent_id"]), states[row["parent_id"]]
+
+    def _meeko_plan_rows(self, rows):
+        for offset in range(0, len(rows), PLANNING_BATCH_SIZE):
+            self._check_cancelled()
+            batch = rows[offset:offset + PLANNING_BATCH_SIZE]
+            paths = [(self.repository.root / "artifacts" / "pdbqt" / row["parent_id"] /
+                      row["state_id"] / "ligand.pdbqt").relative_to(self.repository.root).as_posix()
+                     for row in batch]
+            with self.repository.connection() as conn:
+                artifacts = {artifact["relative_path"]: artifact for artifact in conn.execute(
+                    f"SELECT relative_path,sha256 FROM artifacts WHERE active=1 AND relative_path IN ({','.join('?' for _ in paths)})",
+                    paths)}
+            for row, path in zip(batch, paths):
+                yield row, artifacts.get(path)
+
+    def _docking_plan_rows(self, states, profile_id):
+        seen = set()
+        for offset in range(0, len(states), PLANNING_BATCH_SIZE):
+            self._check_cancelled()
+            batch = states[offset:offset + PLANNING_BATCH_SIZE]
+            ids = [state["state_id"] for state in batch]
+            paths = [(self.repository.root / "artifacts" / "pdbqt" / state["parent_id"] /
+                      state["state_id"] / "ligand.pdbqt").relative_to(self.repository.root).as_posix()
+                     for state in batch]
+            placeholders = ",".join("?" for _ in ids)
+            with self.repository.connection() as conn:
+                prepared = {row["relative_path"]: row for row in conn.execute(
+                    f"SELECT relative_path,sha256 FROM artifacts WHERE active=1 AND relative_path IN ({placeholders})", paths)}
+                candidates = defaultdict(list)
+                for run in conn.execute(f"""SELECT d.*,raw.relative_path AS raw_path,raw.sha256 AS raw_sha256
+                    FROM docking_runs d JOIN artifacts raw ON raw.artifact_id=d.raw_output_artifact_id
+                    WHERE d.state_id IN ({placeholders}) AND d.receptor_profile_id=? AND d.status='completed'
+                    AND EXISTS (SELECT 1 FROM docking_poses p WHERE p.run_id=d.run_id)
+                    ORDER BY d.is_current DESC,d.rowid DESC""", [*ids, profile_id]):
+                    candidates[run["state_id"]].append(run)
+            for state, path in zip(batch, paths):
+                # Old/imported projects may contain several conformers per
+                # state. A preceding occurrence may just have written a run;
+                # retain the original live lookup for duplicate occurrences.
+                if state["state_id"] in seen:
+                    yield state, None, None
+                else:
+                    seen.add(state["state_id"])
+                    yield state, prepared.get(path), candidates[state["state_id"]]
+
     def _reusable_docking(self, state_id: str, profile_id: str, settings_fp: str,
                           parameters: dict[str, object], receptor_hash: str,
-                          tool_hash: str, backend: str, ligand: Path, ligand_hash: str):
-        with self.repository.connection() as conn:
-            prepared = conn.execute("SELECT sha256 FROM artifacts WHERE relative_path=? AND active=1",
-                                   (ligand.relative_to(self.repository.root).as_posix(),)).fetchone()
-            candidates = conn.execute("""SELECT d.*, raw.relative_path AS raw_path,
-                raw.sha256 AS raw_sha256 FROM docking_runs d
-                JOIN artifacts raw ON raw.artifact_id=d.raw_output_artifact_id
-                WHERE d.state_id=? AND d.receptor_profile_id=? AND d.status='completed'
-                AND EXISTS (SELECT 1 FROM docking_poses p WHERE p.run_id=d.run_id)
-                ORDER BY d.is_current DESC, d.rowid DESC""", (state_id, profile_id)).fetchall()
+                          tool_hash: str, backend: str, ligand: Path, ligand_hash: str,
+                          *, candidates=None, prepared=None):
+        if candidates is None:
+            with self.repository.connection() as conn:
+                prepared = conn.execute("SELECT sha256 FROM artifacts WHERE relative_path=? AND active=1",
+                                       (ligand.relative_to(self.repository.root).as_posix(),)).fetchone()
+                candidates = conn.execute("""SELECT d.*, raw.relative_path AS raw_path,
+                    raw.sha256 AS raw_sha256 FROM docking_runs d
+                    JOIN artifacts raw ON raw.artifact_id=d.raw_output_artifact_id
+                    WHERE d.state_id=? AND d.receptor_profile_id=? AND d.status='completed'
+                    AND EXISTS (SELECT 1 FROM docking_poses p WHERE p.run_id=d.run_id)
+                    ORDER BY d.is_current DESC, d.rowid DESC""", (state_id, profile_id)).fetchall()
         for run in candidates:
             matches = run["settings_fingerprint"] == settings_fp
             if (not matches and run["is_current"] and run["receptor_hash"] == receptor_hash
@@ -97,18 +201,19 @@ class PipelineRunner:
             raise RuntimeError("RDKit must be installed before screening") from exc
         completed = failed = 0
         with self.repository.connection() as conn:
-            parents = conn.execute("SELECT parent_id, source_smiles FROM parent_ligands ORDER BY parent_id").fetchall()
+            parents = conn.execute("""SELECT p.parent_id,p.source_smiles,
+                s.fingerprint AS previous_fingerprint,s.status AS previous_status
+                FROM parent_ligands p LEFT JOIN screening_results s ON s.parent_id=p.parent_id AND s.active=1
+                ORDER BY p.parent_id""").fetchall()
         self._emit("stage_started", "screening", total=len(parents))
         skipped = 0
         for index, parent in enumerate(parents, 1):
             self._check_cancelled()
             self._emit("item_started", "screening", parent["parent_id"], index, len(parents))
             run_fingerprint = fingerprint(settings={"enabled": enabled, "policy": policy.value}, inputs={"smiles": parent["source_smiles"]}, tool_version=rdkit_version)
-            with self.repository.connection() as conn:
-                previous = conn.execute("SELECT fingerprint,status FROM screening_results WHERE parent_id=? AND active=1", (parent["parent_id"],)).fetchone()
-            if previous and previous["fingerprint"] == run_fingerprint and previous["status"] in (StageStatus.COMPLETED, StageStatus.FAILED):
+            if parent["previous_fingerprint"] == run_fingerprint and parent["previous_status"] in (StageStatus.COMPLETED, StageStatus.FAILED):
                 skipped += 1
-                if previous["status"] == StageStatus.COMPLETED:
+                if parent["previous_status"] == StageStatus.COMPLETED:
                     completed += 1
                 else:
                     failed += 1
@@ -163,19 +268,11 @@ class PipelineRunner:
 
         def jobs():
             nonlocal created, failed, skipped, completed
-            for row in allowed:
+            for row, previous, existing in self._molscrub_plan_rows(allowed):
                 if self.cancelled and self.cancelled():
                     return
                 run_fingerprint = fingerprint(settings=cache_settings,
                     inputs={"smiles": row["source_smiles"]}, tool_version=version)
-                with self.repository.connection() as conn:
-                    previous = conn.execute("""SELECT fingerprint,status,reason FROM stage_runs
-                        WHERE stage_name='molscrub' AND entity_type='parent' AND entity_id=?
-                        ORDER BY rowid DESC LIMIT 1""", (row["parent_id"],)).fetchone()
-                    existing = conn.execute("""SELECT s.state_structure_hash,s.generation_fingerprint,
-                        a.relative_path,a.sha256 FROM molecular_states s LEFT JOIN conformers c ON c.state_id=s.state_id
-                        LEFT JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id
-                        WHERE s.parent_id=? AND s.active=1""", (row["parent_id"],)).fetchall()
                 if not retry_failed and previous and previous["status"] == StageStatus.FAILED and previous["fingerprint"] == run_fingerprint:
                     failed += 1
                     skipped += 1
@@ -281,29 +378,31 @@ class PipelineRunner:
         settings = self.repository.get_settings().get("meeko", {})
         with self.repository.connection() as conn:
             all_states = conn.execute("SELECT COUNT(*) FROM molecular_states WHERE active=1").fetchone()[0]
-            rows = conn.execute("""SELECT s.state_id, s.parent_id, c.conformer_id, a.relative_path
+            rows = conn.execute("""SELECT s.state_id, s.parent_id, c.conformer_id, c.status AS conformer_status,a.relative_path
                 FROM molecular_states s JOIN conformers c ON c.state_id=s.state_id
                 JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id WHERE s.active=1 AND a.active=1
                 ORDER BY s.parent_id, s.state_id""").fetchall()
-            reusable = set()
-            destinations: dict[Path, str] = {}
-            for row in rows:
-                pdbqt = self.repository.root / "artifacts" / "pdbqt" / row["parent_id"] / row["state_id"] / "ligand.pdbqt"
-                log = self.repository.root / "logs" / "meeko" / f"{row['state_id']}.log"
-                for destination in (pdbqt.resolve(), log.resolve()):
-                    if destination in destinations:
-                        raise ValueError("Multiple Meeko preparation jobs target the same output file: "
-                                         f"{destinations[destination]} and {row['conformer_id']}. "
-                                         "Each state must have one active conformer.")
-                    destinations[destination] = row["conformer_id"]
-                artifact = conn.execute("SELECT relative_path,sha256 FROM artifacts WHERE relative_path=? AND active=1",
-                    (pdbqt.relative_to(self.repository.root).as_posix(),)).fetchone()
-                conformer = conn.execute("SELECT status FROM conformers WHERE conformer_id=?", (row["conformer_id"],)).fetchone()
-                if conformer["status"] == "pdbqt_ready" and artifact and self._artifact_matches(artifact["relative_path"], artifact["sha256"]):
-                    reusable.add(row["conformer_id"])
-            rows = [row for row in rows if row["conformer_id"] not in reusable]
+        self._emit("stage_started", "meeko", total=len(rows), message="Checking existing ligand outputs")
+        reusable = set()
+        destinations: dict[Path, str] = {}
+        resolved_paths: dict[Path, Path] = {}
+        for row, artifact in self._meeko_plan_rows(rows):
+            self._check_cancelled()
+            pdbqt = self.repository.root / "artifacts" / "pdbqt" / row["parent_id"] / row["state_id"] / "ligand.pdbqt"
+            log = self.repository.root / "logs" / "meeko" / f"{row['state_id']}.log"
+            for destination in (_resolve_destination(pdbqt, resolved_paths), _resolve_destination(log, resolved_paths)):
+                if destination in destinations:
+                    raise ValueError("Multiple Meeko preparation jobs target the same output file: "
+                                     f"{destinations[destination]} and {row['conformer_id']}. "
+                                     "Each state must have one active conformer.")
+                destinations[destination] = row["conformer_id"]
+            if row["conformer_status"] == "pdbqt_ready" and artifact and self._artifact_matches(artifact["relative_path"], artifact["sha256"]):
+                reusable.add(row["conformer_id"])
+        rows = [row for row in rows if row["conformer_id"] not in reusable]
+        del resolved_paths, destinations
         workers = worker_count(settings, len(rows))
-        self._emit("stage_started", "meeko", total=len(rows), message=f"Using {workers} parallel workers")
+        self._emit("planning_completed", "meeko", total=len(rows), skipped=max(0, all_states - len(rows)),
+                   message=f"Using {workers} parallel workers; {len(rows)} ligand preparations pending")
         skipped = max(0, all_states - len(rows))
         def prepare(row: object) -> tuple[object, Path, Path, str | None]:
             sdf = self.repository.root / row["relative_path"]
@@ -435,7 +534,7 @@ class PipelineRunner:
                 continue
             receptor_hash = file_sha256(receptor)
             parameters = _docking_parameters(run_settings, backend_name)
-            for state in states:
+            for state, prepared_artifact, candidates in self._docking_plan_rows(states, profile_id):
                 self._check_cancelled()
                 index += 1
                 self._emit("item_started", "vina", state["state_id"], index, total,
@@ -451,7 +550,8 @@ class PipelineRunner:
                 settings_fp = fingerprint(settings=parameters, inputs=input_hashes, tool_version=tool_hash)
                 reusable = (self._reusable_docking(state["state_id"], profile_id, settings_fp,
                                                    parameters, receptor_hash, tool_hash, backend_name,
-                                                   ligand, input_hashes["ligand"])
+                                                   ligand, input_hashes["ligand"], candidates=candidates,
+                                                   prepared=prepared_artifact)
                             if ligand.is_file() else None)
                 if reusable:
                     if not reusable["is_current"]:
