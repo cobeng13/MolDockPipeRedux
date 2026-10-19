@@ -250,3 +250,12 @@ leaderboard contains the top three poses per parent compound for that receptor,
 sorted by most-negative affinity, across the cumulative project library.
 Regenerating exports includes all imported batches. Workflow Maintenance can clear generated data
 while preserving inputs and `project.yml`.
+
+## Optional zinc-metalloprotein docking
+
+The feature branch adds receptor-specific AutoDock4Zn preparation and Vina AD4
+map scoring. Standard Vina remains the default. See [AD4Zn setup and validation](docs/AD4Zn.md)
+for the required external tools and manual validation steps.
+
+On Windows, after installing the environment, double-click `Launch-MolDockPipe.cmd`
+to launch this checkout without manual activation or PYTHONPATH settings.

@@ -96,6 +96,7 @@ class ReceptorPreparationPlan:
     excluded_receptor_residues: tuple[ResidueKey, ...] = ()
     preserve_hydrogens: bool = False
     chemistry_template_path: Path | None = None
+    protocol: str = "vina"
 
     def as_record(self) -> dict[str, Any]:
         value = asdict(self)

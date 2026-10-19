@@ -18,6 +18,7 @@ from .services.screening import screen_smiles
 from .services.validation import validate_pdbqt
 from .services.vina import VinaDockingBackend, find_vina_executable, find_vina_split_executable
 from .services.vinagpu import VinaGpuDockingBackend, find_vinagpu_executable, vinagpu_tool_hash
+from .receptors.ad4zn import protocol_for, ensure_ad4zn_maps
 from .services.postdock import PostDockService, receptor_export_filename
 
 
@@ -56,7 +57,7 @@ def _resolve_destination(path: Path, cache: dict[Path, Path]) -> Path:
 
 
 def _docking_parameters(settings: dict[str, object], backend: str) -> dict[str, object]:
-    """Fingerprint only arguments used by the selected docking executable."""
+    """Fingerprint docking arguments and protocol-specific scientific inputs."""
     defaults = {"num_modes": 9, "energy_range": 3, "seed": 0}
     if backend == "vinagpu":
         defaults.update(thread=8000, search_depth=32)
@@ -64,8 +65,13 @@ def _docking_parameters(settings: dict[str, object], backend: str) -> dict[str, 
         defaults.update(exhaustiveness=8, cpu=0)
     names = ("center_x", "center_y", "center_z", "size_x", "size_y", "size_z", *defaults)
     # JSON distinguishes 20 from 20.0, although Vina treats them identically.
-    return {"backend": backend, **{name: float(settings.get(name, defaults.get(name)))
-            for name in names if settings.get(name, defaults.get(name)) is not None}}
+    parameters = {"backend": backend, **{name: float(settings.get(name, defaults.get(name)))
+                  for name in names if settings.get(name, defaults.get(name)) is not None}}
+    if protocol_for(settings) == "ad4zn":
+        record = settings.get("ad4zn", {})
+        parameters.update(protocol="ad4zn", map_fingerprint=record.get("map_fingerprint"),
+                          map_request=record.get("request"))
+    return parameters
 
 
 class PipelineRunner:
@@ -510,8 +516,35 @@ class PipelineRunner:
                 run_settings.pop("exhaustiveness", None)
                 run_settings.update(backend="vinagpu", thread=docking_settings.get("thread", 8000),
                                     search_depth=docking_settings.get("search_depth", 32))
-            if not receptor.is_file():
-                reason = f"Prepared receptor not found: {receptor}"
+            maps_kwargs = {}
+            preparation_error = None
+            if protocol_for(profile) == "vina":
+                run_settings.pop("protocol", None)
+                run_settings.pop("ad4zn", None)
+            try:
+                if protocol_for(profile) == "ad4zn":
+                    if backend_name != "vina":
+                        raise ValueError("AD4Zn requires the Vina CPU backend with AD4 map scoring; select Vina in Settings.")
+                    if states:
+                        self._emit("item_started", "vina", message=f"{profile_name}: preparing AD4Zn maps")
+                        ligands = [self.repository.root / "artifacts" / "pdbqt" / state["parent_id"] /
+                                   state["state_id"] / "ligand.pdbqt" for state in states]
+                        maps, record = ensure_ad4zn_maps(self.repository, profile, ligands, executable, self.cancelled)
+                        run_settings["ad4zn"] = record
+                        maps_kwargs = {"maps": maps}
+                        self._check_cancelled()
+            except InterruptedError:
+                self.repository.update_workflow_stage(
+                    workflow_run_id, "vina", StageStatus.CANCELLED.value,
+                    summary={"total": total, "succeeded": succeeded, "failed": failed, "reused": reused},
+                    error="Pipeline stopped safely")
+                self.repository.finish_workflow_run(workflow_run_id, StageStatus.CANCELLED.value,
+                                                    error="Pipeline stopped safely")
+                raise
+            except Exception as exc:
+                preparation_error = str(exc)
+            if preparation_error or not receptor.is_file():
+                reason = preparation_error or f"Prepared receptor not found: {receptor}"
                 missing_fp = fingerprint(settings=run_settings, inputs={"receptor": "missing"}, tool_version=tool_hash)
                 for state in states:
                     index += 1
@@ -572,7 +605,7 @@ class PipelineRunner:
                             (run_id, state["state_id"], receptor_hash, settings_fp, StageStatus.RUNNING,
                              json.dumps({"settings": run_settings, "inputs": input_hashes, "argv": []}, sort_keys=True),
                              utc_now(), profile_id, profile_name, workflow_run_id))
-                    result = backend.run(executable=executable, receptor=receptor, ligand=ligand, output=output, log=log, settings=run_settings, cancelled=self.cancelled)
+                    result = backend.run(executable=executable, receptor=receptor, ligand=ligand, output=output, log=log, settings=run_settings, cancelled=self.cancelled, **maps_kwargs)
                     raw_artifact = self.repository.add_artifact(output, "vina_output_pdbqt", "vina") if output.exists() else None
                     log_artifact = self.repository.add_artifact(log, "vina_log_txt", "vina")
                     with self.repository.connection() as conn:
@@ -639,7 +672,7 @@ class PipelineRunner:
         with self.repository.connection() as conn:
             placeholders = ",".join("?" for _ in profile_ids)
             runs = conn.execute(f"""SELECT d.run_id, d.receptor_profile_id, d.receptor_profile_name,
-                    s.parent_id, s.state_id, a.relative_path raw_path
+                    s.parent_id, s.state_id, a.relative_path raw_path, d.command_json
                 FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id
                 JOIN artifacts a ON a.artifact_id=d.raw_output_artifact_id
                 WHERE d.status='completed' AND d.is_current=1 AND s.active=1
@@ -692,6 +725,14 @@ class PipelineRunner:
         for run in runs:
             self._check_cancelled()
             profile_root = self.repository.root / "For_PostDocking" / run["receptor_profile_id"]
+            run_record = json.loads(run["command_json"])
+            if run_record.get("settings", {}).get("protocol") == "ad4zn":
+                metadata = profile_root / "protocols" / (run["run_id"] + ".json")
+                metadata.parent.mkdir(parents=True, exist_ok=True)
+                metadata.write_text(json.dumps({"run_id": run["run_id"], "protocol": "ad4zn",
+                    "settings": run_record.get("settings", {}),
+                    "note": "Prepared PDB contains physical receptor atoms; TZ pseudoatoms and maps remain in the project AD4Zn bundle."}, indent=2), encoding="utf-8")
+                self.repository.add_artifact(metadata, "postdock_protocol", "postdock")
             expected_folders = ("PDBQTs",) if mode == "split_only" else ("SDF",) if mode == "sdf_only" else ("SDF", "PDBQTs")
             export_root = lambda folder: profile_root / folder / run["parent_id"] / run["state_id"] / run["run_id"]
             already_exported = all(

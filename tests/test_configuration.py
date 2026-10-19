@@ -10,7 +10,7 @@ from moldockpipe.project import ProjectRepository
 @pytest.fixture
 def receptor_project(tmp_path):
     repo = ProjectRepository.create(tmp_path / "project")
-    profile = {"id": "original", "name": "Original receptor", "enabled": True,
+    profile = {"protocol": "vina", "id": "original", "name": "Original receptor", "enabled": True,
                "archived": False, "receptor": "inputs/receptors/original/receptor.pdbqt",
                "center_x": 1.25, "size_x": 20, "reference_ligand": {"name": "LIG"}}
     receptor = repo.root / profile["receptor"]

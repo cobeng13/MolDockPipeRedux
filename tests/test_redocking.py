@@ -172,3 +172,35 @@ def test_restart_marks_running_redocking_interrupted(redocking_project) -> None:
             ('run','receptor-a','running','LIG A:401','r','h','s','m','h','{}','now')""")
     assert repo.recover_interrupted_runs() == 1
     with repo.connection() as conn: assert conn.execute("SELECT status FROM redocking_runs").fetchone()[0] == "interrupted"
+
+
+def test_ad4zn_redocking_uses_maps_and_invalidates_reuse(redocking_project, monkeypatch):
+    from moldockpipe.receptors.ad4zn import AD4ZnEnvironment
+    from test_ad4zn import pdbqt
+    repo, profile, molecule = redocking_project
+    profile['protocol'] = 'ad4zn'
+    (repo.root / profile['receptor']).write_text(pdbqt('C', 'Zn'))
+    monkeypatch.setattr('moldockpipe.redocking.runner.check_ad4zn_environment', lambda _: AD4ZnEnvironment({}))
+    context = {'protocol': 'ad4zn', 'map_fingerprint': 'maps-a'}
+    def ensure(repository, selected, ligands, executable, cancelled):
+        assert selected['protocol'] == 'ad4zn'
+        assert len(ligands) == 1 and ligands[0].is_file()
+        return repo.root / 'maps/receptor_TZ', dict(context)
+    monkeypatch.setattr('moldockpipe.redocking.runner.ensure_ad4zn_maps', ensure)
+    class ZincVina(FakeVina):
+        def run(self, **kwargs):
+            assert kwargs['settings']['protocol'] == 'ad4zn'
+            assert kwargs['maps'] == repo.root / 'maps/receptor_TZ'
+            return super().run(**kwargs)
+    vina = ZincVina()
+    runner = runner_for(repo, profile, molecule, vina=vina)
+    result = runner.run()
+    assert vina.calls == 1
+    runner.run(result['run_id'])
+    assert vina.calls == 1
+    context['map_fingerprint'] = 'maps-b'
+    runner.run(result['run_id'])
+    assert vina.calls == 2
+    with repo.connection() as conn:
+        row = conn.execute('SELECT settings_json FROM redocking_runs WHERE run_id=?', (result['run_id'],)).fetchone()
+    assert json.loads(row[0])['ad4zn']['map_fingerprint'] == 'maps-b'

@@ -113,10 +113,10 @@ def test_run_all_checks_receptor_before_import_or_chemistry(tmp_path):
 
 def test_stale_receptor_manager_checks_before_file_or_database_changes(tmp_path):
     repo = ProjectRepository.create(tmp_path / "project")
-    original = {"id": "original", "name": "Original", "enabled": True}
+    original = {"id": "original", "name": "Original", "enabled": True, "protocol": "vina"}
     repo.save_receptor_profiles([original])
     fake = SimpleNamespace(repository=repo, original_profiles={"original": dict(original)})
-    newer = {"id": "newer", "name": "Newer", "enabled": True}
+    newer = {"id": "newer", "name": "Newer", "enabled": True, "protocol": "vina"}
     repo.save_receptor_profiles([original, newer])
     with pytest.raises(RuntimeError, match="changed since"):
         ReceptorManagerDialog._save_locked(fake)
