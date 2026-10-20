@@ -228,6 +228,12 @@ Post-docking supports:
 
 The compound selector lists successfully docked compounds by most-negative score,
 shows export status, and prevents selecting compounds already exported.
+Enter **Start** and **End** docking scores (for example, -10 to -7 kcal/mol),
+then click **Select score range** to replace the checked selection with matching
+compounds. Both endpoints are included. Selection uses each compound's best
+score across enabled receptors, for standard Vina or AD4Zn. Confirm with **OK**
+to export; the existing export settings still determine which states and poses
+of those compounds are written.
 
 Outputs are organized as:
 
