@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -73,16 +74,37 @@ class PostDockService:
         return "prepared_pdbqt_conversion"
 
     def split(self, executable: Path, input_pdbqt: Path, output_dir: Path, prefix: str) -> list[Path]:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        result = subprocess.run([str(executable), "--input", str(input_pdbqt), "--ligand", str(output_dir / prefix)], text=True, capture_output=True, check=False)
-        if result.returncode:
-            raise RuntimeError(result.stderr or result.stdout or "vina_split failed")
-        return sorted(output_dir.glob(f"{prefix}*.pdbqt"))
+        # Native tools may still use MAX_PATH even when Python supports long paths.
+        executable = executable.resolve()
+        with tempfile.TemporaryDirectory(prefix="mdp_") as directory:
+            work = Path(directory)
+            shutil.copy2(input_pdbqt, work / "input.pdbqt")
+            result = subprocess.run(
+                [str(executable), "--input", "input.pdbqt", "--ligand", "pose_"],
+                cwd=work, text=True, capture_output=True, check=False,
+            )
+            if result.returncode:
+                raise RuntimeError(result.stderr or result.stdout or "vina_split failed")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            outputs = []
+            for pose in sorted(work.glob("pose_*.pdbqt")):
+                output = output_dir / f"{prefix}{pose.name[len('pose_'):]}"
+                shutil.copy2(pose, output)
+                outputs.append(output)
+            return outputs
 
     def export_sdf(self, input_pdbqt: Path, output_sdf: Path, log: Path) -> None:
         output_sdf.parent.mkdir(parents=True, exist_ok=True)
         log.parent.mkdir(parents=True, exist_ok=True)
-        result = subprocess.run([sys.executable, "-m", "meeko.cli.mk_export", str(input_pdbqt), "-s", str(output_sdf)], text=True, capture_output=True, check=False)
-        log.write_text(result.stdout + "\n" + result.stderr, encoding="utf-8")
-        if result.returncode or not output_sdf.exists() or output_sdf.stat().st_size == 0:
-            raise RuntimeError("mk_export.py failed")
+        with tempfile.TemporaryDirectory(prefix="mdp_") as directory:
+            work = Path(directory)
+            shutil.copy2(input_pdbqt, work / "input.pdbqt")
+            result = subprocess.run(
+                [sys.executable, "-m", "meeko.cli.mk_export", "input.pdbqt", "-s", "output.sdf"],
+                cwd=work, text=True, capture_output=True, check=False,
+            )
+            log.write_text(result.stdout + "\n" + result.stderr, encoding="utf-8")
+            generated = work / "output.sdf"
+            if result.returncode or not generated.exists() or generated.stat().st_size == 0:
+                raise RuntimeError("mk_export.py failed")
+            shutil.copy2(generated, output_sdf)

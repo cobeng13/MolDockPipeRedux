@@ -58,3 +58,75 @@ def test_postdock_copies_exact_validation_mol2_standard(tmp_path: Path) -> None:
     PostDockService().export_validation_standard(source, output)
 
     assert output.read_bytes() == source.read_bytes()
+
+
+def test_split_stages_long_paths_and_preserves_names(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    source = tmp_path / ('input_' + 'x' * 80) / 'raw.pdbqt'
+    source.parent.mkdir()
+    source.write_text('MODEL 1\nENDMDL\n', encoding='ascii')
+    output = tmp_path / ('a' * 90) / ('b' * 90) / ('c' * 50)
+    prefix = 'Quercetin7Rhamnoside_Quercetin7Rhamnoside-0eab8f797a06dd29_pose_'
+    staging = []
+
+    def run(args, **kwargs):
+        work = Path(kwargs['cwd'])
+        staging.append(work)
+        assert args[2:] == ['input.pdbqt', '--ligand', 'pose_']
+        assert (work / 'input.pdbqt').read_bytes() == source.read_bytes()
+        for number in (1, 2):
+            (work / f'pose_{number}.pdbqt').write_text(f'pose {number}', encoding='ascii')
+        return SimpleNamespace(returncode=0, stdout='', stderr='')
+
+    monkeypatch.setattr('moldockpipe.services.postdock.subprocess.run', run)
+    outputs = PostDockService().split(Path('vina_split.exe'), source, output, prefix)
+    assert outputs == [output / f'{prefix}{number}.pdbqt' for number in (1, 2)]
+    assert [p.read_text() for p in outputs] == ['pose 1', 'pose 2']
+    assert not staging[0].exists()
+
+
+def test_sdf_stages_long_paths_and_keeps_log(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    source = tmp_path / 'pose.pdbqt'
+    source.write_text('pose', encoding='ascii')
+    output = tmp_path / ('a' * 90) / ('b' * 90) / ('c' * 50) / 'pose.sdf'
+    log = output.with_suffix('.log.txt')
+    staging = []
+
+    def run(args, **kwargs):
+        work = Path(kwargs['cwd'])
+        staging.append(work)
+        assert args[-3:] == ['input.pdbqt', '-s', 'output.sdf']
+        assert (work / 'input.pdbqt').read_bytes() == source.read_bytes()
+        (work / 'output.sdf').write_text('molecule\n$$$$\n', encoding='ascii')
+        return SimpleNamespace(returncode=0, stdout='exported', stderr='warning')
+
+    monkeypatch.setattr('moldockpipe.services.postdock.subprocess.run', run)
+    PostDockService().export_sdf(source, output, log)
+    assert output.read_text() == 'molecule\n$$$$\n'
+    assert log.read_text() == 'exported\nwarning'
+    assert not staging[0].exists()
+
+
+def test_split_failure_cleans_staging_without_publishing(tmp_path, monkeypatch):
+    import pytest
+    from types import SimpleNamespace
+
+    source = tmp_path / 'raw.pdbqt'
+    source.write_text('pose', encoding='ascii')
+    output = tmp_path / 'exports'
+    staging = []
+
+    def run(args, **kwargs):
+        work = Path(kwargs['cwd'])
+        staging.append(work)
+        (work / 'pose_1.pdbqt').write_text('incomplete', encoding='ascii')
+        return SimpleNamespace(returncode=1, stdout='', stderr='split failed')
+
+    monkeypatch.setattr('moldockpipe.services.postdock.subprocess.run', run)
+    with pytest.raises(RuntimeError, match='split failed'):
+        PostDockService().split(Path('vina_split.exe'), source, output, 'pose_')
+    assert not output.exists()
+    assert not staging[0].exists()
