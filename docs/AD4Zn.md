@@ -1,8 +1,8 @@
-# AutoDock4Zn support (feature branch)
+# AutoDock4Zn support
 
 AD4Zn is an optional receptor-specific protocol. Existing profiles default to
 standard Vina, and standard Vina does not require any AD4Zn tools. The ligand
-Screening -> MolScrub -> Meeko pipeline is unchanged. This branch implements
+Screening -> MolScrub -> Meeko pipeline is unchanged. This integration implements
 software integration; it does not establish scientific validity for MMP-13.
 
 ## Windows student launch
@@ -14,8 +14,9 @@ session discards its environment settings; the stable checkout is not reinstalle
 The Windows launcher uses a process-scoped execution-policy override to run its
 shipped PowerShell script; it does not change the machine execution policy.
 
-Install ADFR Suite in its default location and place the three supplied resource
-files in `tools/ad4zn`. The application discovers standard ADFR installation
+The three resource files (`zinc_pseudo.py`, `prepare_gpf4zn.py`, and `AD4Zn.dat`)
+are included in `tools/ad4zn`. Install ADFR Suite separately in its default
+location. The application discovers standard ADFR installation
 folders and Windows installer registry locations. Manual path overrides below
 are only needed for installations it cannot discover. An invalid parameter
 placeholder is reported directly in the Receptors dialog.
