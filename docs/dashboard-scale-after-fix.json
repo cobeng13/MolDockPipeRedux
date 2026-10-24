@@ -1,0 +1,25 @@
+{
+  "python": "3.13.15 | packaged by Anaconda, Inc. | (main, Aug 14 2026, 17:17:48) [MSC v.1942 64 bit (AMD64)]",
+  "cpu_count": 12,
+  "cases": [
+    {
+      "parents": 20000,
+      "states_per_parent": 32,
+      "poses": 5760000,
+      "repeats": 3,
+      "refresh_seconds_median": 5.0373,
+      "refresh_seconds_max": 5.2317,
+      "gui_request_seconds_max": 0.0031,
+      "qt_heartbeat_max_gap_seconds": 0.0184,
+      "memory_before_mib": {
+        "working_set": 63.51,
+        "private": 33.22
+      },
+      "memory_after_mib": {
+        "working_set": 64.56,
+        "private": 33.21
+      },
+      "legacy_unindexed_failure_query_seconds": ">3s (interrupted)"
+    }
+  ]
+}

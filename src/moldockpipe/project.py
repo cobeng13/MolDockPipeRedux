@@ -112,9 +112,10 @@ class ProjectRepository:
         finally:
             conn.close()
 
-    def molscrub_failures(self) -> list[sqlite3.Row]:
+    def molscrub_failures(self, *, cancelled=lambda: False) -> list[sqlite3.Row]:
         """Return current parent failures, including notes from older projects."""
         with self.connection() as conn:
+            conn.set_progress_handler(lambda: int(cancelled()), 5000)
             return conn.execute("""SELECT p.parent_id, COALESCE(r.reason, p.parse_reason) AS reason
                 FROM parent_ligands p LEFT JOIN stage_runs r ON r.rowid=(
                     SELECT MAX(latest.rowid) FROM stage_runs latest

@@ -121,7 +121,8 @@ class SettingsDialog(QDialog):
     def _workers(self, form: QFormLayout, key: str, values: dict[str, object]) -> None:
         cpus = logical_cpu_count()
         self._integer(form, "Parallel workers", key, values.get("workers", 0), 0, max(256, cpus))
-        self.fields[key].setSpecialValueText(f"Automatic ({cpus} logical CPUs)")
+        self.fields[key].setSpecialValueText("Automatic (CPU and memory budget)")
+        self.fields[key].setToolTip("Automatic uses at most 8 workers and leaves CPU headroom. All worker counts are capped by available memory, reserving space for the desktop.")
 
     def _docking_tab(self, values: dict[str, object]) -> QWidget:
         form = QFormLayout()

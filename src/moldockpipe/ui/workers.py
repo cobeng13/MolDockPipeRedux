@@ -3,12 +3,28 @@ from __future__ import annotations
 from threading import Event
 from time import monotonic
 
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 from ..pipeline import PipelineRunner
 from ..project import ProjectRepository
 from ..execution_lock import project_execution_lock
 from ..models import ProgressEvent
+
+
+class TaskWorker(QThread):
+    """Run repository work with connections created on the calling thread."""
+    succeeded = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, function, parent=None):
+        super().__init__(parent)
+        self.function = function
+
+    def run(self):
+        try:
+            self.succeeded.emit(self.function())
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class VinaWorker(QObject):
@@ -41,12 +57,12 @@ class PipelineWorker(QObject):
         self._last_progress_at = float("-inf")
 
     def _report_progress(self, event: object) -> None:
-        """Bound routine Qt updates while always delivering failures and boundaries."""
+        """Bound item updates, including failures already persisted in history."""
         now = monotonic()
         kind = getattr(event, "event", "")
-        important = (kind in {"stage_preparing", "stage_started", "planning_completed", "stage_completed", "item_failed"}
-                     or (kind == "item_skipped" and getattr(event, "failed", 0))
-                     or getattr(event, "index", 0) == getattr(event, "total", 0))
+        important = (kind in {"stage_preparing", "stage_started", "planning_completed", "stage_completed"}
+                     or (getattr(event, "total", 0) > 0
+                         and getattr(event, "index", 0) == getattr(event, "total", 0)))
         if important or now - self._last_progress_at >= 0.1:
             self._last_progress_at = now
             self.progress.emit(event)

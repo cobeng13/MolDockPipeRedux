@@ -37,15 +37,30 @@ def fake_canvas(qt_app, monkeypatch):
             return self
 
     monkeypatch.setattr(module, "_web_view", lambda parent, bridge: Canvas(parent))
+    yield
+    # Dispose native widgets on the GUI thread after all query/conversion work.
+    # Letting Python's cyclic GC collect an old dialog from a later worker can
+    # otherwise destroy Qt objects from the wrong thread.
+    from PyQt6.QtCore import QCoreApplication, QEvent
+    from moldockpipe.ui.results_dialog import DockingResultsDialog
+    for widget in qt_app.topLevelWidgets():
+        if isinstance(widget, DockingResultsDialog):
+            widget.reject()
+            wait_for(qt_app, lambda: widget._table_worker is None and widget._worker is None)
+            widget.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
 def wait_for(qt_app, condition):
     from PyQt6.QtTest import QTest
     deadline = time.monotonic() + 8
-    while not condition() and time.monotonic() < deadline:
+    def ready():
+        qt_app.processEvents()
+        return condition()
+    while not ready() and time.monotonic() < deadline:
         qt_app.processEvents()
         QTest.qWait(10)
-    assert condition()
+    assert ready()
 
 
 def test_result_best_mode_and_pose_switch(qt_app, fake_canvas, viewer_project):
@@ -60,14 +75,14 @@ def test_result_best_mode_and_pose_switch(qt_app, fake_canvas, viewer_project):
     finally:
         module.StructureViewerService = original
     dialog.viewer.bridge.ready()
-    wait_for(qt_app, lambda: dialog._worker is None)
+    wait_for(qt_app, lambda: dialog._table_worker is None and dialog._worker is None)
     assert dialog.viewer._structure.mode_index == 8
     assert dialog.viewer.pose.count() == 2
     assert not dialog.viewer.export.isEnabled()
     dialog.viewer.bridge.rendered(dialog.viewer._token)
     assert dialog.viewer.export.isEnabled()
     dialog.viewer.pose.setCurrentIndex(0)
-    wait_for(qt_app, lambda: dialog._worker is None)
+    wait_for(qt_app, lambda: dialog._table_worker is None and dialog._worker is None)
     assert dialog.viewer._structure.mode_index == 3
     assert "Mode 3" in dialog.viewer.title.text()
     dialog.reject()
@@ -85,7 +100,7 @@ def test_pending_row_and_tab_switch_clear_old_pose(qt_app, fake_canvas, viewer_p
     monkeypatch.setattr(module, "StructureViewerService", lambda _: service)
     dialog = DockingResultsDialog(repo)
     dialog.viewer.bridge.ready()
-    wait_for(qt_app, lambda: dialog._worker is None)
+    wait_for(qt_app, lambda: dialog._table_worker is None and dialog._worker is None)
     table = dialog.tabs.currentWidget()
     pending_row = next(row for row in range(table.rowCount()) if table.item(row, 0).text() == "pending")
     table.selectRow(pending_row)
@@ -120,7 +135,7 @@ def test_stale_load_is_ignored_and_closing_cancels_worker(qt_app, fake_canvas, v
     dialog._loaded(previous_generation, object())  # An old result must never reach the canvas.
     assert dialog.viewer._structure is None
     dialog.reject()
-    wait_for(qt_app, lambda: dialog._worker is None)
+    wait_for(qt_app, lambda: dialog._table_worker is None and dialog._worker is None)
     assert dialog._closing
 
 
@@ -144,7 +159,7 @@ def test_latest_selection_runs_after_cancelled_conversion(qt_app, fake_canvas, v
     dialog = DockingResultsDialog(repo)
     wait_for(qt_app, started.is_set)
     dialog.viewer.pose.setCurrentIndex(0)
-    wait_for(qt_app, lambda: dialog._worker is None and dialog._pending is None)
+    wait_for(qt_app, lambda: dialog._table_worker is None and dialog._worker is None and dialog._pending is None)
     assert dialog.viewer._structure.mode_index == 3
     dialog.reject()
 
@@ -154,11 +169,66 @@ def test_missing_webengine_keeps_results_table(qt_app, viewer_project, monkeypat
     from moldockpipe.ui.results_dialog import DockingResultsDialog
     monkeypatch.setattr(module, "_web_view", lambda *_: (_ for _ in ()).throw(ImportError("missing WebEngine")))
     dialog = DockingResultsDialog(viewer_project[0])
+    wait_for(qt_app, lambda: dialog._table_worker is None)
     assert dialog.tabs.currentWidget().rowCount() == 1
     assert not dialog.viewer.available
     assert "README" in dialog.viewer.status.text()
     assert dialog._worker is None
     dialog.reject()
+
+
+def test_result_pages_are_bounded_and_do_not_overlap(viewer_project):
+    from moldockpipe.ui.results_dialog import load_profile_page
+    repo = viewer_project[0]
+    with repo.connection() as conn:
+        conn.executemany("INSERT INTO parent_ligands(parent_id,source_smiles,parse_status,created_at) VALUES (?,'CCO','completed','now')",
+                         [(f'pending{i:04}',) for i in range(450)])
+    profile_id = repo.get_receptor_profiles()[0]['id']
+    total, first = load_profile_page(repo, profile_id, 0)
+    _, second = load_profile_page(repo, profile_id, 200)
+    _, last = load_profile_page(repo, profile_id, 400)
+    assert total == 451
+    assert [len(first), len(second), len(last)] == [200, 200, 51]
+    assert len({row['parent_id'] for row in first + second + last}) == 451
+    assert first[0]['status'] == 'completed'
+
+
+def test_only_visible_receptor_is_loaded(qt_app, fake_canvas, viewer_project, monkeypatch):
+    import moldockpipe.ui.results_dialog as module
+    repo = viewer_project[0]
+    profiles = repo.get_receptor_profiles()
+    repo.save_receptor_profiles(profiles + [{**profiles[0], 'id': 'second', 'name': 'Second'}])
+    original, calls = module.load_profile_page, []
+    def load(repository, profile_id, *args, **kwargs):
+        calls.append(profile_id)
+        return original(repository, profile_id, *args, **kwargs)
+    monkeypatch.setattr(module, 'load_profile_page', load)
+    dialog = module.DockingResultsDialog(repo)
+    wait_for(qt_app, lambda: dialog._table_worker is None and dialog._worker is None)
+    assert calls == [profiles[0]['id']]
+    assert dialog.tabs.widget(1).rowCount() == 0
+    dialog.tabs.setCurrentIndex(1)
+    wait_for(qt_app, lambda: dialog._table_worker is None and dialog._worker is None)
+    assert calls == [profiles[0]['id'], 'second']
+    dialog.reject()
+
+
+def test_close_cancels_table_query_and_waits_for_its_thread(qt_app, fake_canvas, viewer_project, monkeypatch):
+    from threading import Event
+    import moldockpipe.ui.results_dialog as module
+    entered = Event()
+    def blocked(repository, profile_id, offset, *, cancelled):
+        entered.set()
+        while not cancelled():
+            time.sleep(0.005)
+        raise InterruptedError('cancelled')
+    monkeypatch.setattr(module, 'load_profile_page', blocked)
+    dialog = module.DockingResultsDialog(viewer_project[0])
+    wait_for(qt_app, entered.is_set)
+    dialog.reject()
+    assert dialog._closing
+    wait_for(qt_app, lambda: dialog._table_worker is None)
+    assert dialog._worker is None
 
 
 def test_contact_controls_send_visibility_and_clear_on_pose_change(qt_app, fake_canvas):

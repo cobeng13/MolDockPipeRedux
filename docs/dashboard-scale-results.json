@@ -1,0 +1,97 @@
+{
+  "cases": [
+    {
+      "parents": 1000,
+      "states_per_parent": 1,
+      "poses": 9000,
+      "repeats": 15,
+      "refresh_seconds_median": 0.0217,
+      "refresh_seconds_max": 0.0329,
+      "qt_heartbeat_max_gap_seconds": 0.037,
+      "memory_before_mib": {
+        "working_set": 62.27,
+        "private": 31.62
+      },
+      "memory_after_mib": {
+        "working_set": 63.87,
+        "private": 32.59
+      },
+      "legacy_unindexed_failure_query_seconds": 0.0612122000020463
+    },
+    {
+      "parents": 5000,
+      "states_per_parent": 1,
+      "poses": 45000,
+      "repeats": 15,
+      "refresh_seconds_median": 0.0483,
+      "refresh_seconds_max": 0.0613,
+      "qt_heartbeat_max_gap_seconds": 0.062,
+      "memory_before_mib": {
+        "working_set": 63.75,
+        "private": 32.29
+      },
+      "memory_after_mib": {
+        "working_set": 63.56,
+        "private": 32.13
+      },
+      "legacy_unindexed_failure_query_seconds": 1.4869131000014022
+    },
+    {
+      "parents": 20000,
+      "states_per_parent": 1,
+      "poses": 180000,
+      "repeats": 15,
+      "refresh_seconds_median": 0.15,
+      "refresh_seconds_max": 0.1605,
+      "qt_heartbeat_max_gap_seconds": 0.1611,
+      "memory_before_mib": {
+        "working_set": 63.94,
+        "private": 32.62
+      },
+      "memory_after_mib": {
+        "working_set": 64.26,
+        "private": 33.39
+      },
+      "legacy_unindexed_failure_query_seconds": ">3s (interrupted)"
+    },
+    {
+      "parents": 20000,
+      "states_per_parent": 8,
+      "poses": 1440000,
+      "repeats": 15,
+      "refresh_seconds_median": 0.7124,
+      "refresh_seconds_max": 0.7474,
+      "qt_heartbeat_max_gap_seconds": 0.7484,
+      "memory_before_mib": {
+        "working_set": 65.41,
+        "private": 34.32
+      },
+      "memory_after_mib": {
+        "working_set": 65.04,
+        "private": 33.85
+      },
+      "legacy_unindexed_failure_query_seconds": ">3s (interrupted)"
+    },
+    {
+      "parents": 20000,
+      "states_per_parent": 32,
+      "poses": 5760000,
+      "repeats": 5,
+      "refresh_seconds_median": 2.872,
+      "refresh_seconds_max": 2.9174,
+      "qt_heartbeat_max_gap_seconds": 2.9213,
+      "memory_before_mib": {
+        "working_set": 62.79,
+        "private": 32.11
+      },
+      "memory_after_mib": {
+        "working_set": 64.2,
+        "private": 33.18
+      },
+      "legacy_unindexed_failure_query_seconds": ">3s (interrupted)"
+    }
+  ],
+  "commit": "3403bce",
+  "date": "2026-10-24",
+  "scope": "Synthetic dashboard only; no chemistry or Vina"
+}

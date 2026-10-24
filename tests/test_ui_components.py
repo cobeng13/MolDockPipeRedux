@@ -123,7 +123,7 @@ def test_stale_receptor_manager_checks_before_file_or_database_changes(tmp_path)
     assert repo.get_receptor_profiles() == [original, newer]
 
 
-def test_bulk_progress_is_throttled_without_losing_failures_or_boundaries(monkeypatch):
+def test_bulk_progress_is_throttled_with_final_totals_and_boundaries(monkeypatch):
     from moldockpipe.models import ProgressEvent
 
     monkeypatch.setattr(workers, "monotonic", lambda: 10.0)
@@ -144,7 +144,7 @@ def test_bulk_progress_is_throttled_without_losing_failures_or_boundaries(monkey
     assert delivered[0] == start
     assert [(e.event, e.index) for e in delivered[1:3]] == [
         ("item_started", 5000), ("item_succeeded", 5000)]
-    assert delivered[3:] == [failure, cached_failure, finish]
+    assert delivered[3:] == [finish]  # detailed failures remain in persisted history
     monkeypatch.setattr(workers, "monotonic", lambda: 10.2)
     update = ProgressEvent("item_succeeded", "meeko", "next", 1, 5000)
     worker._report_progress(update)
@@ -233,6 +233,7 @@ def test_close_waits_for_pipeline_thread_cleanup():
 
 
 def test_dashboard_refresh_defines_profile_metadata(tmp_path) -> None:
+    from moldockpipe.dashboard import collect_dashboard
     class Sink:
         def setText(self, value): self.text = value
         def setEnabled(self, value): self.enabled = value
@@ -245,10 +246,11 @@ def test_dashboard_refresh_defines_profile_metadata(tmp_path) -> None:
         stat_details={key: Sink() for key in ("passed", "failed")},
         project_summary=Sink(), docked_export_action=Sink(),
         stage_buttons={key: Sink() for key in ("screening", "molscrub", "meeko", "vina", "postdock")},
-        overall_progress=SimpleNamespace(states={}),
+        overall_progress=SimpleNamespace(states={}, reset=lambda: None, update=lambda: None,
+            start_stage=lambda stage: None, complete_stage=lambda stage: None),
     )
 
-    MainWindow._update_dashboard(fake, 0, 0, 0, 0, 0)
+    MainWindow._apply_dashboard(fake, collect_dashboard(fake.repo), False)
 
     assert fake.docked_export_action.enabled is False
 
@@ -258,7 +260,7 @@ def test_dashboard_refresh_defines_profile_metadata(tmp_path) -> None:
     fake.repo.import_ligands_csv(csv_path)
     with fake.repo.connection() as conn:
         conn.execute("UPDATE parent_ligands SET parse_reason='MolScrub failed: ETKDG failed'")
-    MainWindow._update_dashboard(fake, 2, 0, 0, 0, 0)
+    MainWindow._apply_dashboard(fake, collect_dashboard(fake.repo), False)
     assert fake.stat_cards["failed"].text == "2"
     assert "0 generated; 2 failed" in fake.stage_buttons["molscrub"].text
     assert "Failed 3D Structure Generation: 2" in fake.stat_details["failed"].text
@@ -270,13 +272,12 @@ def test_dashboard_refresh_defines_profile_metadata(tmp_path) -> None:
         def start_stage(self, stage): self.states[stage] = "active"
 
     fake.overall_progress = Progress()
-    fake._update_dashboard = lambda *values: MainWindow._update_dashboard(fake, *values)
-    MainWindow._refresh_checkpoint_state(fake)
+    MainWindow._apply_dashboard(fake, collect_dashboard(fake.repo), False)
     assert fake.overall_progress.states["molscrub"] == "warning"
     # An incomplete batch must not become complete after the first result.
     with fake.repo.connection() as conn:
         conn.execute("UPDATE parent_ligands SET parse_reason=NULL WHERE parent_id='lig2'")
-    MainWindow._refresh_checkpoint_state(fake)
+    MainWindow._apply_dashboard(fake, collect_dashboard(fake.repo), False)
     assert fake.overall_progress.states["molscrub"] == "active"
 
 

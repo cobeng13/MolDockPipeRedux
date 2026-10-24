@@ -9,8 +9,13 @@ from moldockpipe.pipeline import PipelineRunner
 from moldockpipe.project import ProjectRepository
 
 
+@pytest.fixture(autouse=True)
+def ample_memory(monkeypatch):
+    monkeypatch.setattr('moldockpipe.parallel.available_memory_bytes', lambda: 64 * 2**30)
+
+
 @pytest.mark.parametrize("cpus,requested,jobs,expected", [
-    (12, 0, 100, 12), (64, 0, 100, 64), (12, 0, 3, 3),
+    (12, 0, 100, 8), (64, 0, 100, 8), (12, 0, 3, 3),
     (None, 0, 100, 1), (12, 4, 100, 4), (12, 1, 100, 1), (12, 0, 0, 1),
 ])
 def test_worker_limits_follow_cpu_count_or_explicit_override(monkeypatch, cpus, requested, jobs, expected):
@@ -23,8 +28,8 @@ def test_default_workers_are_automatic(tmp_path, monkeypatch):
     repo = ProjectRepository.create(tmp_path / "project")
     for stage in ("molscrub", "meeko"):
         assert repo.get_settings()[stage]["workers"] == 0
-        assert worker_count(repo.get_settings()[stage], 100) == 12
-    assert worker_count({}, 100) == 12
+        assert worker_count(repo.get_settings()[stage], 100) == 8
+    assert worker_count({}, 100) == 8
 
 
 @pytest.mark.parametrize("old_workers,expected", [(4, 0), (None, 0), (2, 2), (0, 0)])
@@ -39,7 +44,7 @@ def test_legacy_meeko_default_upgrades_once(tmp_path, monkeypatch, old_workers, 
     repo.migrate()
     assert repo.get_settings()["meeko"]["workers"] == expected
     if expected == 0:
-        assert worker_count(repo.get_settings()["meeko"], 100) == 12
+        assert worker_count(repo.get_settings()["meeko"], 100) == 8
     # A manual choice made after upgrading must survive every later reopen.
     config = repo.get_settings()
     config["meeko"]["workers"] = 4
@@ -250,3 +255,10 @@ def test_meeko_rejects_colliding_jobs_before_any_worker_writes(parallel_project)
     with pytest.raises(ValueError, match="same output file"):
         runner.run_meeko()
     assert probes["meeko"].calls == 0
+
+
+@pytest.mark.parametrize('available,requested,expected', [(3 * 2**30, 0, 2), (3 * 2**30, 32, 2), (512 * 2**20, 32, 1), (None, 0, 2)])
+def test_preparation_respects_available_memory(monkeypatch, available, requested, expected):
+    monkeypatch.setattr('moldockpipe.parallel.os.cpu_count', lambda: 64)
+    monkeypatch.setattr('moldockpipe.parallel.available_memory_bytes', lambda: available)
+    assert worker_count({'workers': requested}, 100) == expected

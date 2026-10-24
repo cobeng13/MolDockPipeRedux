@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from PyQt6.QtCore import QThread, Qt, QUrl
+from PyQt6.QtCore import QThread, QTimer, Qt, QUrl
 from PyQt6.QtGui import QCloseEvent, QDesktopServices, QFont
 from PyQt6.QtWidgets import (
     QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox,
@@ -16,7 +16,6 @@ from ..project import ProjectRepository
 from ..execution_lock import project_execution_lock
 from ..csv_exports import export_leaderboard_csv as write_leaderboards, export_manifest_csv as write_manifests
 from ..reporting import generate_project_report
-from ..services.postdock import receptor_export_filename
 from .compound_selector import CompoundSelectorDialog
 from .progress import CheckpointProgress
 from .receptor_manager import ReceptorManagerDialog
@@ -24,7 +23,8 @@ from .redocking_queue import RedockingQueueController, RedockingQueueDialog
 from .receptor_wizard import ReceptorPreparationWizard, ReceptorPreparationWorker
 from .results_dialog import DockingResultsDialog
 from .settings_dialog import SettingsDialog
-from .workers import PipelineWorker
+from .workers import PipelineWorker, TaskWorker
+from ..dashboard import collect_dashboard
 
 
 class MainWindow(QMainWindow):
@@ -39,6 +39,19 @@ class MainWindow(QMainWindow):
         self.redocking_queue: RedockingQueueController | None = None
         self.setWindowTitle("MolDockPipe Redux")
         self.resize(1280, 760)
+        self._closing = False
+        self._project_task = None
+        self._dashboard_worker = None
+        self._dashboard_pending = False
+        self._dashboard_timer = QTimer(self)
+        self._dashboard_timer.setSingleShot(True)
+        self._dashboard_timer.timeout.connect(self._start_dashboard_snapshot)
+        self._gui_last_tick = time.monotonic()
+        self._gui_max_gap = 0.0
+        self._snapshot_seconds = 0.0
+        self._heartbeat = QTimer(self)
+        self._heartbeat.timeout.connect(self._record_gui_heartbeat)
+        self._heartbeat.start(250)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -63,6 +76,7 @@ class MainWindow(QMainWindow):
         tools_button.setText("Tools")
         tools_menu = QMenu(tools_button)
         tools_menu.addAction("Troubleshooter…", self.show_troubleshooter)
+        tools_menu.addAction("Save performance report…", self.save_performance_report)
         self.prepare_receptor_action = tools_menu.addAction("Receptor Preparation…")
         self.prepare_receptor_action.setEnabled(False)
         self.prepare_receptor_action.triggered.connect(self.prepare_receptor)
@@ -256,12 +270,29 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._closing = True
+        timer = getattr(self, "_dashboard_timer", None)
+        if timer is not None:
+            timer.stop()
+        heartbeat = getattr(self, "_heartbeat", None)
+        if heartbeat is not None:
+            heartbeat.stop()
+        if getattr(self, "_dashboard_worker", None) is not None or getattr(self, "_project_task", None) is not None:
+            if self._dashboard_worker is not None:
+                self._dashboard_worker.requestInterruption()
+            event.ignore()
+            if self._pipeline_active():
+                self._close_after_pipeline = True
+                self.stop_pipeline()
+            return
         if self._pipeline_active():
             event.ignore()
             self._close_after_pipeline = True
             self.stop_pipeline()
             return
         if self.redocking_queue and self.redocking_queue.is_running and not self.redocking_queue.shutdown():
+            self._closing = False
+            self._heartbeat.start(250)
             event.ignore()
             QMessageBox.warning(self, "Validation is stopping",
                 "MolDockPipe is still stopping the active validation process. Try closing the application again in a few seconds.")
@@ -279,7 +310,36 @@ class MainWindow(QMainWindow):
             self._close_after_pipeline = False
             self.close()
 
+    def _start_project_task(self, function, ready, label):
+        if self._project_task is not None or self._closing:
+            return
+        worker = TaskWorker(function, self)
+        self._project_task = worker
+        self.statusBar().showMessage(label)
+        self._set_stage_actions(False)
+        self.run_all_action.setEnabled(False)
+        self.refresh_action.setEnabled(False)
+        worker.succeeded.connect(lambda result: ready(result) if not self._closing else None)
+        worker.failed.connect(lambda message: QMessageBox.critical(self, label, message) if not self._closing else None)
+        worker.finished.connect(self._project_task_finished)
+        worker.start()
+
+    def _project_task_finished(self):
+        worker, self._project_task = self._project_task, None
+        worker.deleteLater()
+        self._set_stage_actions(not self._pipeline_active())
+        self.run_all_action.setEnabled(self.repo is not None and not self._pipeline_active())
+        self.refresh_action.setEnabled(self.repo is not None and not self._pipeline_active())
+        self.statusBar().clearMessage()
+        if self._closing:
+            self.close()
+
     def _block_project_change(self) -> bool:
+        if self._closing:
+            return True
+        if self._project_task is not None:
+            self.statusBar().showMessage("Wait for the current project operation to finish.", 5000)
+            return True
         if self._pipeline_active():
             QMessageBox.warning(self, "Pipeline running", "Finish or stop the pipeline before changing projects or importing ligands.")
             return True
@@ -302,8 +362,10 @@ class MainWindow(QMainWindow):
         if path.exists():
             QMessageBox.warning(self, "Project already exists", f"A project named '{name}' already exists in {path.parent}.")
             return
-        self.repo = ProjectRepository.create(path)
-        self._activate_project("Created")
+        def ready(repo):
+            self.repo = repo
+            self._activate_project("Created")
+        self._start_project_task(lambda: ProjectRepository.create(path), ready, "Creating project...")
 
     def open_project(self) -> None:
         if self._block_project_change():
@@ -318,15 +380,17 @@ class MainWindow(QMainWindow):
         if not repo.database_path.exists():
             QMessageBox.warning(self, "Not a project", "This folder does not contain project.sqlite.")
             return
-        try:
+        def load():
             with project_execution_lock(repo.root):
                 repo.migrate()
                 interrupted = repo.recover_interrupted_runs()
-        except (RuntimeError, ValueError, OSError) as exc:
-            QMessageBox.warning(self, "Unable to open project", str(exc))
-            return
-        self.repo = repo
-        self._activate_project("Opened" + (f"; recovered {interrupted} interrupted stage runs" if interrupted else ""))
+                repo.import_project_input()
+            return interrupted
+
+        def ready(interrupted):
+            self.repo = repo
+            self._activate_project("Opened" + (f"; recovered {interrupted} interrupted stage runs" if interrupted else ""))
+        self._start_project_task(load, ready, "Opening project...")
 
     def import_csv(self) -> None:
         if self._block_project_change():
@@ -337,22 +401,14 @@ class MainWindow(QMainWindow):
         if not path:
             return
         csv_path = Path(path)
-        try:
-            preview = self.repo.preview_ligand_sync(csv_path)
-        except Exception as exc:
-            QMessageBox.critical(self, "Import failed", str(exc))
-            return
-        try:
-            result = self.repo.sync_ligands_csv(csv_path)
-        except Exception as exc:
-            QMessageBox.critical(self, "Import failed", str(exc))
-            return
-        self._write_log(
-            f"Imported into project library from {path}: added={result.added}, unchanged={result.unchanged}, "
-            f"metadata updated={result.changed}"
-        )
-        self.refresh_tables()
-        self._refresh_checkpoint_state()
+        repo = self.repo
+        def ready(result):
+            self._write_log(
+                f"Imported into project library from {path}: added={result.added}, unchanged={result.unchanged}, "
+                f"metadata updated={result.changed}"
+            )
+            self._refresh_checkpoint_state()
+        self._start_project_task(lambda: repo.sync_ligands_csv(csv_path), ready, "Importing ligands...")
 
     def _activate_project(self, action: str) -> None:
         assert self.repo
@@ -378,7 +434,6 @@ class MainWindow(QMainWindow):
             lambda result: self._write_log(f"Redocking artifacts ready: run {result.get('run_id')}")
         )
         self.redocking_queue.start()
-        self._auto_import_input()
         self._write_log(f"{action} project: {self.repo.root}")
         self.refresh_tables()
         self._refresh_checkpoint_state()
@@ -431,105 +486,99 @@ class MainWindow(QMainWindow):
         self._load_table(self.results_table, results)
 
     def _refresh_checkpoint_state(self) -> None:
-        if not self.repo:
-            return
-        profiles = [profile for profile in self.repo.get_receptor_profiles() if profile.get("enabled")]
-        profile_ids = [str(profile["id"]) for profile in profiles]
-        placeholders = ",".join("?" for _ in profile_ids)
-        structure_failed = len(self.repo.molscrub_failures())
-        with self.repo.connection() as conn:
-            parents = conn.execute("SELECT COUNT(*) FROM parent_ligands").fetchone()[0]
-            screened = conn.execute("SELECT COUNT(*) FROM screening_results s JOIN parent_ligands p USING(parent_id) WHERE s.active=1 AND s.status IN ('completed','failed')").fetchone()[0]
-            states = conn.execute("SELECT COUNT(*) FROM molecular_states WHERE active=1").fetchone()[0]
-            structure_passed = conn.execute("SELECT COUNT(DISTINCT parent_id) FROM molecular_states WHERE active=1").fetchone()[0]
-            structure_total = conn.execute("""SELECT COUNT(*) FROM parent_ligands p
-                LEFT JOIN screening_results s ON s.parent_id=p.parent_id AND s.active=1
-                WHERE s.decision NOT IN ('fail') OR ?='annotate_only'""",
-                (self.repo.get_settings().get("screening", {}).get("policy", "annotate_only"),)).fetchone()[0]
-            prepared = conn.execute("SELECT COUNT(*) FROM conformers c JOIN molecular_states s USING(state_id) WHERE s.active=1 AND c.status='pdbqt_ready'").fetchone()[0]
-            conformers = conn.execute("SELECT COUNT(*) FROM conformers c JOIN molecular_states s USING(state_id) WHERE s.active=1").fetchone()[0]
-            meeko_terminal = conn.execute("SELECT COUNT(*) FROM conformers c JOIN molecular_states s USING(state_id) WHERE s.active=1 AND c.status IN ('pdbqt_ready','pdbqt_failed')").fetchone()[0]
-            prepared_states = conn.execute("SELECT COUNT(DISTINCT s.state_id) FROM conformers c JOIN molecular_states s USING(state_id) WHERE s.active=1 AND c.status='pdbqt_ready'").fetchone()[0]
-            if profile_ids:
-                docked = conn.execute(f"SELECT COUNT(*) FROM docking_runs d JOIN molecular_states s USING(state_id) WHERE s.active=1 AND d.status='completed' AND d.is_current=1 AND d.receptor_profile_id IN ({placeholders})", profile_ids).fetchone()[0]
-                docking_terminal = conn.execute(f"SELECT COUNT(*) FROM docking_runs d JOIN molecular_states s USING(state_id) WHERE s.active=1 AND d.status IN ('completed','failed','interrupted') AND d.is_current=1 AND d.receptor_profile_id IN ({placeholders})", profile_ids).fetchone()[0]
-            else:
-                docked = docking_terminal = 0
-        self.overall_progress.reset()
-        if parents and screened == parents:
-            self.overall_progress.complete_stage("screening")
-        elif screened:
-            self.overall_progress.start_stage("screening")
-        if structure_total and structure_passed + structure_failed >= structure_total:
-            if structure_failed:
-                self.overall_progress.states["molscrub"] = "warning"
-                self.overall_progress.update()
-            else:
-                self.overall_progress.complete_stage("molscrub")
-        elif structure_passed or structure_failed:
-            self.overall_progress.start_stage("molscrub")
-        if conformers and meeko_terminal == conformers:
-            self.overall_progress.complete_stage("meeko")
-        elif prepared:
-            self.overall_progress.start_stage("meeko")
-        expected_docking = prepared_states * len(profile_ids)
-        if expected_docking and docking_terminal == expected_docking:
-            self.overall_progress.complete_stage("vina")
-        elif docked:
-            self.overall_progress.start_stage("vina")
-        self._update_dashboard(parents, screened, states, prepared, docked)
+        self._request_dashboard()
 
-    def _update_dashboard(self, parents: int, screened: int, states: int, prepared: int, docked: int) -> None:
-        """Refresh the compact statistics and stage labels shown in the ribbon."""
-        if not self.repo:
+    def _refresh_live_dashboard(self) -> None:
+        self._request_dashboard()
+
+    def _request_dashboard(self) -> None:
+        if not self.repo or self._closing:
             return
+        self._dashboard_pending = True
+        if self._dashboard_worker is not None and self._dashboard_context != (self.repo, self.stage_running):
+            self._dashboard_worker.requestInterruption()
+        if self._dashboard_worker is not None or self._dashboard_timer.isActive():
+            return
+        self._start_dashboard_snapshot()
+
+    def _start_dashboard_snapshot(self) -> None:
+        if not self.repo or self._closing:
+            return
+        self._dashboard_pending = False
+        repo, running = self.repo, self.stage_running
+        self._snapshot_started = time.monotonic()
+        worker = TaskWorker(lambda: collect_dashboard(repo, running, worker.isInterruptionRequested), self)
+        self._dashboard_context = (repo, running)
+        self._dashboard_worker = worker
+        worker.succeeded.connect(lambda snapshot: self._dashboard_ready(repo, running, snapshot))
+        worker.failed.connect(lambda message: self.statusBar().showMessage(f"Dashboard update failed: {message}", 5000)
+                              if not self._closing and not worker.isInterruptionRequested() else None)
+        worker.finished.connect(self._dashboard_finished)
+        worker.start()
+
+    def _dashboard_ready(self, repo, running, snapshot) -> None:
+        if not self._closing and self.repo is repo and self.stage_running == running:
+            self._apply_dashboard(snapshot, running)
+        else:
+            self._dashboard_pending = True
+
+    def _dashboard_finished(self) -> None:
+        self._snapshot_seconds = time.monotonic() - self._snapshot_started
+        worker, self._dashboard_worker = self._dashboard_worker, None
+        worker.deleteLater()
+        # Delay from completion, so slow queries cannot create a refresh storm.
+        if not self._closing and (self.stage_running or self._dashboard_pending):
+            self._dashboard_timer.start(1000)
+        if self._closing:
+            self.close()
+
+    def _apply_dashboard(self, snapshot, running) -> None:
+        parents = snapshot["parents"]
+        screened = snapshot["screened"]
+        states = snapshot["states"]
+        prepared = snapshot["prepared"]
+        docked = snapshot["docked"]
+        structure_total = snapshot["structure_total"]
+        structure_passed = snapshot["structure_passed"]
+        structure_failed = snapshot["structure_failed"]
+        conformers = snapshot["conformers"]
+        meeko_terminal = snapshot["meeko_terminal"]
+        expected_docking = snapshot["expected_docking"]
+        docking_terminal = snapshot["docking_terminal"]
+        passed = snapshot["passed"]
+        failed = snapshot["failed"]
+        failed_ligands = snapshot["failed_ligands"]
+        pdbqt_failed = snapshot["pdbqt_failed"]
+        pdbqt_passed = snapshot["pdbqt_passed"]
+        docking_failed = snapshot["docking_failed"]
+        docking_passed = snapshot["docking_passed"]
+        stage_runs = snapshot["stage_runs"]
+        structure_failures = snapshot["structure_failures"]
+        has_docking_exports = snapshot["has_docking_exports"]
+        export_status = snapshot["export_status"]
         self._dashboard_values = (parents, screened, states, prepared, docked)
-        profiles = [profile for profile in self.repo.get_receptor_profiles() if profile.get("enabled")]
-        profile_ids = [str(profile["id"]) for profile in profiles]
-        placeholders = ",".join("?" for _ in profile_ids)
-        structure_failures = self.repo.molscrub_failures()
-        with self.repo.connection() as conn:
-            passed = conn.execute("SELECT COUNT(*) FROM screening_results s JOIN parent_ligands p USING(parent_id) WHERE s.active=1 AND s.decision != 'fail'").fetchone()[0]
-            failed = conn.execute("SELECT COUNT(*) FROM screening_results s JOIN parent_ligands p USING(parent_id) WHERE s.active=1 AND s.decision = 'fail'").fetchone()[0]
-            structure_failed = len(structure_failures)
-            screening_failed_ids = {row[0] for row in conn.execute("SELECT parent_id FROM screening_results WHERE active=1 AND decision='fail'")}
-            failed_ligands = len(screening_failed_ids | {row["parent_id"] for row in structure_failures})
-            structure_passed = conn.execute("SELECT COUNT(DISTINCT parent_id) FROM molecular_states WHERE active=1").fetchone()[0]
-            pdbqt_failed = conn.execute("SELECT COUNT(DISTINCT s.parent_id) FROM molecular_states s JOIN parent_ligands p USING(parent_id) WHERE s.active=1 AND s.status='pdbqt_failed'").fetchone()[0]
-            pdbqt_passed = conn.execute("SELECT COUNT(DISTINCT s.parent_id) FROM molecular_states s JOIN parent_ligands p USING(parent_id) JOIN conformers c USING(state_id) WHERE s.active=1 AND c.status='pdbqt_ready'").fetchone()[0]
-            if profile_ids:
-                docking_failed = conn.execute(f"""SELECT COUNT(DISTINCT s.parent_id || ':' || d.receptor_profile_id)
-                    FROM docking_runs d JOIN molecular_states s USING(state_id) JOIN parent_ligands p USING(parent_id)
-                    WHERE s.active=1 AND d.status IN ('failed','interrupted') AND d.is_current=1
-                    AND d.receptor_profile_id IN ({placeholders})""", profile_ids).fetchone()[0]
-                docking_passed = conn.execute(f"""SELECT COUNT(DISTINCT s.parent_id || ':' || d.receptor_profile_id)
-                    FROM docking_runs d JOIN molecular_states s USING(state_id) JOIN parent_ligands p USING(parent_id)
-                    WHERE s.active=1 AND d.status='completed' AND d.is_current=1
-                    AND d.receptor_profile_id IN ({placeholders})""", profile_ids).fetchone()[0]
-            else:
-                docking_failed = docking_passed = 0
-            stage_runs = conn.execute("SELECT COUNT(*) FROM stage_runs").fetchone()[0]
-            screening_failures = conn.execute("""SELECT p.parent_id, COALESCE(s.reason, 'Screening rule failure')
-                FROM screening_results s JOIN parent_ligands p USING(parent_id)
-                WHERE s.active=1 AND s.decision='fail' ORDER BY p.parent_id LIMIT 6""").fetchall()
-            pdbqt_failures = conn.execute("""SELECT state_id, COALESCE(reason, 'PDBQT generation failed')
-                FROM molecular_states WHERE active=1 AND status='pdbqt_failed' ORDER BY state_id LIMIT 6""").fetchall()
-            docking_failures = conn.execute("""SELECT s.state_id, CASE
-                WHEN COUNT(p.pose_id)=0 THEN 'No valid Vina poses'
-                ELSE 'Docking failed' END
-                FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id
-                LEFT JOIN docking_poses p ON p.run_id=d.run_id
-                WHERE s.active=1 AND d.status IN ('failed','interrupted') GROUP BY d.run_id, s.state_id ORDER BY s.state_id LIMIT 6""").fetchall()
-            # Directory scans belong to idle refreshes. Walking thousands of
-            # exports here prevents Qt from delivering queued stage updates or Stop.
-            checking_exports = not self.stage_running
-            docked_exports = [tuple(row) for row in conn.execute(f"""SELECT DISTINCT d.receptor_profile_id, s.parent_id, s.state_id, d.run_id
-                FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id JOIN parent_ligands p USING(parent_id)
-                WHERE s.active=1 AND d.status='completed' AND d.is_current=1
-                AND d.receptor_profile_id IN ({placeholders})""", profile_ids).fetchall()] if profile_ids and checking_exports else []
-            validated_profiles = {str(row[0]) for row in conn.execute(
-                "SELECT DISTINCT receptor_profile_id FROM redocking_runs WHERE status='ARTIFACTS_READY'"
-            ).fetchall()} if checking_exports else set()
+        if not running:
+            self.overall_progress.reset()
+            if parents and screened == parents:
+                self.overall_progress.complete_stage("screening")
+            elif screened:
+                self.overall_progress.start_stage("screening")
+            if structure_total and structure_passed + structure_failed >= structure_total:
+                if structure_failed:
+                    self.overall_progress.states["molscrub"] = "warning"
+                    self.overall_progress.update()
+                else:
+                    self.overall_progress.complete_stage("molscrub")
+            elif structure_passed or structure_failed:
+                self.overall_progress.start_stage("molscrub")
+            if conformers and meeko_terminal == conformers:
+                self.overall_progress.complete_stage("meeko")
+            elif prepared:
+                self.overall_progress.start_stage("meeko")
+            if expected_docking and docking_terminal == expected_docking:
+                self.overall_progress.complete_stage("vina")
+            elif docked:
+                self.overall_progress.start_stage("vina")
         self.stat_cards["ligands"].setText(str(parents))
         self.stat_cards["passed"].setText(str(passed))
         self.stat_cards["failed"].setText(str(failed_ligands))
@@ -548,28 +597,6 @@ class MainWindow(QMainWindow):
             f"Failed Docking: {docking_failed}"
         )
         self.project_summary.setText(f"Current Project: {self.repo.root.name}")
-        exported_root = self.repo.root / "For_PostDocking"
-        mode = str(self.repo.get_settings().get("postdock", {}).get("mode", "split_and_sdf"))
-        expected = ("PDBQTs",) if mode == "split_only" else ("SDF",) if mode == "sdf_only" else ("SDF", "PDBQTs")
-        pending_export = False
-        for profile_id, parent_id, state_id, run_id in docked_exports:
-            def complete(folder: str) -> bool:
-                target = exported_root / profile_id / folder / parent_id / state_id / run_id
-                suffix = "*.sdf" if folder == "SDF" else "*.pdbqt"
-                return target.is_dir() and any(target.glob(suffix))
-            if not all(complete(folder) for folder in expected):
-                pending_export = True
-                break
-        profile_names = {str(profile["id"]): str(profile.get("name", profile["id"])) for profile in profiles}
-        package_update_needed = any(
-            not (exported_root / profile_id / receptor_export_filename(profile_names[profile_id])).is_file()
-            or (profile_id in validated_profiles and not (exported_root / profile_id / "reference_ligand_heavy.mol2").is_file())
-            for profile_id in {str(row[0]) for row in docked_exports}
-        )
-        has_docking_exports = bool(docked_exports) if checking_exports else bool(docking_passed)
-        export_status = ("Ready" if not checking_exports or pending_export or package_update_needed else "Complete") if has_docking_exports else "Pending"
-        # Completed results remain exportable so users can refresh an existing
-        # package when bundle contents or export settings change.
         self.docked_export_action.setEnabled(has_docking_exports)
         labels = {
             "screening": f"Screening\n{passed} passed; {failed} failed",
@@ -597,22 +624,6 @@ class MainWindow(QMainWindow):
             else:
                 button.setStyleSheet("QPushButton { color: #374151; background: #f3f4f6; border: 1px solid #d1d5db; }")
 
-    def _refresh_live_dashboard(self) -> None:
-        if not self.repo:
-            return
-        profile_ids = [str(profile["id"]) for profile in self.repo.get_receptor_profiles() if profile.get("enabled")]
-        placeholders = ",".join("?" for _ in profile_ids)
-        with self.repo.connection() as conn:
-            docked = conn.execute(f"SELECT COUNT(*) FROM docking_runs d JOIN molecular_states s USING(state_id) WHERE s.active=1 AND d.status='completed' AND d.is_current=1 AND d.receptor_profile_id IN ({placeholders})", profile_ids).fetchone()[0] if profile_ids else 0
-            values = (
-                conn.execute("SELECT COUNT(*) FROM parent_ligands").fetchone()[0],
-                conn.execute("SELECT COUNT(*) FROM screening_results s JOIN parent_ligands p USING(parent_id) WHERE s.active=1 AND s.status IN ('completed','failed')").fetchone()[0],
-                conn.execute("SELECT COUNT(*) FROM molecular_states WHERE active=1").fetchone()[0],
-                conn.execute("SELECT COUNT(*) FROM conformers c JOIN molecular_states s USING(state_id) WHERE s.active=1 AND c.status='pdbqt_ready'").fetchone()[0],
-                docked,
-            )
-        self._update_dashboard(*values)
-
     @staticmethod
     def _load_table(table: QTableWidget, rows: list[object]) -> None:
         table.setRowCount(len(rows))
@@ -634,6 +645,24 @@ class MainWindow(QMainWindow):
 
         TroubleshooterDialog(self.repo.root if self.repo else application_root(), self).exec()
 
+    def _record_gui_heartbeat(self):
+        now = time.monotonic()
+        self._gui_max_gap = max(self._gui_max_gap, now - self._gui_last_tick)
+        self._gui_last_tick = now
+
+    def save_performance_report(self):
+        if not self.repo or self._project_task is not None:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save performance report", "moldockpipe-performance.json", "JSON (*.json)")
+        if not path:
+            return
+        from ..performance import save_performance_report
+        repo = self.repo
+        metrics = {"heartbeat_max_gap_seconds": self._gui_max_gap,
+                   "last_dashboard_seconds": self._snapshot_seconds, "pipeline_running": self.stage_running}
+        self._start_project_task(lambda: save_performance_report(repo, Path(path), metrics),
+            lambda result: self._write_log(f"Saved performance report: {result}"), "Saving performance report...")
+
     def run_molscrub(self) -> None:
         self._start_pipeline(["molscrub"], "MolScrub")
 
@@ -641,7 +670,7 @@ class MainWindow(QMainWindow):
         self._start_pipeline(["meeko"], "Meeko")
 
     def _start_pipeline(self, stages: list[str], label: str) -> None:
-        if not self.repo or self._pipeline_active():
+        if not self.repo or self._pipeline_active() or self._closing or self._project_task is not None:
             return
         self.stage_running = True
         self.stage_started_at = time.monotonic()
@@ -710,27 +739,36 @@ class MainWindow(QMainWindow):
     def select_compounds_for_export(self) -> None:
         if not self.repo or self.stage_running:
             return
-        profile_ids = [str(profile["id"]) for profile in self.repo.get_receptor_profiles() if profile.get("enabled")]
-        placeholders = ",".join("?" for _ in profile_ids)
-        with self.repo.connection() as conn:
-            rows = conn.execute(f"""SELECT s.parent_id, MIN(p.affinity) best_affinity
-                FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id
-                JOIN parent_ligands l ON l.parent_id=s.parent_id
-                JOIN docking_poses p ON p.run_id=d.run_id
-                WHERE s.active=1 AND d.status='completed' AND d.is_current=1
-                AND d.receptor_profile_id IN ({placeholders})
-                GROUP BY s.parent_id ORDER BY best_affinity ASC, s.parent_id""", profile_ids).fetchall() if profile_ids else []
-        current = self.repo.get_settings().get("postdock", {}).get("selected_parents", [])
-        dialog = CompoundSelectorDialog(rows, set(current), self.repo, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        selected = dialog.selected()
-        if not selected:
-            QMessageBox.warning(self, "Select compounds", "Select at least one successfully docked compound to export.")
-            return
-        self.repo.update_settings({"postdock": {"selected_parents": selected}})
-        self._write_log(f"Export selected compounds: {len(selected)}")
-        self.run_postdock()
+        repo = self.repo
+        def load():
+            profiles = [str(profile['id']) for profile in repo.get_receptor_profiles() if profile.get('enabled')]
+            with repo.connection() as conn:
+                rows = [dict(row) for row in conn.execute(f"""SELECT s.parent_id, MIN(p.affinity) best_affinity
+                    FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id
+                    JOIN parent_ligands l ON l.parent_id=s.parent_id JOIN docking_poses p ON p.run_id=d.run_id
+                    WHERE s.active=1 AND d.status='completed' AND d.is_current=1
+                    AND d.receptor_profile_id IN ({','.join('?' for _ in profiles)})
+                    GROUP BY s.parent_id ORDER BY best_affinity,s.parent_id""", profiles)] if profiles else []
+            for row in rows:
+                # Preserve the selector's legacy export markers. A partially
+                # exported receptor campaign must remain selectable for resume.
+                row['exported'] = any((repo.root / 'For_PostDocking' / folder / row['parent_id']).exists()
+                                      for folder in ('SDF', 'PDBQTs'))
+            return rows, repo.get_settings().get('postdock', {}).get('selected_parents', [])
+
+        def ready(result):
+            rows, current = result
+            dialog = CompoundSelectorDialog(rows, set(current), repo, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            selected = dialog.selected()
+            if not selected:
+                QMessageBox.warning(self, "Select compounds", "Select at least one successfully docked compound to export.")
+                return
+            repo.update_settings({'postdock': {'selected_parents': selected}})
+            self._write_log(f"Export selected compounds: {len(selected)}")
+            QTimer.singleShot(0, self.run_postdock)
+        self._start_project_task(load, ready, "Loading docked compounds...")
 
     def run_all(self) -> None:
         self.overall_progress.reset()
@@ -859,20 +897,13 @@ class MainWindow(QMainWindow):
     def refresh_dashboard(self) -> None:
         if not self.repo or self.stage_running:
             return
-        candidate = self._project_input_csv()
-        if candidate and self._input_csv_has_ligand_rows(candidate):
-            try:
-                result = self.repo.sync_ligands_csv(candidate)
-            except Exception as exc:
-                QMessageBox.critical(self, "Input reload failed", str(exc))
-                return
-            self._write_log(
-                f"Reloaded ligands from {candidate}: added={result.added}, unchanged={result.unchanged}, "
-                f"metadata updated={result.changed}"
-            )
-        self.refresh_tables()
-        self._refresh_checkpoint_state()
-        self._write_log("Dashboard refreshed")
+        if self._project_task is not None:
+            return
+        repo = self.repo
+        def ready(result):
+            self._write_log(f"Reloaded ligands: added={result.added}, unchanged={result.unchanged}, metadata updated={result.changed}")
+            self._refresh_checkpoint_state()
+        self._start_project_task(repo.import_project_input, ready, "Refreshing project inputs...")
 
     @staticmethod
     def _event_summary(event: object) -> str:

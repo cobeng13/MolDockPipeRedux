@@ -35,27 +35,18 @@ def test_active_dashboard_never_walks_export_directories(tmp_path, monkeypatch, 
         conn.execute("""INSERT INTO docking_runs
             (run_id,state_id,receptor_hash,settings_fingerprint,status,is_current,receptor_profile_id)
             VALUES ('run','s','receptor','fp','completed',1,'rec')""")
-    fake = SimpleNamespace(
-        repo=repo, stage_running=running,
-        stat_cards={key: Sink() for key in ("ligands", "passed", "failed", "running")},
-        stat_details={key: Sink() for key in ("passed", "failed")},
-        project_summary=Sink(), docked_export_action=Sink(),
-        stage_buttons={key: Sink() for key in ("screening", "molscrub", "meeko", "vina", "postdock")},
-        overall_progress=SimpleNamespace(states={}),
-    )
+    from moldockpipe.dashboard import collect_dashboard
     scans = []
-
     def scanned(path):
         scans.append(path)
         if running:
-            pytest.fail("Active dashboard performed filesystem export scan on GUI thread")
+            pytest.fail("Active dashboard performed filesystem export scan")
         return False
-
     monkeypatch.setattr(Path, "is_dir", scanned)
-    MainWindow._update_dashboard(fake, 1, 1, 1, 1, 1)
-    assert fake.docked_export_action.enabled
-    assert "Ready" in fake.stage_buttons["postdock"].text
-    assert bool(scans) == (not running)  # idle checks retain existing export semantics
+    snapshot = collect_dashboard(repo, running)
+    assert snapshot['has_docking_exports']
+    assert snapshot['export_status'] == 'Ready'
+    assert bool(scans) == (not running)
 
 
 def test_worker_announces_stage_before_dependency_setup(tmp_path, monkeypatch):
@@ -106,3 +97,16 @@ def test_dependency_failure_clears_busy_progress_and_running_labels(monkeypatch)
     assert fake.dashboard_status.text == "Pipeline failed"
     assert "exceeded 30s" in fake.current_task_label.text
     assert fake.stop_action.enabled is False
+
+
+@pytest.mark.parametrize('kind', ['item_skipped', 'item_failed'])
+def test_failure_bursts_are_rate_limited_without_losing_final_totals(monkeypatch, kind):
+    monkeypatch.setattr(workers, 'monotonic', lambda: 0.0)
+    worker = PipelineWorker(None)
+    events = []
+    worker.progress.connect(events.append)
+    for index in range(1, 20001):
+        worker._report_progress(ProgressEvent(kind, 'molscrub', index=index, total=20000, failed=index))
+    worker._report_progress(ProgressEvent('stage_completed', 'molscrub', total=20000, failed=20000))
+    assert len(events) == 3
+    assert events[-1].failed == 20000

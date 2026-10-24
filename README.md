@@ -296,12 +296,25 @@ The **Settings** button contains tabs for:
 - Post-docking: split/export mode, poses per compound, and successfully docked compound selection.
 - Guardrails: purge generated workflow data and export data.
 
-MolScrub and Meeko default to **Automatic**, using one worker per detected
-logical CPU, limited by the number of compounds or states awaiting preparation.
+MolScrub and Meeko default to **Automatic**, using at most eight workers and
+leaving one logical CPU available for the desktop. Worker counts are also limited
+by the pending jobs and current available physical/commit memory: scheduling
+reserves at least 2 GiB or 25% of available memory and budgets 512 MiB per worker.
+If memory cannot be measured, the limit is two workers. This reduces memory
+pressure; individual chemistry jobs can exceed that estimate.
 In `project.yml`, `workers: 0` selects Automatic; positive values set a manual
-limit. Older projects using Meeko's previous default of four workers switch to
+limit, subject to the same memory budget. Older projects using Meeko's previous default of four workers switch to
 Automatic once on upgrade. Other manual limits and choices made after upgrading
 are preserved. Both stage Settings tabs offer Automatic and manual limits.
+
+Large campaigns update the dashboard through one background snapshot at a time;
+slow queries and export-file checks do not run on the GUI thread. Results load
+only the visible receptor in pages of 200 ligands. The export selector uses a
+virtual table, and project loading and CSV imports run in background workers.
+For a responsiveness or memory report, choose **Tools → Save performance report**.
+The local JSON includes app/source identifiers, record counts and indexes,
+dashboard timing, GUI heartbeat gaps, available memory, and Windows app/child
+process memory and CPU times. It includes local paths; review before sharing.
 
 Both stages keep only one batch of jobs in flight. Stop prevents new submissions
 and saves results from active jobs before exiting. MolScrub retains a separate
