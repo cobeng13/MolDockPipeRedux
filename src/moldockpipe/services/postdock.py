@@ -5,6 +5,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 
@@ -93,16 +95,35 @@ class PostDockService:
                 outputs.append(output)
             return outputs
 
-    def export_sdf(self, input_pdbqt: Path, output_sdf: Path, log: Path) -> None:
+    def export_sdf(self, input_pdbqt: Path, output_sdf: Path, log: Path, *,
+                   cancelled: Callable[[], bool] | None = None) -> None:
         output_sdf.parent.mkdir(parents=True, exist_ok=True)
         log.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="mdp_") as directory:
             work = Path(directory)
             shutil.copy2(input_pdbqt, work / "input.pdbqt")
-            result = subprocess.run(
-                [sys.executable, "-m", "meeko.cli.mk_export", "input.pdbqt", "-s", "output.sdf"],
-                cwd=work, text=True, capture_output=True, check=False,
-            )
+            command = [sys.executable, "-m", "meeko.cli.mk_export", "input.pdbqt", "-s", "output.sdf"]
+            if cancelled is None:
+                result = subprocess.run(command, cwd=work, text=True, capture_output=True, check=False)
+            else:
+                process = subprocess.Popen(command, cwd=work, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                started = time.monotonic()
+                try:
+                    while True:
+                        if cancelled():
+                            raise InterruptedError("Pose loading cancelled")
+                        if time.monotonic() - started > 120:
+                            raise TimeoutError("Pose conversion exceeded two minutes")
+                        try:
+                            stdout, stderr = process.communicate(timeout=0.1)
+                            result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+                            break
+                        except subprocess.TimeoutExpired:
+                            continue
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.communicate()
             log.write_text(result.stdout + "\n" + result.stderr, encoding="utf-8")
             generated = work / "output.sdf"
             if result.returncode or not generated.exists() or generated.stat().st_size == 0:

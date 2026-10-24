@@ -994,7 +994,11 @@ class MainWindow(QMainWindow):
 
     def show_multidock_results(self) -> None:
         if self.repo:
-            DockingResultsDialog(self.repo, self).exec()
+            dialog = DockingResultsDialog(self.repo, self)
+            try:
+                dialog.exec()
+            finally:
+                dialog.deleteLater()
 
     def _on_workflow_reset(self) -> None:
         if not self.repo:

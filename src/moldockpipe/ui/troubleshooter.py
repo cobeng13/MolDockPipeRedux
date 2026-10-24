@@ -19,7 +19,7 @@ class TroubleshooterDialog(QDialog):
         self.resize(850, 620)
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
-            "Test RDKit, MolScrub, Meeko, Vina CPU and Vina GPU in the app's environment.\n"
+            "Test RDKit, MolScrub, Meeko, Vina CPU/GPU and WebEngine bindings/assets in the app's environment.\n"
             "Uses temporary test molecules. GPU checks run a small docking job; allow a few minutes.\n"
             "Vina GPU is optional for CPU users. Reports include local paths; review before sharing."
         ))

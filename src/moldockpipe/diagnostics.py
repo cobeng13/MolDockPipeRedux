@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from importlib import metadata, util
 from pathlib import Path
 
-CHECKS = ("rdkit", "molscrub", "meeko", "vina", "vinagpu")
+CHECKS = ("rdkit", "molscrub", "meeko", "vina", "vinagpu", "webengine")
 TIMEOUT = 120
 
 
@@ -69,6 +69,18 @@ def _probe(name: str, root: Path, work: Path) -> None:
         _run([sys.executable, "-m", "meeko.cli.mk_prepare_receptor", "--help"], timeout=20)
         _run([sys.executable, "-m", "meeko.cli.mk_export", "--help"], timeout=20)
         print("Ethanol PDBQT preparation passed; receptor and export commands load successfully.")
+    elif name == "webengine":
+        from .__main__ import configure_qt_runtime
+        configure_qt_runtime()
+        from PyQt6.QtWebEngineWidgets import QWebEngineView
+        from PyQt6.QtWebChannel import QWebChannel
+        assets = Path(__file__).parent / "ui" / "assets" / "molecular_viewer"
+        for filename in ("viewer.html", "viewer.js", "3Dmol-2.5.5.min.js"):
+            path = assets / filename
+            if not path.is_file() or path.stat().st_size == 0:
+                raise RuntimeError(f"Offline viewer asset missing or empty: {path}")
+        print("PyQt6 WebEngine/WebChannel bindings and offline viewer assets load successfully.")
+        print("This check does not start a graphics window. Verify WebGL and PNG export in Results.")
     else:
         from .services.vina import find_vina_executable
         from .services.vinagpu import KERNEL_NAMES, find_vinagpu_executable, vinagpu_tool_hash
@@ -98,14 +110,14 @@ def _probe(name: str, root: Path, work: Path) -> None:
         print("Small docking job produced a valid scored pose.")
 
 
-def _package_info(name: str) -> dict[str, str | None]:
+def _package_info(name: str, module_name: str | None = None) -> dict[str, str | None]:
     info: dict[str, str | None] = {"version": None, "location": None}
     try:
         info["version"] = metadata.version(name)
     except metadata.PackageNotFoundError:
         pass
     try:
-        spec = util.find_spec(name)
+        spec = util.find_spec(module_name or name)
         info["location"] = spec.origin if spec else None
     except Exception as exc:
         info["location"] = str(exc)
@@ -114,6 +126,11 @@ def _package_info(name: str) -> dict[str, str | None]:
 
 def _advice(name: str, root: Path) -> str:
     python = subprocess.list2cmdline([sys.executable])
+    if name == "webengine":
+        return ("For the desktop viewer, create the Conda environment from environment.yml in the source checkout "
+                "and launch the app from that environment. Keep Qt and WebEngine from the same distribution; "
+                "do not replace Conda's Qt runtime with pip Qt wheels. Check README.md for first-time setup. "
+                "WebEngine is optional for headless pipeline execution.")
     if name in {"vina", "vinagpu"}:
         return ("Check the executable path and runtime libraries. " +
                 ("Check both kernel files beside Vina-GPU and the GPU vendor's OpenCL driver. "
@@ -136,6 +153,8 @@ def run_diagnostics(root: Path) -> dict:
               "virtual_env": os.environ.get("VIRTUAL_ENV"),
               "packages": {name: _package_info(name) for name in ("rdkit", "molscrub", "meeko", "scipy", "gemmi")},
               "checks": []}
+    report["packages"]["PyQt6"] = _package_info("PyQt6")
+    report["packages"]["PyQt6-WebEngine"] = _package_info("PyQt6-WebEngine", "PyQt6.QtWebEngineWidgets")
     for name in CHECKS:
         command = [sys.executable, "-m", "moldockpipe.diagnostics", name, str(root)]
         try:
@@ -160,7 +179,8 @@ def run_diagnostics(root: Path) -> dict:
 def format_report(report: dict) -> str:
     lines = ["MolDockPipe Troubleshooter", "",
              *(f"[{check['status']}] {check['name']}" for check in report['checks']), "",
-             "Vina GPU is optional when using CPU docking.", "", f"Python: {report['python']}",
+             "Vina GPU is optional when using CPU docking. WebEngine is optional for headless execution.",
+             "WebEngine checks bindings/assets; verify WebGL and PNG export in Results.", "", f"Python: {report['python']}",
              f"Version: {report['python_version']}", f"Environment: {report['prefix']}",
              f"Platform: {report['platform']}", f"Project/tool search root: {report['project_root']}",
              f"Conda: {report['conda_prefix']}", f"Virtual environment: {report['virtual_env']}",

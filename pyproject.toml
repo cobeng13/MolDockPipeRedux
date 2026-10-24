@@ -23,6 +23,7 @@ dev = ["pytest>=8.0"]
 
 # Install PyQt6 with Conda alongside RDKit. Installing its wheel with pip can
 # replace Conda's native Qt runtime and break Windows plugin discovery.
+# environment.yml supplies RDKit, PyQt and PyQtWebEngine for desktop installs.
 
 [project.scripts]
 moldockpipe = "moldockpipe.__main__:main"
@@ -32,3 +33,6 @@ testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+moldockpipe = ["ui/assets/molecular_viewer/*"]

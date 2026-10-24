@@ -25,7 +25,7 @@ def test_failures_timeouts_and_native_crashes_do_not_stop_other_checks(tmp_path,
     monkeypatch.setattr(diagnostics.subprocess, "run", run)
     report = diagnostics.run_diagnostics(tmp_path)
     assert calls == list(diagnostics.CHECKS)
-    assert [check["status"] for check in report["checks"]] == ["FAIL"] * 3 + ["PASS"] * 2
+    assert [check["status"] for check in report["checks"]] == ["FAIL"] * 3 + ["PASS"] * 3
     rendered = diagnostics.format_report(report)
     assert "partial output" in rendered and "exceeded 120 seconds" in rendered
     assert "ImportError: missing dependency" in rendered and "native crash" in rendered
@@ -78,3 +78,48 @@ def test_doctor_cli_saves_report_without_loading_qt(tmp_path, monkeypatch, capsy
     import json
     assert json.loads(output.read_text()) == report
     assert json.loads(capsys.readouterr().out) == report
+
+
+def test_webengine_import_failure_is_reported_with_conda_guidance(tmp_path, monkeypatch):
+    monkeypatch.setattr(diagnostics.platform, "platform", lambda: "Windows test")
+    def run(command, **kwargs):
+        if command[3] == "webengine":
+            return subprocess.CompletedProcess(command, 1, "", "ImportError: QtWebEngineWidgets missing")
+        return subprocess.CompletedProcess(command, 0, "passed", "")
+
+    monkeypatch.setattr(diagnostics.subprocess, "run", run)
+    report = diagnostics.run_diagnostics(tmp_path)
+    check = next(check for check in report["checks"] if check["name"] == "webengine")
+    assert check["status"] == "FAIL"
+    assert "environment.yml" in check["suggestion"]
+    assert "optional for headless" in check["suggestion"]
+    assert all(check["status"] == "PASS" for check in report["checks"][:-1])
+
+
+def test_webengine_probe_checks_assets_without_constructing_a_window(tmp_path, monkeypatch, capsys):
+    from moldockpipe import __main__
+    import pytest
+    original = builtins.__import__
+
+    class NoWindow:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("The import check must not create a graphics window")
+
+    def fake_import(name, *args, **kwargs):
+        if name == "PyQt6.QtWebEngineWidgets":
+            return type("WebEngine", (), {"QWebEngineView": NoWindow})
+        if name == "PyQt6.QtWebChannel":
+            return type("WebChannel", (), {"QWebChannel": NoWindow})
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(__main__, "configure_qt_runtime", lambda: None)
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(diagnostics, "__file__", str(tmp_path / "diagnostics.py"))
+    assets = tmp_path / "ui/assets/molecular_viewer"
+    assets.mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="asset missing"):
+        diagnostics._probe("webengine", tmp_path, tmp_path)
+    for filename in ("viewer.html", "viewer.js", "3Dmol-2.5.5.min.js"):
+        (assets / filename).write_text("test asset")
+    diagnostics._probe("webengine", tmp_path, tmp_path)
+    assert "does not start a graphics window" in capsys.readouterr().out

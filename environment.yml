@@ -1,0 +1,19 @@
+# Windows desktop setup, including the offline 3D Results viewer.
+# Run from the repository root: conda env create --file environment.yml
+# Keep the native Qt stack on one channel; do not add pip Qt runtime wheels.
+name: moldockpipe-clean
+channels:
+  - defaults
+  - nodefaults
+dependencies:
+  - python=3.13
+  # This build supplies pip metadata, preventing MolScrub's dependency resolver
+  # from installing a second RDKit over the Conda-managed package.
+  - conda-forge::rdkit=2026.03.*
+  - pyqt=6.11.*
+  - pyqtwebengine=6.11.*
+  - pip
+  - git
+  - pip:
+      # pyproject.toml remains the source of truth for Python dependencies.
+      - -e .[chemistry,dev]

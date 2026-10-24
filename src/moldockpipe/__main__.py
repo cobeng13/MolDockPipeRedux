@@ -97,6 +97,9 @@ def main() -> int:
         return _run_project(args.project, args.stages)
     try:
         configure_qt_runtime()
+        from PyQt6.QtCore import QCoreApplication, Qt
+        # Optional Results WebEngine views may be created after QApplication.
+        QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
         from PyQt6.QtWidgets import QApplication
         from .ui.main_window import MainWindow
     except ImportError as exc:

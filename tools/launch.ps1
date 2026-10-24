@@ -27,7 +27,7 @@ if (-not $condaExecutable) {
     }
 }
 if (-not $condaExecutable) {
-    throw 'Conda was not found. Install the course Conda environment first, or run this launcher from a Conda terminal.'
+    throw 'Conda was not found. Install Miniconda/Anaconda, then follow the first-time setup in README.md (conda env create --file environment.yml).'
 }
 Push-Location -LiteralPath $repositoryRoot
 try {
@@ -39,6 +39,7 @@ try {
     $launchExitCode = $LASTEXITCODE
     if ($launchExitCode -ne 0) {
         Write-Host "Launch/check failed. Verify the '$EnvironmentName' Conda environment using README.md."
+        Write-Host 'For first-time setup, run conda env create --file environment.yml from the repository folder.'
     }
 } finally {
     Pop-Location

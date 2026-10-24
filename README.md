@@ -4,21 +4,148 @@ PyQt6 desktop workflow for traceable virtual screening projects. It keeps submit
 ligands, generated molecular states, docking runs, poses, and scientific artifacts
 separate. The legacy scripts remain in `Reference/` as behavioral reference only.
 
-## Installation
+## First-time installation (Windows desktop)
 
-RDKit is best installed from conda-forge. Install the application into that environment:
+Install **64-bit Miniconda or Anaconda** and **Git for Windows** first. Open an
+Anaconda/Miniconda PowerShell Prompt. Internet access is needed for installation;
+the molecular viewer itself works offline afterward.
+
+Clone the repository and run these commands from its root (the folder containing
+`environment.yml` and `pyproject.toml`):
 
 ```powershell
-conda create -n moldockpipe-clean -c conda-forge python=3.13 rdkit pyqt6 pip
+git clone https://github.com/cobeng13/MolDockPipeRedux.git
+cd MolDockPipeRedux
+conda env create --file environment.yml
 conda activate moldockpipe-clean
-pip install -e ".[chemistry,dev]"
-python -m pytest -q
-moldockpipe
+python -m pip check
+python -m moldockpipe doctor --output diagnostics.txt
+python -m moldockpipe ui
 ```
 
-Keep RDKit and PyQt6 Conda-managed. The project installs MolScrub, Meeko, SciPy,
-Gemmi, Joblib, and the test dependencies through pip. Do not install a pip PyQt6
-wheel into the same environment.
+`environment.yml` installs Python 3.13, RDKit, PyQt 6.11, **PyQtWebEngine 6.11**,
+and the application's chemistry/test dependencies. RDKit is explicitly sourced
+from conda-forge so pip recognizes the installed package; all native Qt packages
+come from the matched defaults-channel distribution. The environment name matches
+both Windows launchers. After setup, double-click `Launch-MolDockPipe.cmd` to start
+the application; the terminal command above also works.
+
+There is no separate `requirements.txt`: `environment.yml` supplies the native
+desktop packages and installs `.[chemistry,dev]` from `pyproject.toml` through
+pip. Keep RDKit and Qt Conda-managed. Do not separately install pip `PyQt6` or
+`PyQt6-WebEngine-Qt6` runtime wheels into this environment.
+
+Review `diagnostics.txt` before continuing if required chemistry or CPU Vina
+checks fail. An optional Vina-GPU failure is expected on unsupported GPUs. The
+WebEngine check verifies bindings and bundled viewer files; to verify graphics,
+open a project with completed docking results, select a compound in Results,
+rotate its receptor/ligand view, and export a PNG. Working WebGL is required.
+
+For development, `python -m pytest -q` runs the regression suite. CPU Vina and
+Vina Split binaries are included in the source checkout. GPU docking and the
+AD4Zn protocol have additional runtime requirements documented under `tools/`.
+
+### Updating an existing installation
+
+Close the application and run `git pull` from the repository root. For an
+environment originally created using this `environment.yml`:
+
+```powershell
+conda env update --file environment.yml
+conda activate moldockpipe-clean
+python -m pip check
+python -m moldockpipe ui
+```
+
+For an older or mixed-channel environment, create a separate clean environment
+instead of mixing native Qt distributions. If `moldockpipe-clean` already exists,
+choose a new name without deleting it:
+
+```powershell
+conda env create --name moldockpipe-desktop --file environment.yml
+conda activate moldockpipe-desktop
+python -m moldockpipe ui
+```
+
+To use that custom name with the double-click launcher, create a shortcut whose
+target ends with `Launch-MolDockPipe.cmd -EnvironmentName moldockpipe-desktop`,
+or run `./Launch-MolDockPipe.cmd -EnvironmentName moldockpipe-desktop` in
+PowerShell. Existing project folders do not need to be recreated.
+
+### Optional interactive Results viewer
+
+Open **Multidock Results**, then select a completed compound. The panel beside
+the receptor tabs displays its prepared receptor and best ligand pose. The mode
+selector switches among poses from that same state and docking run. Drag to
+rotate, scroll to zoom, choose receptor Cartoon/Sticks, toggle the receptor,
+focus the ligand, or reset the initial camera. **Export PNG** saves only the
+molecular canvas, at twice its displayed width and height with a white background.
+Existing PDB/SDF exports remain available through the Export menu.
+
+The viewer works offline: 3Dmol.js 2.5.5 and its license notices ship with the
+application. Structures come directly from docking artifacts; running postdock
+export first is unnecessary. Missing or changed structures produce an error
+instead of displaying an unmatched complex.
+
+Interaction toggles display colored dashed lines for **H-bonds** (blue),
+**π–π** (purple), **cation–π** (orange), **salt bridges** (green), and
+**hydrophobic contacts** (gray, initially hidden). Counts include all detected
+contacts, including hidden types. Contacted residues appear as sticks on the
+cartoon. Toggle **Contact labels** to show residue identity, interaction type,
+and distance in Å; hiding the receptor also hides these annotations.
+PNG exports include the visible contacts and labels. **Interaction criteria…**
+explains the rules inside Results. No additional installation is required.
+
+These are geometric predictions, not validated bonds, interaction energies,
+or changes to docking scores. Analysis runs in the existing loading worker,
+uses the original coordinates, and never generates hydrogens or changes
+protonation. RDKit chemical features identify ligand donors/acceptors and
+aromatic 5/6-member rings; ligand charge groups require actual SDF formal charge.
+Protein roles use standard amino-acid templates. ASP/GLU are assumed negative
+(unless an explicit acid hydrogen is present), LYS/ARG positive; histidine
+H-bond roles require explicit ring hydrogens. Uncertain protonation can alter
+assignments. Waters, metals, cofactors, modified residues, water bridges,
+halogen bonds, and metal coordination are outside this first implementation.
+Only the first receptor model and blank/A alternate locations are considered.
+
+| Contact | Geometry used |
+| --- | --- |
+| H-bond | Donor–acceptor ≤3.5 Å. With explicit donor H: H–A ≤2.6 Å and D–H–A ≥120°. Without donor H: every heavy-neighbor–D–A angle ≥90°; explicitly labeled **candidate**. |
+| π–π | Ring centers ≤5.5 Å; acute plane angle ≤30° (parallel) or ≥60° (T-shaped); minimum of the two ring-plane offsets ≤2 Å. Ring atoms must be planar within 0.15 Å. |
+| Cation–π | Positive group–ring center ≤6 Å; in-plane offset ≤2 Å. |
+| Salt bridge | Opposite charge group centers ≤4 Å. |
+| Hydrophobic | Nonpolar C···C ≤4 Å; carbon neighbors limited to C/H/S; shortest contact per residue. |
+
+Distances below 0.5 Å are excluded as coincident coordinates, not contacts.
+Ring and charged-group distances are measured between centers, not nearest atoms.
+This is a local geometric detector, **not PLIP**. Its ring/offset rules and
+hydrophobic cutoff are informed by the
+[PLIP documentation](https://github.com/pharmai/plip/blob/master/DOCUMENTATION.md);
+H-bond and salt-bridge cutoffs are deliberately stricter than PLIP defaults.
+Ligand feature definitions come from
+[RDKit BaseFeatures](https://github.com/rdkit/rdkit/blob/master/Data/BaseFeatures.fdef).
+
+WebEngine is included in the first-time desktop setup above. For older
+installations, use the clean-environment instructions rather than installing
+unmatched Qt packages into an existing environment. The native WebEngine library
+alone does not supply the PyQt6 Python bindings.
+
+Restart the application after installation. Working WebGL support is required.
+If WebEngine/WebGL is unavailable, the ranked Results table still works; the
+viewer displays setup guidance. Headless commands require neither WebEngine
+nor PyQt.
+
+The optional native rendering test can be run from a Windows desktop session:
+
+```powershell
+$env:MOLDOCKPIPE_WEBENGINE_TEST = "1"
+$env:QT_QPA_PLATFORM = "windows"
+python -m pytest tests/test_results_viewer.py -q
+```
+
+It verifies a structure payload over 2 MB and a nonblank PNG at exactly twice the
+viewport dimensions. The regular test suite uses a fake web canvas for UI
+selection/cancellation tests and skips this native graphics test by default.
 
 For a headless Linux or macOS environment, PyQt is not required:
 
@@ -55,10 +182,12 @@ package versions and locations, full errors, and suggested actions. Each check
 runs separately with a time limit, so an import crash does not stop other checks.
 Reports include local file paths; review them before sharing.
 
-The tests parse and embed a molecule with RDKit, generate 3D states through the
+The checks parse and embed a molecule with RDKit, generate 3D states through the
 MolScrub worker, prepare an ethanol PDBQT with Meeko, load its receptor/export
 commands, and run tiny docking jobs with Vina CPU and Vina GPU. GPU testing also
-checks the kernel files and exercises the OpenCL runtime. A missing GPU backend
+checks the kernel files and exercises the OpenCL runtime. They also import the
+WebEngine/WebChannel bindings and verify the bundled offline viewer files; this
+does not test the graphics driver or WebGL rendering. A missing GPU backend
 is expected if only CPU docking is installed. These are smoke tests, not checks
 of scientific docking accuracy or every receptor preparation scenario.
 
@@ -70,7 +199,8 @@ python -m moldockpipe doctor --project C:\path\to\project --json --output diagno
 ```
 
 The command exits with code 1 if any check fails, including an unavailable optional
-GPU backend. It uses temporary fixtures and does not change project data.
+GPU backend or desktop viewer in a headless installation. It uses temporary
+fixtures and does not change project data.
 
 An installed package is not necessarily importable: a dependency, incompatible
 API, or native DLL may fail at import time. MolScrub errors now retain that cause.
