@@ -64,8 +64,26 @@ are not written into portable project profiles. Invalid overrides fail without
 falling back. Without overrides, discovery checks application tools/ad4zn,
 project tools/ad4zn, installed ADFR runtimes, then PATH. Conventional names are pythonsh(.exe),
 autogrid4(.exe), zinc_pseudo.py, prepare_gpf4zn.py, and AD4Zn.dat.
-Other OSes can use compatible native tools through the same overrides; their
-ADFR runtimes have not been validated by this Windows-first integration.
+On macOS, discovery searches `~/ADFRsuite*`, `~/Applications/ADFRsuite*`,
+`/Applications/ADFRsuite*`, `~/Downloads/ADFRsuite*`, `/opt/ADFRsuite*`, and
+`/usr/local/ADFRsuite*` (folder names are matched without case sensitivity).
+It expects `bin/pythonsh` and `bin/autogrid4` inside the installation folder.
+Run the ADFR tarball's `install.sh` first; simply extracting the download does
+not establish a working runtime. Custom destinations can use these overrides
+from the same Terminal session used to launch MolDockPipe:
+
+```sh
+export MOLDOCKPIPE_AD4ZN_PYTHON="/actual/path/to/ADFRsuite-1.0/bin/pythonsh"
+export MOLDOCKPIPE_AD4ZN_AUTOGRID="/actual/path/to/ADFRsuite-1.0/bin/autogrid4"
+python -m moldockpipe ui
+```
+
+Both files must be nonempty and executable on macOS/Linux. If a valid
+installation is still reported missing, check for stale overrides with
+`env | grep MOLDOCKPIPE_AD4ZN`. A Finder-launched app may have a different PATH
+and environment from Terminal. Discovery finds files only; runtime import and
+AutoGrid version checks still run before preparation. Native macOS ADFR execution
+has not been validated by this Windows-first integration.
 
 Official sources:
 

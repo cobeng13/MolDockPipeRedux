@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,19 +54,28 @@ class AD4ZnEnvironment:
         return dict(self.components)
 
 
-def adfr_installations() -> list[Path]:
-    """Find conventional ADFR installations without changing the host environment."""
-    roots = [Path.home()]
+def _adfr_search_roots() -> list[Path]:
+    home = Path.home()
+    roots = [home]
+    if sys.platform == "darwin":
+        roots += [home / "Applications", Path("/Applications"), home / "Downloads",
+                  Path("/opt"), Path("/usr/local")]
     for variable in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
         value = os.environ.get(variable)
         if value:
             roots.append(Path(value))
             if variable == "LOCALAPPDATA":
                 roots.append(Path(value) / "Programs")
+    return roots
+
+
+def adfr_installations() -> list[Path]:
+    """Find conventional ADFR installations without changing the host environment."""
     found = []
-    for root in roots:
+    for root in _adfr_search_roots():
         try:
-            found.extend(path for path in root.glob("ADFRsuite*") if path.is_dir())
+            found.extend(path for path in root.iterdir()
+                         if path.name.lower().startswith("adfrsuite") and path.is_dir())
         except OSError:
             continue
     # A custom installer location may be registered instead of using a default folder.
