@@ -93,8 +93,18 @@ class DockingResultsDialog(QDialog):
         self.next_page.clicked.connect(lambda: self._change_page(200))
         pages = QHBoxLayout()
         pages.addWidget(self.previous_page); pages.addWidget(self.page_label); pages.addWidget(self.next_page)
+        self.interaction_action = QPushButton("Analyze Interactions")
+        self.interaction_action.clicked.connect(self._open_interactions)
+        pages.addWidget(self.interaction_action)
         layout = QVBoxLayout(self); layout.addWidget(splitter); layout.addLayout(pages); layout.addWidget(buttons)
         self._tab_changed()
+
+    def _open_interactions(self):
+        table = self.tabs.currentWidget()
+        if not isinstance(table, QTableWidget):
+            return
+        from .interaction_dialog import InteractionDialog
+        InteractionDialog(self.repository, table._profile_id, self._run_id, self).exec()
 
     def _tab_changed(self, *_):
         table = self.tabs.currentWidget()

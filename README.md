@@ -4,6 +4,14 @@ PyQt6 desktop workflow for traceable virtual screening projects. It keeps submit
 ligands, generated molecular states, docking runs, poses, and scientific artifacts
 separate. The legacy scripts remain in `Reference/` as behavioral reference only.
 
+Automated ProLIF comparison against the crystallographic reference is available
+from **Multidock Results → Analyze Interactions** after existing SDF export.
+Use **Load co-crystallized SDF…** there to attach a reference for an imported
+receptor without a validation run.
+Optional execution after each export batch is configured in Post-docking settings.
+See [interaction analysis](docs/interaction-analysis.md) for inputs, CSV schemas,
+scientific policies, command-line use, and limitations.
+
 ## First-time installation (Windows desktop)
 
 Install **64-bit Miniconda or Anaconda** and **Git for Windows** first. Open an

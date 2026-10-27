@@ -36,7 +36,7 @@ def configure_qt_runtime() -> None:
         os.environ["PATH"] = str(binaries) + os.pathsep + os.environ.get("PATH", "")
 
 
-def _run_project(project: Path, stages: list[str]) -> int:
+def _run_project(project: Path, stages: list[str], *, profile_id=None, run_id=None, force=False) -> int:
     from .pipeline import PipelineRunner
 
     # Protect import and crash recovery too: neither may run concurrently with
@@ -47,12 +47,14 @@ def _run_project(project: Path, stages: list[str]) -> int:
         runner = PipelineRunner(repo)
         if "vina" in stages:
             runner.validate_docking_configuration()
-        repo.import_project_input()
+        if list(stages) != ["interactions"]:
+            repo.import_project_input()
         repo.recover_interrupted_runs()
         summary = {}
         failed = 0
         for stage in stages:
-            result = getattr(runner, f"run_{stage}")()
+            result = (runner.run_interactions(profile_id=profile_id, run_id=run_id, force=force)
+                      if stage == "interactions" else getattr(runner, f"run_{stage}")())
             summary[stage] = result
             if isinstance(result, tuple) and len(result) > 1:
                 failed += int(result[1])
@@ -68,10 +70,13 @@ def main() -> int:
     run = subparsers.add_parser("run", help="Run pipeline stages without the desktop UI")
     run.add_argument("project", type=Path)
     run.add_argument(
-        "--stages", nargs="+", choices=("screening", "molscrub", "meeko", "vina", "postdock"),
+        "--stages", nargs="+", choices=("screening", "molscrub", "meeko", "vina", "postdock", "interactions"),
         default=("screening", "molscrub", "meeko", "vina", "postdock"),
         help="Stages to run in order (default: the complete pipeline)",
     )
+    run.add_argument("--profile-id", help="Limit interaction analysis to this receptor profile")
+    run.add_argument("--run-id", help="Limit interaction analysis to this completed docking run")
+    run.add_argument("--force-interactions", action="store_true", help="Create a new interaction snapshot even when unchanged")
     subparsers.add_parser("ui", help="Open the desktop UI")
     doctor = subparsers.add_parser("doctor", help="Test chemistry packages and docking engines")
     doctor.add_argument("--project", type=Path, default=Path.cwd(), help="Project root for executable discovery")
@@ -94,7 +99,8 @@ def main() -> int:
     if args.command == "run":
         if not (args.project / "project.sqlite").is_file():
             parser.error(f"Not a MolDockPipe project: {args.project}")
-        return _run_project(args.project, args.stages)
+        return _run_project(args.project, args.stages, profile_id=args.profile_id,
+                            run_id=args.run_id, force=args.force_interactions)
     try:
         configure_qt_runtime()
         from PyQt6.QtCore import QCoreApplication, Qt

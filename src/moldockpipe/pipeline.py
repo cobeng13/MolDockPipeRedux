@@ -758,8 +758,19 @@ class PipelineRunner:
                     for source in sources:
                         suffix = source.stem if len(sources) > 1 else "all"
                         service.export_sdf(source, sdf_dir / f"{suffix}.sdf", sdf_dir / f"{suffix}.export.log.txt")
+                        try:
+                            from .services.interaction_analysis import register_export
+                            register_export(self.repository, run, sdf_dir / f"{suffix}.sdf", cancelled=lambda: bool(self.cancelled and self.cancelled()))
+                        except InterruptedError:
+                            raise
+                        except Exception as mapping_error:
+                            self.repository.record_provenance_event(event_type="interaction_export_mapping_failed",
+                                stage_name="postdock", level="WARNING", entity_type="docking_run",
+                                entity_id=run["run_id"], message=str(mapping_error))
                 success += 1
                 self._emit("item_succeeded", "postdock", run["state_id"], success, len(runs), succeeded=success)
+            except InterruptedError:
+                raise
             except Exception as exc:
                 failed += 1
                 error_dir = sdf_dir if mode in ("split_and_sdf", "sdf_only") else pdbqt_dir
@@ -767,4 +778,22 @@ class PipelineRunner:
                 (error_dir / "postdock.error.txt").write_text(str(exc), encoding="utf-8")
                 self._emit("item_failed", "postdock", run["state_id"], success + failed, len(runs), failed=failed, message=str(exc))
         self._emit("stage_completed", "postdock", total=len(runs), succeeded=success, failed=failed)
+        if settings.get("analyze_interactions", False):
+            if mode == "split_only":
+                self._emit("item_skipped", "interactions", message="Split-only export has no SDF inputs for interaction analysis")
+            else:
+                for profile_id in sorted({str(run["receptor_profile_id"]) for run in runs}):
+                    self._check_cancelled()
+                    try:
+                        self.run_interactions(profile_id=profile_id)
+                    except InterruptedError:
+                        raise
+                    except Exception as exc:
+                        self._emit("item_failed", "interactions", message=str(exc), failed=1)
         return success, failed
+
+    @exclusive_project
+    def run_interactions(self, *, profile_id=None, run_id=None, force=False) -> tuple[int, int]:
+        from .services.interaction_analysis import InteractionAnalysisService
+        return InteractionAnalysisService(self.repository, progress=self.progress,
+            cancelled=self.cancelled).run(profile_id=profile_id, run_id=run_id, force=force)

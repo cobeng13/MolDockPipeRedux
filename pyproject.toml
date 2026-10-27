@@ -12,6 +12,9 @@ dependencies = [
   "meeko>=0.5",
   "scipy>=1.10",
   "gemmi>=0.6",
+  "prolif==2.2.2",
+  "MDAnalysis>=2.10,<3",
+  "pandas>=2.2,<4",
 ]
 
 [project.optional-dependencies]

@@ -88,10 +88,11 @@ class PipelineWorker(QObject):
                                 cancelled=self.cancel_event.is_set)
         if not self.stages or "vina" in self.stages:
             runner.validate_docking_configuration()
-        self.repository.import_project_input()
+        if self.stages != ["interactions"]:
+            self.repository.import_project_input()
         summary = {}
-        for stage in ("screening", "molscrub", "meeko", "vina", "postdock"):
-            if (stage != "postdock" and not self.stages) or (self.stages and stage in self.stages):
+        for stage in ("screening", "molscrub", "meeko", "vina", "postdock", "interactions"):
+            if (stage not in {"postdock", "interactions"} and not self.stages) or (self.stages and stage in self.stages):
                 if self.cancel_event.is_set():
                     raise InterruptedError("Pipeline stopped safely")
                 self._report_progress(ProgressEvent("stage_preparing", stage,

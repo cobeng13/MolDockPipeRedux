@@ -12,6 +12,9 @@ dependencies:
   - conda-forge::rdkit=2026.03.*
   - pyqt=6.11.*
   - pyqtwebengine=6.11.*
+  # The defaults build avoids the intl-8.dll symbol collision between recent
+  # defaults GLib (Qt) and conda-forge fontconfig (RDKit/Cairo).
+  - fontconfig>=2.18.2
   - pip
   - git
   - pip:

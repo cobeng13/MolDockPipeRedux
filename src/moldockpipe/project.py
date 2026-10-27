@@ -20,7 +20,7 @@ from .execution_lock import exclusive_project
 from .configuration import read_project_config, write_project_config
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 DEFAULT_VINA_PROFILE: dict[str, Any] = {
@@ -130,6 +130,24 @@ class ProjectRepository:
         with self.connection() as conn:
             conn.executescript("""
             CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS interaction_exports (
+                sdf_path TEXT NOT NULL, record_index INTEGER NOT NULL, sdf_sha256 TEXT NOT NULL,
+                run_id TEXT NOT NULL, pose_id TEXT, mapping_status TEXT NOT NULL,
+                PRIMARY KEY(sdf_path, record_index)
+            );
+            CREATE TABLE IF NOT EXISTS interaction_runs (
+                analysis_id TEXT PRIMARY KEY, receptor_profile_id TEXT NOT NULL,
+                workflow_run_id TEXT NOT NULL, fingerprint TEXT NOT NULL, status TEXT NOT NULL,
+                output_path TEXT, succeeded INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT NOT NULL, finished_at TEXT, error_message TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_interaction_reuse
+                ON interaction_runs(receptor_profile_id, fingerprint, status);
+            CREATE TABLE IF NOT EXISTS interaction_pose_summaries (
+                analysis_id TEXT NOT NULL REFERENCES interaction_runs(analysis_id),
+                source_record_id TEXT NOT NULL, summary_json TEXT NOT NULL,
+                PRIMARY KEY(analysis_id, source_record_id)
+            );
             CREATE TABLE IF NOT EXISTS projects (project_id TEXT PRIMARY KEY, name TEXT NOT NULL, root_path TEXT NOT NULL, created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS parent_ligands (
                 parent_id TEXT PRIMARY KEY, source_id TEXT, source_smiles TEXT NOT NULL,
@@ -267,6 +285,7 @@ class ProjectRepository:
                 conn.execute("UPDATE parent_ligands SET input_fingerprint=? WHERE parent_id=?", (self._input_fingerprint(row["source_smiles"], row["notes"], row["params_json"]), row["parent_id"]))
             if not conn.execute("SELECT 1 FROM schema_migrations WHERE version=7").fetchone():
                 self._restore_archived_library(conn)
+                conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (7, ?)", (utc_now(),))
             conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)", (SCHEMA_VERSION, utc_now()))
             conn.execute("INSERT OR IGNORE INTO projects(project_id, name, root_path, created_at) VALUES (?, ?, ?, ?)", (str(uuid.uuid4()), self.root.name, str(self.root), utc_now()))
         self._migrate_vina_profiles()
@@ -753,6 +772,8 @@ class ProjectRepository:
             conn.execute("UPDATE redocking_stages SET status='interrupted', finished_at=? WHERE status='running'", (utc_now(),))
             workflows = conn.execute("UPDATE workflow_runs SET status='interrupted',finished_at=?,error_message=? WHERE status='running'",
                                      (utc_now(), "Application restarted before completion")).rowcount
+            conn.execute("UPDATE interaction_runs SET status='interrupted',finished_at=?,error_message=? WHERE status='running'",
+                         (utc_now(), "Application restarted before completion"))
             conn.execute("UPDATE workflow_run_stages SET status='interrupted',finished_at=?,error_message=? WHERE status='running'",
                          (utc_now(), "Application restarted before completion"))
             queued = conn.execute("""UPDATE redocking_queue_items SET status='queued',current_stage=NULL,

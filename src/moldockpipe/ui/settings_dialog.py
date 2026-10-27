@@ -165,6 +165,10 @@ class SettingsDialog(QDialog):
         self.fields["postdock.mode"] = mode
         form.addRow("Operation", mode)
         self._integer(form, "Poses per compound", "postdock.poses_per_compound", values.get("poses_per_compound", 3), 1, 100)
+        automatic = QCheckBox("Analyze interactions after SDF export")
+        automatic.setChecked(bool(values.get("analyze_interactions", False)))
+        self.fields["postdock.analyze_interactions"] = automatic
+        form.addRow(automatic)
         widget = QWidget(); widget.setLayout(form); return widget
 
     def _selection_text(self) -> str:

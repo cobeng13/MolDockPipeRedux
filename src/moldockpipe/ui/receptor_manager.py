@@ -22,6 +22,21 @@ from ..redocking.runner import validate_redocking_prerequisites
 from ..execution_lock import exclusive_project
 
 
+def rebase_imported_profile(value, old_folder, new_folder):
+    """Move bundled metadata paths with the receptor's new project identity."""
+    if isinstance(value, str):
+        normalized = value.replace("\\", "/")
+        if old_folder and normalized.startswith(old_folder.rstrip("/") + "/"):
+            return new_folder.rstrip("/") + normalized[len(old_folder.rstrip("/")):]
+        return value
+    if isinstance(value, list):
+        return [rebase_imported_profile(item, old_folder, new_folder) for item in value]
+    if isinstance(value, dict):
+        return {rebase_imported_profile(key, old_folder, new_folder): rebase_imported_profile(item, old_folder, new_folder)
+                for key, item in value.items()}
+    return value
+
+
 class ReceptorProfileDialog(QDialog):
     def __init__(self, repository: ProjectRepository, profile: dict[str, object], parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -325,7 +340,10 @@ class ReceptorManagerDialog(QDialog):
             candidate = f"{base_name} ({suffix})"
             suffix += 1
         profile["name"] = candidate
-        profile["id"] = uuid.uuid4().hex
+        new_id = uuid.uuid4().hex
+        old_folder = str(Path(str(profile.get("receptor", ""))).parent).replace("\\", "/")
+        profile = rebase_imported_profile(profile, old_folder, f"inputs/receptors/{new_id}")
+        profile["id"] = new_id
         profile["receptor"] = f"inputs/receptors/{profile['id']}/receptor.pdbqt"
         profile["archived"] = False
         self.profiles.append(profile)
