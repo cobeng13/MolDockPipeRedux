@@ -107,6 +107,34 @@ def test_imported_receptor_falls_back_to_pdbqt_never_cleaned(viewer_project):
     assert "9.000" not in result.receptor_pdb
 
 
+@pytest.mark.parametrize("atom_name", ["CA  ", "  CA"])
+def test_load_accepts_different_atom_name_padding(viewer_project, atom_name):
+    repo, service, calls, receptor, raw = viewer_project
+    padded = PDB[:12] + atom_name + PDB[16:]
+    (receptor.parent / "receptor_prepared.pdb").write_text(padded, encoding="utf-8")
+    assert service.load("run", "pose-3").receptor_pdb == padded
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("start,end,replacement", [
+    (12, 16, " CB "),  # atom name
+    (16, 17, "B"),     # alternate location
+    (17, 20, "GLY"),   # residue name
+    (21, 22, "B"),     # chain
+    (22, 26, "   2"),  # residue number
+    (26, 27, "A"),     # insertion code
+    (30, 38, "   1.001"),  # coordinate
+    (76, 78, " N"),    # element
+])
+def test_load_rejects_real_atom_changes(viewer_project, start, end, replacement):
+    repo, service, calls, receptor, raw = viewer_project
+    changed = PDB[:start] + replacement + PDB[end:]
+    (receptor.parent / "receptor_prepared.pdb").write_text(changed, encoding="utf-8")
+    with pytest.raises(ValueError, match="does not match"):
+        service.load("run", "pose-3")
+    assert not calls
+
+
 def test_load_finds_exact_archived_artifact_and_verifies_checksum(viewer_project):
     repo, service, calls, receptor, raw = viewer_project
     relative = raw.relative_to(repo.root)

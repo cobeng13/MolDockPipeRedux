@@ -75,7 +75,9 @@ def _heavy_atoms(text: str, *, pdbqt: bool) -> Counter:
         xyz = tuple(float(line[start:start + 8]) for start in (30, 38, 46))
         if not all(math.isfinite(value) for value in xyz):
             raise ValueError("Receptor contains non-finite coordinates.")
-        atoms[(line[12:27], xyz, element.upper())] += 1
+        # PDB and PDBQT writers may align the same atom name differently.
+        # Normalize only name padding; retain alternate location and residue identity.
+        atoms[(line[12:16].strip(), line[16:27], xyz, element.upper())] += 1
     return atoms
 
 
