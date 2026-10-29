@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from importlib import metadata, util
 from pathlib import Path
 
-CHECKS = ("rdkit", "molscrub", "meeko", "vina", "vinagpu", "webengine")
+CHECKS = ("rdkit", "molscrub", "meeko", "interactions", "vina", "vinagpu", "webengine")
 TIMEOUT = 120
 
 
@@ -42,11 +42,35 @@ def _probe(name: str, root: Path, work: Path) -> None:
     if name == "rdkit":
         from rdkit import Chem
         from rdkit.Chem import Descriptors
+        from rdkit.Chem.Draw import rdMolDraw2D
 
         molecule = _ethanol()
         if not Chem.MolToInchiKey(molecule) or not 46 < Descriptors.MolWt(molecule) < 47:
             raise RuntimeError("RDKit molecule descriptors/InChI check failed")
-        print("SMILES parsing, hydrogen addition, 3D embedding, descriptors and InChI passed.")
+        drawer = rdMolDraw2D.MolDraw2DSVG(200, 150)
+        drawer.DrawMolecule(Chem.RemoveHs(molecule))
+        drawer.FinishDrawing()
+        if "<svg" not in drawer.GetDrawingText():
+            raise RuntimeError("RDKit SVG drawing check failed")
+        print("SMILES parsing, hydrogen addition, 3D embedding, descriptors, InChI and drawing passed.")
+    elif name == "interactions":
+        import MDAnalysis
+        import gemmi
+        import pandas
+        import prolif as plf
+
+        # Synthetic contact smoke test; this does not validate a study's results.
+        probe = _ethanol()
+        ligand = plf.Molecule.from_rdkit(probe, resname="LIG", resnumber=1)
+        conformer = probe.GetConformer()
+        for index in range(probe.GetNumAtoms()):
+            point = conformer.GetAtomPosition(index)
+            conformer.SetAtomPosition(index, (point.x, point.y, point.z + 3.0))
+        partner = plf.Molecule.from_rdkit(probe, resname="PRB", resnumber=2)
+        fingerprint = plf.Fingerprint(["VdWContact"])
+        if not fingerprint.generate(ligand, partner):
+            raise RuntimeError("ProLIF synthetic contact check produced no interactions")
+        print("ProLIF imports and synthetic contact detection passed (including RDKit drawing dependencies).")
     elif name == "molscrub":
         from .services.molscrub import MolScrubService
 
@@ -136,6 +160,11 @@ def _advice(name: str, root: Path) -> str:
                 ("Check both kernel files beside Vina-GPU and the GPU vendor's OpenCL driver. "
                  "Vina-GPU is optional when using CPU docking." if name == "vinagpu" else
                  "Set MOLDOCKPIPE_VINA or place Vina in tools/vina."))
+    if name in {"rdkit", "interactions"}:
+        return ("Create a new environment from the current environment.yml and restart the app using that environment. "
+                "Keep RDKit, Cairo and Qt together on conda-forge; mixing defaults and conda-forge can cause "
+                "rdMolDraw2D DLL failures. Do not rename DLLs or overlay pip RDKit/Qt wheels. "
+                f"Inspect Python dependencies with: {python} -m pip check")
     install = subprocess.list2cmdline([sys.executable, "-m", "pip", "install", "-e", str(root) + "[chemistry,dev]"])
     return (f"Use this app's Python to inspect dependencies: {python} -m pip check\n"
             f"From the source checkout, reinstall with: {install}\n"
@@ -151,7 +180,8 @@ def run_diagnostics(root: Path) -> dict:
               "platform": platform.platform(), "project_root": str(root),
               "conda_prefix": os.environ.get("CONDA_PREFIX"),
               "virtual_env": os.environ.get("VIRTUAL_ENV"),
-              "packages": {name: _package_info(name) for name in ("rdkit", "molscrub", "meeko", "scipy", "gemmi")},
+              "packages": {name: _package_info(name) for name in
+                           ("rdkit", "molscrub", "meeko", "scipy", "gemmi", "prolif", "MDAnalysis", "pandas")},
               "checks": []}
     report["packages"]["PyQt6"] = _package_info("PyQt6")
     report["packages"]["PyQt6-WebEngine"] = _package_info("PyQt6-WebEngine", "PyQt6.QtWebEngineWidgets")

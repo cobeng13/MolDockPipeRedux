@@ -1,20 +1,18 @@
 # Windows desktop setup, including the offline 3D Results viewer.
 # Run from the repository root: conda env create --file environment.yml
-# Keep the native Qt stack on one channel; do not add pip Qt runtime wheels.
+# Keep RDKit, Cairo, and Qt on one channel; do not add pip native runtime wheels.
 name: moldockpipe-clean
 channels:
-  - defaults
+  - conda-forge
   - nodefaults
 dependencies:
   - python=3.13
   # This build supplies pip metadata, preventing MolScrub's dependency resolver
   # from installing a second RDKit over the Conda-managed package.
-  - conda-forge::rdkit=2026.03.*
-  - pyqt=6.11.*
-  - pyqtwebengine=6.11.*
-  # The defaults build avoids the intl-8.dll symbol collision between recent
-  # defaults GLib (Qt) and conda-forge fontconfig (RDKit/Cairo).
-  - fontconfig>=2.18.2
+  - rdkit=2026.03.*
+  # conda-forge uses these names for the Qt 6 bindings (pyqt is Qt 5 there).
+  - pyqt6=6.11.*
+  - pyqt6-webengine=6.11.*
   - pip
   - git
   - pip:

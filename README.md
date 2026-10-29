@@ -5,8 +5,8 @@ ligands, generated molecular states, docking runs, poses, and scientific artifac
 separate. The legacy scripts remain in `Reference/` as behavioral reference only.
 
 Automated ProLIF comparison against the crystallographic reference is available
-from **Multidock Results → Analyze Interactions** after existing SDF export.
-Use **Load co-crystallized SDF…** there to attach a reference for an imported
+from **Multidock Results â†’ Analyze Interactions** after existing SDF export.
+Use **Load co-crystallized SDFâ€¦** there to attach a reference for an imported
 receptor without a validation run.
 Optional execution after each export batch is configured in Post-docking settings.
 See [interaction analysis](docs/interaction-analysis.md) for inputs, CSV schemas,
@@ -32,9 +32,10 @@ python -m moldockpipe ui
 ```
 
 `environment.yml` installs Python 3.13, RDKit, PyQt 6.11, **PyQtWebEngine 6.11**,
-and the application's chemistry/test dependencies. RDKit is explicitly sourced
-from conda-forge so pip recognizes the installed package; all native Qt packages
-come from the matched defaults-channel distribution. The environment name matches
+and the application's chemistry/test dependencies. RDKit, Cairo, and Qt all come
+from conda-forge so their native libraries match. On that channel the Qt 6 package
+names are `pyqt6` and `pyqt6-webengine`; `pyqt` selects Qt 5. The RDKit build also
+supplies pip metadata to prevent installation of a second RDKit. The environment name matches
 both Windows launchers. After setup, double-click `Launch-MolDockPipe.cmd` to start
 the application; the terminal command above also works.
 
@@ -65,13 +66,18 @@ python -m pip check
 python -m moldockpipe ui
 ```
 
-For an older or mixed-channel environment, create a separate clean environment
-instead of mixing native Qt distributions. If `moldockpipe-clean` already exists,
+For an older or mixed-channel environment, including one created by the earlier
+recipe that combined defaults Qt with conda-forge RDKit, create a separate clean
+environment. Updating that environment in place can retain incompatible DLLs.
+An `rdMolDraw2D` DLL error during interaction analysis is one symptom.
+If `moldockpipe-clean` already exists,
 choose a new name without deleting it:
 
 ```powershell
 conda env create --name moldockpipe-desktop --file environment.yml
 conda activate moldockpipe-desktop
+python -m pip check
+python -m moldockpipe doctor --output diagnostics.txt
 python -m moldockpipe ui
 ```
 
@@ -79,6 +85,10 @@ To use that custom name with the double-click launcher, create a shortcut whose
 target ends with `Launch-MolDockPipe.cmd -EnvironmentName moldockpipe-desktop`,
 or run `./Launch-MolDockPipe.cmd -EnvironmentName moldockpipe-desktop` in
 PowerShell. Existing project folders do not need to be recreated.
+
+The troubleshooter checks RDKit drawing and a synthetic ProLIF contact as well
+as the preparation and docking tools. These checks catch missing native drawing
+libraries before a real interaction analysis is started.
 
 ### Optional interactive Results viewer
 
@@ -96,12 +106,12 @@ export first is unnecessary. Missing or changed structures produce an error
 instead of displaying an unmatched complex.
 
 Interaction toggles display colored dashed lines for **H-bonds** (blue),
-**π–π** (purple), **cation–π** (orange), **salt bridges** (green), and
+**Ï€â€“Ï€** (purple), **cationâ€“Ï€** (orange), **salt bridges** (green), and
 **hydrophobic contacts** (gray, initially hidden). Counts include all detected
 contacts, including hidden types. Contacted residues appear as sticks on the
 cartoon. Toggle **Contact labels** to show residue identity, interaction type,
-and distance in Å; hiding the receptor also hides these annotations.
-PNG exports include the visible contacts and labels. **Interaction criteria…**
+and distance in Ã…; hiding the receptor also hides these annotations.
+PNG exports include the visible contacts and labels. **Interaction criteriaâ€¦**
 explains the rules inside Results. No additional installation is required.
 
 These are geometric predictions, not validated bonds, interaction energies,
@@ -118,13 +128,13 @@ Only the first receptor model and blank/A alternate locations are considered.
 
 | Contact | Geometry used |
 | --- | --- |
-| H-bond | Donor–acceptor ≤3.5 Å. With explicit donor H: H–A ≤2.6 Å and D–H–A ≥120°. Without donor H: every heavy-neighbor–D–A angle ≥90°; explicitly labeled **candidate**. |
-| π–π | Ring centers ≤5.5 Å; acute plane angle ≤30° (parallel) or ≥60° (T-shaped); minimum of the two ring-plane offsets ≤2 Å. Ring atoms must be planar within 0.15 Å. |
-| Cation–π | Positive group–ring center ≤6 Å; in-plane offset ≤2 Å. |
-| Salt bridge | Opposite charge group centers ≤4 Å. |
-| Hydrophobic | Nonpolar C···C ≤4 Å; carbon neighbors limited to C/H/S; shortest contact per residue. |
+| H-bond | Donorâ€“acceptor â‰¤3.5 Ã…. With explicit donor H: Hâ€“A â‰¤2.6 Ã… and Dâ€“Hâ€“A â‰¥120Â°. Without donor H: every heavy-neighborâ€“Dâ€“A angle â‰¥90Â°; explicitly labeled **candidate**. |
+| Ï€â€“Ï€ | Ring centers â‰¤5.5 Ã…; acute plane angle â‰¤30Â° (parallel) or â‰¥60Â° (T-shaped); minimum of the two ring-plane offsets â‰¤2 Ã…. Ring atoms must be planar within 0.15 Ã…. |
+| Cationâ€“Ï€ | Positive groupâ€“ring center â‰¤6 Ã…; in-plane offset â‰¤2 Ã…. |
+| Salt bridge | Opposite charge group centers â‰¤4 Ã…. |
+| Hydrophobic | Nonpolar CÂ·Â·Â·C â‰¤4 Ã…; carbon neighbors limited to C/H/S; shortest contact per residue. |
 
-Distances below 0.5 Å are excluded as coincident coordinates, not contacts.
+Distances below 0.5 Ã… are excluded as coincident coordinates, not contacts.
 Ring and charged-group distances are measured between centers, not nearest atoms.
 This is a local geometric detector, **not PLIP**. Its ring/offset rules and
 hydrophobic cutoff are informed by the
@@ -184,7 +194,7 @@ validation and the separate persistent-work architecture proposal.
 
 ## Troubleshooting student installations
 
-Open **Tools → Troubleshooter…** (no project is required), click **Run checks**,
+Open **Tools â†’ Troubleshooterâ€¦** (no project is required), click **Run checks**,
 then copy or save the report. It records the app's Python executable, environment,
 package versions and locations, full errors, and suggested actions. Each check
 runs separately with a time limit, so an import crash does not stop other checks.
@@ -319,7 +329,7 @@ Large campaigns update the dashboard through one background snapshot at a time;
 slow queries and export-file checks do not run on the GUI thread. Results load
 only the visible receptor in pages of 200 ligands. The export selector uses a
 virtual table, and project loading and CSV imports run in background workers.
-For a responsiveness or memory report, choose **Tools → Save performance report**.
+For a responsiveness or memory report, choose **Tools â†’ Save performance report**.
 The local JSON includes app/source identifiers, record counts and indexes,
 dashboard timing, GUI heartbeat gaps, available memory, and Windows app/child
 process memory and CPU times. It includes local paths; review before sharing.

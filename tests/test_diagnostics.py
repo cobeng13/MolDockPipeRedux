@@ -25,7 +25,7 @@ def test_failures_timeouts_and_native_crashes_do_not_stop_other_checks(tmp_path,
     monkeypatch.setattr(diagnostics.subprocess, "run", run)
     report = diagnostics.run_diagnostics(tmp_path)
     assert calls == list(diagnostics.CHECKS)
-    assert [check["status"] for check in report["checks"]] == ["FAIL"] * 3 + ["PASS"] * 3
+    assert [check["status"] for check in report["checks"]] == ["FAIL"] * 3 + ["PASS"] * (len(diagnostics.CHECKS) - 3)
     rendered = diagnostics.format_report(report)
     assert "partial output" in rendered and "exceeded 120 seconds" in rendered
     assert "ImportError: missing dependency" in rendered and "native crash" in rendered
@@ -94,6 +94,44 @@ def test_webengine_import_failure_is_reported_with_conda_guidance(tmp_path, monk
     assert "environment.yml" in check["suggestion"]
     assert "optional for headless" in check["suggestion"]
     assert all(check["status"] == "PASS" for check in report["checks"][:-1])
+
+
+def test_interaction_dll_failure_is_reported_without_stopping_other_checks(tmp_path, monkeypatch):
+    monkeypatch.setattr(diagnostics.platform, "platform", lambda: "Windows test")
+
+    def run(command, **kwargs):
+        if command[3] == "interactions":
+            return subprocess.CompletedProcess(command, 1, "",
+                "ImportError: DLL load failed while importing rdMolDraw2D")
+        return subprocess.CompletedProcess(command, 0, "passed", "")
+
+    monkeypatch.setattr(diagnostics.subprocess, "run", run)
+    report = diagnostics.run_diagnostics(tmp_path)
+    check = next(check for check in report["checks"] if check["name"] == "interactions")
+    assert check["status"] == "FAIL"
+    assert "rdMolDraw2D" in check["stderr"]
+    assert "environment.yml" in check["suggestion"]
+    assert "conda-forge" in check["suggestion"]
+    assert all(other["status"] == "PASS" for other in report["checks"] if other is not check)
+
+
+def test_rdkit_probe_checks_drawing_dependencies(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import pytest
+    original = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "rdkit":
+            return SimpleNamespace(Chem=object())
+        if name == "rdkit.Chem":
+            return SimpleNamespace(Descriptors=object())
+        if name == "rdkit.Chem.Draw":
+            raise ImportError("DLL load failed while importing rdMolDraw2D")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    with pytest.raises(ImportError, match="rdMolDraw2D"):
+        diagnostics._probe("rdkit", tmp_path, tmp_path)
 
 
 def test_webengine_probe_checks_assets_without_constructing_a_window(tmp_path, monkeypatch, capsys):
