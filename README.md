@@ -92,8 +92,10 @@ libraries before a real interaction analysis is started.
 
 ### Optional interactive Results viewer
 
-Open **Multidock Results**, then select a completed compound. The panel beside
-the receptor tabs displays its prepared receptor and best ligand pose. The mode
+Open **Multidock Results**, select a completed compound, then click **Show 3D view**.
+Results opens with the table only; the 3D browser and molecular structures load
+only when requested. **Hide 3D view** cancels loading and releases the 3D canvas.
+The panel beside the receptor tabs displays the prepared receptor and best ligand pose. The mode
 selector switches among poses from that same state and docking run. Drag to
 rotate, scroll to zoom, choose receptor Cartoon/Sticks, toggle the receptor,
 focus the ligand, or reset the initial camera. **Export PNG** saves only the

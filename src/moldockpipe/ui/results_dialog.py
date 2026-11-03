@@ -72,19 +72,16 @@ class DockingResultsDialog(QDialog):
         self.setWindowTitle("Multidock Results")
         self.resize(1350, 700)
         self.tabs = tabs = QTabWidget()
-        self.viewer = MolecularViewer(self)
+        self.viewer = None
         profiles = repository.get_receptor_profiles(include_archived=True)
         for profile in profiles:
             tabs.addTab(self._profile_table(str(profile["id"])), str(profile.get("name", profile["id"])))
         if not profiles:
             tabs.addTab(QLabel("No receptor profiles configured."), "Results")
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter = splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(tabs)
-        splitter.addWidget(self.viewer)
-        splitter.setSizes([650, 700])
         splitter.setChildrenCollapsible(False)
         tabs.currentChanged.connect(self._tab_changed)
-        self.viewer.pose.currentIndexChanged.connect(self._pose_changed)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close); buttons.rejected.connect(self.reject)
         self.previous_page = QPushButton("Previous 200")
         self.next_page = QPushButton("Next 200")
@@ -93,11 +90,37 @@ class DockingResultsDialog(QDialog):
         self.next_page.clicked.connect(lambda: self._change_page(200))
         pages = QHBoxLayout()
         pages.addWidget(self.previous_page); pages.addWidget(self.page_label); pages.addWidget(self.next_page)
+        self.viewer_action = QPushButton("Show 3D view")
+        self.viewer_action.setCheckable(True)
+        self.viewer_action.setToolTip("Load the selected structure on demand. Hide the view to stop loading and release the 3D canvas.")
+        self.viewer_action.toggled.connect(self._toggle_viewer)
+        pages.addWidget(self.viewer_action)
         self.interaction_action = QPushButton("Analyze Interactions")
         self.interaction_action.clicked.connect(self._open_interactions)
         pages.addWidget(self.interaction_action)
         layout = QVBoxLayout(self); layout.addWidget(splitter); layout.addLayout(pages); layout.addWidget(buttons)
         self._tab_changed()
+
+    def _toggle_viewer(self, enabled):
+        if self._closing:
+            return
+        if enabled:
+            self.viewer = MolecularViewer(self)
+            self.splitter.addWidget(self.viewer)
+            self.splitter.setSizes([650, 700])
+            self.viewer.pose.currentIndexChanged.connect(self._pose_changed)
+            self.viewer_action.setText("Hide 3D view")
+            table = self.tabs.currentWidget()
+            if isinstance(table, QTableWidget):
+                self._selection_changed(table)
+        else:
+            self._invalidate("3D view hidden")
+            viewer, self.viewer = self.viewer, None
+            if viewer is not None:
+                viewer.pose.currentIndexChanged.disconnect(self._pose_changed)
+                viewer.hide()
+                viewer.deleteLater()
+            self.viewer_action.setText("Show 3D view")
 
     def _open_interactions(self):
         table = self.tabs.currentWidget()
@@ -125,18 +148,25 @@ class DockingResultsDialog(QDialog):
         self._pending = None
         if self._worker:
             self._worker.requestInterruption()
-        self.viewer.clear(message)
+        if self.viewer is not None:
+            self.viewer.clear(message)
 
     def _selection_changed(self, table):
         if self.tabs.currentWidget() is not table:
             return
         self._invalidate("Select a completed docking result.")
         self._run_id = None
+        item = table.item(table.currentRow(), 0)
+        record = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if record:
+            self._run_id = record["run_id"]
+        # Selection still controls interaction-analysis scope, but never loads
+        # poses or starts WebEngine until the user requests the 3D view.
+        if self.viewer is None:
+            return
         self.viewer.pose.blockSignals(True)
         self.viewer.pose.clear()
         self.viewer.pose.setEnabled(False)
-        item = table.item(table.currentRow(), 0)
-        record = item.data(Qt.ItemDataRole.UserRole) if item else None
         try:
             if not record:
                 if item:
@@ -161,6 +191,8 @@ class DockingResultsDialog(QDialog):
             self._pose_changed()
 
     def _pose_changed(self, *_):
+        if self.viewer is None or self._closing:
+            return
         self._invalidate("Loading receptor and ligand…")
         pose_id = self.viewer.pose.currentData()
         if self._run_id and pose_id and self.viewer.available:
@@ -168,7 +200,7 @@ class DockingResultsDialog(QDialog):
             self._start_pending()
 
     def _start_pending(self):
-        if self._worker is not None or self._pending is None or self._closing:
+        if self._worker is not None or self._pending is None or self._closing or self.viewer is None:
             return
         generation, run_id, pose_id = self._pending
         self._pending = None
@@ -179,11 +211,11 @@ class DockingResultsDialog(QDialog):
         self._worker.start()
 
     def _loaded(self, generation, structure):
-        if generation == self._generation and not self._closing and self.viewer.available:
+        if generation == self._generation and not self._closing and self.viewer is not None and self.viewer.available:
             self.viewer.set_structure(structure)
 
     def _failed(self, generation, message):
-        if generation == self._generation and not self._closing:
+        if generation == self._generation and not self._closing and self.viewer is not None:
             self.viewer.clear(f"Unable to load pose: {message}")
 
     def _worker_finished(self):
@@ -269,7 +301,8 @@ class DockingResultsDialog(QDialog):
         if not self._closing and self.tabs.currentWidget() is table and table._offset == offset and self._table_pending is None:
             self.page_label.setText("Unable to load results")
             self.previous_page.setEnabled(offset > 0)
-            self.viewer.clear(f"Unable to load results: {message}")
+            if self.viewer is not None:
+                self.viewer.clear(f"Unable to load results: {message}")
 
     def _page_ready(self, table, offset, result):
         if self._closing or self.tabs.currentWidget() is not table or table._offset != offset or self._table_pending is not None:
@@ -293,7 +326,7 @@ class DockingResultsDialog(QDialog):
         self._update_page_controls(table)
         if rows:
             table.selectRow(0)
-        else:
+        elif self.viewer is not None:
             self.viewer.clear("No docking results available.")
 
     def _table_finished(self):

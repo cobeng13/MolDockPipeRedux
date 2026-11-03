@@ -74,6 +74,7 @@ def test_result_best_mode_and_pose_switch(qt_app, fake_canvas, viewer_project):
         dialog = DockingResultsDialog(repo)
     finally:
         module.StructureViewerService = original
+    dialog.viewer_action.click()
     dialog.viewer.bridge.ready()
     wait_for(qt_app, lambda: dialog._table_worker is None and dialog._worker is None)
     assert dialog.viewer._structure.mode_index == 8
@@ -99,6 +100,7 @@ def test_pending_row_and_tab_switch_clear_old_pose(qt_app, fake_canvas, viewer_p
     repo.save_receptor_profiles(profiles + [{**profiles[0], "id": "other", "name": "Other"}])
     monkeypatch.setattr(module, "StructureViewerService", lambda _: service)
     dialog = DockingResultsDialog(repo)
+    dialog.viewer_action.click()
     dialog.viewer.bridge.ready()
     wait_for(qt_app, lambda: dialog._table_worker is None and dialog._worker is None)
     table = dialog.tabs.currentWidget()
@@ -129,6 +131,7 @@ def test_stale_load_is_ignored_and_closing_cancels_worker(qt_app, fake_canvas, v
     monkeypatch.setattr(service, "load", delayed)
     monkeypatch.setattr(module, "StructureViewerService", lambda _: service)
     dialog = DockingResultsDialog(repo)
+    dialog.viewer_action.click()
     wait_for(qt_app, started.is_set)
     previous_generation = dialog._generation
     dialog._invalidate("New selection")
@@ -157,6 +160,7 @@ def test_latest_selection_runs_after_cancelled_conversion(qt_app, fake_canvas, v
     monkeypatch.setattr(service, "load", delayed)
     monkeypatch.setattr(module, "StructureViewerService", lambda _: service)
     dialog = DockingResultsDialog(repo)
+    dialog.viewer_action.click()
     wait_for(qt_app, started.is_set)
     dialog.viewer.pose.setCurrentIndex(0)
     wait_for(qt_app, lambda: dialog._table_worker is None and dialog._worker is None and dialog._pending is None)
@@ -171,9 +175,74 @@ def test_missing_webengine_keeps_results_table(qt_app, viewer_project, monkeypat
     dialog = DockingResultsDialog(viewer_project[0])
     wait_for(qt_app, lambda: dialog._table_worker is None)
     assert dialog.tabs.currentWidget().rowCount() == 1
+    assert dialog.viewer is None
+    dialog.viewer_action.click()
     assert not dialog.viewer.available
     assert "README" in dialog.viewer.status.text()
     assert dialog._worker is None
+    dialog.reject()
+
+
+def test_results_browsing_never_initializes_3d(qt_app, fake_canvas, viewer_project, monkeypatch):
+    import moldockpipe.ui.results_dialog as module
+    repo, service, calls, receptor, raw = viewer_project
+    profiles = repo.get_receptor_profiles()
+    repo.save_receptor_profiles(profiles + [{**profiles[0], "id": "other", "name": "Other"}])
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Browsing results must not initialize 3D or query/load molecular poses")
+
+    monkeypatch.setattr(module, "MolecularViewer", unexpected)
+    monkeypatch.setattr(service, "poses", unexpected)
+    monkeypatch.setattr(service, "load", unexpected)
+    monkeypatch.setattr(module, "StructureViewerService", lambda _: service)
+    dialog = module.DockingResultsDialog(repo)
+    wait_for(qt_app, lambda: dialog._table_worker is None)
+    assert dialog.viewer is None and not dialog.viewer_action.isChecked()
+    assert dialog._worker is None and dialog._pending is None
+    table = dialog.tabs.currentWidget()
+    assert dialog._run_id == table.item(0, 0).data(module.Qt.ItemDataRole.UserRole)["run_id"]
+    dialog.tabs.setCurrentIndex(1)
+    wait_for(qt_app, lambda: dialog._table_worker is None)
+    assert dialog.viewer is None and dialog._worker is None
+    assert dialog._run_id is None
+    dialog.reject()
+
+
+def test_hiding_3d_cancels_conversion_and_reopening_loads_current_selection(qt_app, fake_canvas, viewer_project, monkeypatch):
+    from threading import Event
+    from PyQt6 import sip
+    import moldockpipe.ui.results_dialog as module
+    repo, service, calls, receptor, raw = viewer_project
+    started = Event()
+    original = service.load
+
+    def delayed(run_id, pose_id, *, cancelled):
+        if not started.is_set():
+            started.set()
+            while not cancelled():
+                time.sleep(.005)
+            raise InterruptedError("cancelled")
+        return original(run_id, pose_id, cancelled=cancelled)
+
+    monkeypatch.setattr(service, "load", delayed)
+    monkeypatch.setattr(module, "StructureViewerService", lambda _: service)
+    dialog = module.DockingResultsDialog(repo)
+    wait_for(qt_app, lambda: dialog._table_worker is None)
+    dialog.viewer_action.click()
+    old_viewer = dialog.viewer
+    wait_for(qt_app, started.is_set)
+    generation = dialog._generation
+    dialog.viewer_action.click()
+    assert dialog.viewer is None and dialog._pending is None
+    dialog._loaded(generation, object())
+    dialog._failed(generation, "stale error")
+    wait_for(qt_app, lambda: dialog._worker is None and sip.isdeleted(old_viewer))
+    assert dialog.tabs.currentWidget().rowCount() == 1
+    dialog.viewer_action.click()
+    dialog.viewer.bridge.ready()
+    wait_for(qt_app, lambda: dialog._worker is None)
+    assert dialog.viewer._structure.mode_index == 8
     dialog.reject()
 
 
