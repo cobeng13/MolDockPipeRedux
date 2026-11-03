@@ -111,6 +111,13 @@ class SettingsDialog(QDialog):
         self._integer(form, "Maximum states", "molscrub.max_states", values.get("max_states", 32), 1, 10000)
         self._integer(form, "Time limit per molecule (seconds)", "molscrub.timeout_seconds", values.get("timeout_seconds", 15), 1, 3600)
         self._workers(form, "molscrub.workers", values)
+        legacy = QCheckBox("Retain verified legacy results")
+        legacy.setChecked(bool(self.settings.get("resume", {}).get("retain_legacy_molscrub", False)))
+        legacy.setToolTip("Continue an original campaign whose MolScrub version was recorded as unknown. "
+                          "Saved structures must match the chemical settings and file integrity checks. "
+                          "Original provenance is retained; new molecules use the installed toolchain.")
+        self.fields["resume.retain_legacy_molscrub"] = legacy
+        form.addRow(legacy)
         widget = QWidget(); widget.setLayout(form); return widget
 
     def _meeko_tab(self, values: dict[str, object]) -> QWidget:
@@ -211,7 +218,7 @@ class SettingsDialog(QDialog):
         form.addRow(label, field)
 
     def values(self) -> dict[str, dict[str, object]]:
-        values: dict[str, dict[str, object]] = {"screening": {}, "molscrub": {}, "meeko": {}, "docking": {}, "postdock": {}}
+        values: dict[str, dict[str, object]] = {"screening": {}, "molscrub": {}, "meeko": {}, "docking": {}, "postdock": {}, "resume": {}}
         values["postdock"]["selected_parents"] = list(self.settings.get("postdock", {}).get("selected_parents", []))
         for key, field in self.fields.items():
             if isinstance(field, QLineEdit):

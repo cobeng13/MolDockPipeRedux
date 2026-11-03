@@ -112,12 +112,66 @@ class PipelineRunner:
                     """, ids)}
                 states = defaultdict(list)
                 for state in conn.execute(f"""SELECT s.parent_id,s.state_structure_hash,s.generation_fingerprint,
-                    a.relative_path,a.sha256 FROM molecular_states s LEFT JOIN conformers c ON c.state_id=s.state_id
+                    s.status AS state_status,c.status AS conformer_status,
+                    a.active AS artifact_active,a.validation_status,a.relative_path,a.sha256
+                    FROM molecular_states s LEFT JOIN conformers c ON c.state_id=s.state_id
                     LEFT JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id
                     WHERE s.parent_id IN ({placeholders}) AND s.active=1""", ids):
                     states[state["parent_id"]].append(state)
             for row in batch:
                 yield row, latest.get(row["parent_id"]), states[row["parent_id"]]
+
+    def _molscrub_resume_plan(self, rows, settings, version, *, retry_failed=False):
+        """Verify all saved inputs before dispatching any replacement chemistry.
+
+        Legacy outputs retain their original fingerprints. Opting to keep them
+        freezes existing campaign inputs; it does not assert tool equivalence.
+        """
+        cache = {key: value for key, value in settings.items() if key != "workers"}
+        generation = {key: value for key, value in cache.items() if key != "timeout_seconds"}
+        # Saving Settings materializes an omitted 15-second default. That is
+        # not an instruction to retry failures under a different time budget.
+        failure_settings = [cache]
+        if cache.get("timeout_seconds", 15) == 15:
+            failure_settings += [generation, {**generation, "timeout_seconds": 15},
+                                 {**generation, "timeout_seconds": 15.0}]
+        plan = []
+        for row, previous, states in self._molscrub_plan_rows(rows):
+            self._check_cancelled()
+            inputs = {"smiles": row["source_smiles"]}
+            run_fp = fingerprint(settings=cache, inputs=inputs, tool_version=version)
+            action, detail = "generate", None
+            if previous and previous["status"] == StageStatus.FAILED and not retry_failed:
+                if previous["fingerprint"] in {
+                    fingerprint(settings=candidate, inputs=inputs, tool_version=version)
+                    for candidate in failure_settings}:
+                    action, detail = "failure", previous["reason"]
+                elif previous["fingerprint"] in {
+                    fingerprint(settings=candidate, inputs=inputs, tool_version="unknown")
+                    for candidate in failure_settings}:
+                    action, detail = "legacy_failure", previous["reason"]
+            elif states and (previous is None or previous["status"] == StageStatus.COMPLETED):
+                # Preparation occurs after complete state generation. An SDF
+                # alone may be a partial write preceding a process crash.
+                complete = previous is not None or all(
+                    state["state_status"] == "pdbqt_ready"
+                    and state["conformer_status"] == "pdbqt_ready"
+                    and state["artifact_active"] == 1 and state["validation_status"] == "valid"
+                    for state in states)
+                def matches(tool_version):
+                    return all(state["generation_fingerprint"] in {
+                        fingerprint(settings=candidate, inputs={"state": state["state_structure_hash"]},
+                                    tool_version=tool_version)
+                        for candidate in (generation, cache)} for state in states)
+                current = complete and matches(version)
+                legacy = complete and not current and all(
+                    state["artifact_active"] == 1 and state["validation_status"] == "valid"
+                    for state in states) and matches("unknown")
+                if (current or legacy) and all(self._artifact_matches(state["relative_path"], state["sha256"])
+                                               for state in states):
+                    action, detail = ("legacy_states" if legacy else "states"), len(states)
+            plan.append((row, run_fp, action, detail))
+        return plan
 
     def _meeko_plan_rows(self, rows):
         for offset in range(0, len(rows), PLANNING_BATCH_SIZE):
@@ -266,38 +320,45 @@ class PipelineRunner:
         created = failed = skipped = 0
         completed = 0
         workers = worker_count(settings, len(allowed))
-        # Worker count affects scheduling, not chemical identity or failure
-        # eligibility. Retain compatibility with fingerprints from serial runs.
-        cache_settings = {key: value for key, value in settings.items() if key != "workers"}
-        generation_settings = {key: value for key, value in cache_settings.items() if key != "timeout_seconds"}
+        self._emit("stage_preparing", "molscrub", message="Verifying saved structures and legacy resume eligibility")
+        plan = self._molscrub_resume_plan(allowed, settings, version, retry_failed=retry_failed)
+        legacy = [item for item in plan if item[2].startswith("legacy_")]
+        if legacy and not project.get("resume", {}).get("retain_legacy_molscrub", False):
+            raise RuntimeError(
+                f"{len(legacy)} saved MolScrub results have an unknown historical tool version; "
+                f"the current version is {version}. Existing structures were preserved. "
+                "To continue the original campaign, open Settings > MolScrub and enable "
+                "'Retain verified legacy results', then run again. "
+                "Use a new project to regenerate the campaign with the current chemistry toolchain.")
+        if legacy:
+            self.repository.record_provenance_event(
+                event_type="legacy_molscrub_results_retained", stage_name="molscrub", level="WARNING",
+                message="Original results retained by project policy; chemistry versions are not asserted equivalent",
+                data={"runtime_version": version, "original_version": "unknown",
+                      "parents": [item[0]["parent_id"] for item in legacy],
+                      "states": sum(item[3] for item in legacy if item[2] == "legacy_states"),
+                      "known_failures": sum(item[2] == "legacy_failure" for item in legacy)})
         self._emit("stage_started", "molscrub", total=len(allowed), message=f"Using {workers} parallel workers")
 
         def jobs():
             nonlocal created, failed, skipped, completed
-            for row, previous, existing in self._molscrub_plan_rows(allowed):
+            for row, run_fingerprint, action, detail in plan:
                 if self.cancelled and self.cancelled():
                     return
-                run_fingerprint = fingerprint(settings=cache_settings,
-                    inputs={"smiles": row["source_smiles"]}, tool_version=version)
-                if not retry_failed and previous and previous["status"] == StageStatus.FAILED and previous["fingerprint"] == run_fingerprint:
+                if action in {"failure", "legacy_failure"}:
                     failed += 1
                     skipped += 1
                     completed += 1
                     self._emit("item_skipped", "molscrub", row["parent_id"], completed, len(allowed),
-                               failed=failed, skipped=skipped, message=f"Known failure skipped: {previous['reason']}")
+                               failed=failed, skipped=skipped, message=f"Known failure skipped: {detail}")
                     continue
-                if (previous and previous["status"] == StageStatus.COMPLETED and existing and all(
-                    state["generation_fingerprint"] in {
-                        fingerprint(settings=candidate, inputs={"state": state["state_structure_hash"]}, tool_version=version)
-                        for candidate in (generation_settings, cache_settings)}
-                    and self._artifact_matches(state["relative_path"], state["sha256"])
-                    for state in existing
-                )):
-                    created += len(existing)
+                if action in {"states", "legacy_states"}:
+                    created += detail
                     skipped += 1
                     completed += 1
                     self._emit("item_skipped", "molscrub", row["parent_id"], completed, len(allowed),
-                               skipped=skipped, message=f"{len(existing)} existing states reused")
+                               skipped=skipped, message=f"{detail} existing states reused" +
+                               ("; original legacy provenance retained" if action == "legacy_states" else ""))
                     continue
                 run_id = str(uuid.uuid4())
                 with self.repository.connection() as conn:

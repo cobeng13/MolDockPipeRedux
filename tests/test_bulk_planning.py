@@ -63,7 +63,7 @@ def seed_parent(p, parent_id, *, previous="completed", state=True, generation="c
 
 
 def reference_molscrub(p, retry_failed):
-    """Original per-parent history/state reads and exact reuse conditions."""
+    """Per-parent reference, including verified projects predating stage history."""
     cache = {k: v for k, v in p.settings.items() if k != "workers"}
     generation = {k: v for k, v in cache.items() if k != "timeout_seconds"}
     reused, known_failed = set(), set()
@@ -77,12 +77,17 @@ def reference_molscrub(p, retry_failed):
                 WHERE stage_name='molscrub' AND entity_type='parent' AND entity_id=?
                 ORDER BY rowid DESC LIMIT 1""", (parent["parent_id"],)).fetchone()
             existing = conn.execute("""SELECT s.state_structure_hash,s.generation_fingerprint,
-                a.relative_path,a.sha256 FROM molecular_states s LEFT JOIN conformers c ON c.state_id=s.state_id
+                s.status AS state_status,c.status AS conformer_status,a.active AS artifact_active,
+                a.validation_status,a.relative_path,a.sha256
+                FROM molecular_states s LEFT JOIN conformers c ON c.state_id=s.state_id
                 LEFT JOIN artifacts a ON a.artifact_id=c.sdf_artifact_id
                 WHERE s.parent_id=? AND s.active=1""", (parent["parent_id"],)).fetchall()
         if not retry_failed and previous and previous["status"] == "failed" and previous["fingerprint"] == fp:
             known_failed.add(parent["parent_id"])
-        elif previous and previous["status"] == "completed" and existing and all(
+        elif (previous is None or previous["status"] == "completed") and existing and all(
+            (previous is not None or (state["state_status"] == "pdbqt_ready"
+                and state["conformer_status"] == "pdbqt_ready"
+                and state["artifact_active"] == 1 and state["validation_status"] == "valid")) and
             state["generation_fingerprint"] in {
                 fingerprint(settings=candidate, inputs={"state": state["state_structure_hash"]}, tool_version=p.version)
                 for candidate in (generation, cache)}

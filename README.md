@@ -304,6 +304,13 @@ checksums match. Changed scientific settings can require fresh work. Failed
 preparation/docking or missing/damaged artifacts are retried. Closing during work marks unfinished runs as interrupted when
 the project is reopened.
 
+For older projects that report an unknown historical MolScrub version, enable
+**Settings > MolScrub > Retain verified legacy results**, save, and run again
+to continue using the original structures. MolDockPipe verifies their settings
+and SDF checksums, preserves downstream preparations and dockings, and records
+the decision without relabeling the old chemistry version. See
+[legacy project resume](docs/legacy-resume.md) for details.
+
 ## Settings
 
 The **Settings** button contains tabs for:

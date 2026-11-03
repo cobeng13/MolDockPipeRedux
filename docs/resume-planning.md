@@ -4,6 +4,12 @@ The pipeline retains its existing fingerprint, status, compatibility and full
 SHA-256 checks. This optimization changes how their metadata is read, not the
 criteria for accepting a previous result. No database migration is needed.
 
+The subsequent [legacy resume patch](legacy-resume.md) adds verified reuse for
+projects predating stage history, preflights all MolScrub decisions before
+dispatch, and requires a saved project choice before retaining results recorded
+under an unknown historical tool version. The original optimization and timing
+measurements below describe the pre-patch baseline.
+
 - Screening joins each parent's active result into its initial library query.
 - MolScrub reads latest per-parent history and existing states in batches of
   256 parents. Latest means greatest rowid, including failed/interrupted records;

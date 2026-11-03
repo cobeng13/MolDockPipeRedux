@@ -645,7 +645,7 @@ class ProjectRepository:
     @exclusive_project
     def update_settings(self, updates: dict[str, dict[str, Any]]) -> None:
         """Merge only settings owned by the general Settings dialog."""
-        allowed = {"screening", "molscrub", "meeko", "docking", "postdock"}
+        allowed = {"screening", "molscrub", "meeko", "docking", "postdock", "resume"}
         if set(updates) - allowed:
             raise ValueError("Receptor profiles must be edited through Receptors")
         config = self.get_settings()

@@ -19,7 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 chemistry = [
-  "molscrub @ git+https://github.com/forlilab/molscrub.git",
+  "molscrub @ git+https://github.com/forlilab/molscrub.git@0f8de09c7532d5b187c9376684196ab2c7755320",
   "joblib>=1.3",
 ]
 dev = ["pytest>=8.0"]
