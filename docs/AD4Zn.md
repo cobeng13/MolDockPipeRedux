@@ -116,6 +116,15 @@ prepared ligand-state library. Reference redocking generates maps for its prepar
 reference ligand. Missing/unsupported ligand atom types fail before any AD4Zn
 ligand is docked. Ligand chemistry is not changed to work around missing maps.
 
+Meeko macrocycle closure labels are translated only when determining map
+requirements: `CG0` through `CG3` use the carbon (`C`) map, and `G0` through
+`G3` need no receptor affinity map, matching Vina's AD4 implementation. Ligand
+PDBQT labels remain unchanged. Bundle manifests record original labels in
+`ligand_atom_types` and required affinity-map types in `atom_types`.
+Preparation requests use version `ad4zn-v2`; older bundles remain in history.
+After upgrading from the macrocycle map-check bug, retry the Docking stage
+without purging or repeating ligand preparation. Previous failures remain auditable.
+
 AD4Zn calls Vina with `--maps <prefix> --scoring ad4`; it never supplies
 `--receptor` or box arguments. Standard Vina keeps its existing command. The
 Receptors dialog shows missing tool files, Zn presence, and map status. Runtime,

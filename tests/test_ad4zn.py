@@ -107,6 +107,74 @@ def test_union_preserves_halogen_case_and_all_states(tmp_path):
     assert ad4zn.collect_ligand_atom_types(paths) == ('A', 'Br', 'C', 'Cl', 'HD', 'NA', 'OA')
 
 
+@pytest.mark.parametrize('index', range(4))
+def test_macrocycle_map_translation(index):
+    assert ad4zn.required_ad4_map_types(
+        [f'CG{index}', f'G{index}', 'Cl', 'Br', 'OA', 'Cl']
+    ) == ('Br', 'C', 'Cl', 'OA')
+    assert ad4zn.required_ad4_map_types(['C', 'Unknown']) == ('C', 'Unknown')
+
+
+@pytest.mark.parametrize('types', [[], ['G0', 'G1', 'G2', 'G3']])
+def test_no_real_map_types_rejected(types):
+    with pytest.raises(ValueError, match='non-glue'):
+        ad4zn.required_ad4_map_types(types)
+
+
+def test_macrocycle_bundle_preserves_labels_and_reuses_normalized_maps(zinc_project):
+    from moldockpipe.fingerprints import fingerprint
+    repo, profile, ligand, vina, _, calls = zinc_project
+    macrocycle = ligand.with_name('macrocycle.pdbqt')
+    macrocycle.write_text(pdbqt('CG0', 'G0', 'OA'))
+    original = macrocycle.read_bytes()
+    prefix, record = ad4zn.ensure_ad4zn_maps(repo, profile, [ligand, macrocycle], vina)
+    assert record['atom_types'] == ['C', 'OA']
+    assert record['ligand_atom_types'] == ['C', 'CG0', 'G0', 'OA']
+    assert macrocycle.read_bytes() == original
+    assert not Path(str(prefix) + '.G0.map').exists()
+    assert not Path(str(prefix) + '.CG0.map').exists()
+    count = len(calls)
+    assert ad4zn.ensure_ad4zn_maps(repo, profile, [ligand, macrocycle], vina)[0] == prefix
+    assert len(calls) == count
+    # A published v1 request must rebuild, even with an otherwise valid bundle.
+    current = prefix.parent.parent / 'current.json'
+    legacy = dict(record)
+    legacy['request'] = fingerprint(
+        settings={'protocol': 'ad4zn', 'grid': record['grid'], 'atom_types': ('C', 'OA')},
+        inputs=record['inputs'], tool_version='ad4zn-v1')
+    current.write_text(json.dumps(legacy))
+    new_prefix, _ = ad4zn.ensure_ad4zn_maps(repo, profile, [ligand, macrocycle], vina)
+    assert new_prefix != prefix
+    assert (prefix.parent / 'manifest.json').exists()
+    assert macrocycle.read_bytes() == original
+
+
+@pytest.mark.parametrize('missing', [None, 'C', 'e', 'd'])
+def test_backend_macrocycle_map_requirements(tmp_path, monkeypatch, missing):
+    from types import SimpleNamespace
+    ligand = tmp_path / 'ligand.pdbqt'; ligand.write_text(pdbqt('CG0', 'G0'))
+    receptor = tmp_path / 'receptor.pdbqt'; receptor.write_text(pdbqt('C', 'Zn'))
+    prefix = tmp_path / 'maps'
+    for suffix in ('C', 'e', 'd'):
+        if suffix != missing:
+            Path(str(prefix) + f'.{suffix}.map').write_text('map')
+    launched = []
+    def popen(command, **kwargs):
+        launched.append(command)
+        return SimpleNamespace(returncode=0, communicate=lambda **_: ('ok', ''))
+    monkeypatch.setattr('moldockpipe.services.vina.subprocess.Popen', popen)
+    args = dict(executable=Path('vina'), receptor=receptor, ligand=ligand,
+                output=tmp_path / 'out.pdbqt', log=tmp_path / 'vina.log',
+                settings={'protocol': 'ad4zn'}, maps=prefix)
+    if missing:
+        with pytest.raises(ValueError, match=f'Missing AD4Zn map for {missing}'):
+            VinaDockingBackend().run(**args)
+        assert not launched
+    else:
+        assert VinaDockingBackend().run(**args).return_code == 0
+        assert len(launched) == 1
+
+
 def test_bundle_reuse_and_portable_metadata(zinc_project):
     repo, profile, ligand, vina, _, calls = zinc_project
     prefix, record = ad4zn.ensure_ad4zn_maps(repo, profile, [ligand], vina)
@@ -256,6 +324,24 @@ def test_mixed_campaign_reuse_and_ligand_hash(mixed_campaign, monkeypatch):
     assert len(docked) == 5
 
 
+def test_retry_after_setup_failure_keeps_history_and_docks_macrocycle(mixed_campaign):
+    repo, zinc, _, ligand, _, _, docked, runner = mixed_campaign
+    repo.save_receptor_profiles([zinc])
+    ligand.write_text(pdbqt('Unknown'))
+    assert runner.run_vina() == (0, 1)
+    assert not docked
+    ligand.write_text(pdbqt('CG0', 'G0', 'OA'))
+    before = ligand.read_bytes()
+    assert runner.run_vina() == (1, 0)
+    assert len(docked) == 1
+    assert ligand.read_bytes() == before
+    with repo.connection() as conn:
+        rows = conn.execute('SELECT status,is_current,reason FROM docking_runs ORDER BY started_at').fetchall()
+    assert len(rows) == 2
+    assert any(row['status'] == 'failed' and row['is_current'] == 0 and 'Unknown' in row['reason'] for row in rows)
+    assert any(row['status'] == 'completed' and row['is_current'] == 1 for row in rows)
+
+
 @pytest.mark.parametrize('missing_zinc', [False, True])
 def test_meeko_then_zinc_preparation_and_failure_retention(zinc_project, monkeypatch, tmp_path, missing_zinc):
     from test_receptors import PDB
@@ -296,8 +382,8 @@ def test_invalid_parameter_file_fails_before_tools_run(zinc_project, content):
 
 def test_unknown_ligand_type_fails_before_map_generation(zinc_project):
     repo, profile, ligand, vina, _, calls = zinc_project
-    ligand.write_text(pdbqt('C', 'G0'))
-    with pytest.raises(ValueError, match='G0'):
+    ligand.write_text(pdbqt('C', 'Unknown'))
+    with pytest.raises(ValueError, match='Unknown'):
         ad4zn.ensure_ad4zn_maps(repo, profile, [ligand], vina)
     assert not calls
 

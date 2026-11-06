@@ -6,7 +6,7 @@ from pathlib import Path
 from collections.abc import Callable
 
 from .executables import VINA, VINA_SPLIT, find_executable
-from ..receptors.ad4zn import protocol_for, atom_types
+from ..receptors.ad4zn import protocol_for, atom_types, required_ad4_map_types
 from .validation import parse_vina_poses, validate_pdbqt
 
 
@@ -59,7 +59,7 @@ class VinaDockingBackend:
         if protocol_for(settings) == "ad4zn":
             if maps is None:
                 raise ValueError("AD4Zn maps are required")
-            for suffix in (*atom_types(ligand), "e", "d"):
+            for suffix in (*required_ad4_map_types(atom_types(ligand)), "e", "d"):
                 path = Path(str(maps) + f".{suffix}.map")
                 if not path.is_file() or not path.stat().st_size:
                     raise ValueError(f"Missing AD4Zn map for {suffix}")

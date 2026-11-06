@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import time
 
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
@@ -59,6 +60,17 @@ class SettingsDialog(QDialog):
             return
         try:
             self._clear_workflow_files()
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Purge incomplete",
+                "Some generated files could not be removed. Close any applications using "
+                "the project files, wait for any cloud sync activity to finish, then retry the purge. "
+                "Check file permissions if the problem persists.\n\n"
+                "Some generated files may already have been removed. Database workflow rows "
+                "are cleared only after all generated folders have been cleaned.\n\n"
+                f"Details: {exc}",
+            )
+            return
         except RuntimeError as exc:
             QMessageBox.warning(self, "Project is busy", str(exc))
             return
@@ -67,12 +79,21 @@ class SettingsDialog(QDialog):
 
     @exclusive_project
     def _clear_workflow_files(self) -> None:
-        self.repository.clear_workflow_data()
         for name in ("artifacts", "logs", "exports", "For_PostDocking"):
             target = self.repository.root / name
             if target.exists():
-                shutil.rmtree(target)
+                # Sync clients and viewers can briefly deny deletion on Windows.
+                # Retry sharing/lock violations only; report persistent failures.
+                for attempt in range(3):
+                    try:
+                        shutil.rmtree(target)
+                        break
+                    except OSError as exc:
+                        if getattr(exc, "winerror", None) not in (32, 33) or attempt == 2:
+                            raise
+                        time.sleep(0.1 * (attempt + 1))
             target.mkdir(parents=True, exist_ok=True)
+        self.repository.clear_workflow_data()
 
     def _export_manifest(self) -> None:
         if not self.repository:

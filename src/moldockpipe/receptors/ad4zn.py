@@ -160,6 +160,18 @@ def collect_ligand_atom_types(paths: Iterable[Path]) -> tuple[str, ...]:
     return tuple(sorted(values))
 
 
+def required_ad4_map_types(ligand_types: Iterable[str]) -> tuple[str, ...]:
+    """Match Vina's AD4 cache: closure carbons use C; glue atoms use no map."""
+    required = set()
+    for value in ligand_types:
+        if value in {"G0", "G1", "G2", "G3"}:
+            continue
+        required.add("C" if value in {"CG0", "CG1", "CG2", "CG3"} else value)
+    if not required:
+        raise ValueError("AD4 map generation needs at least one non-glue ligand atom type")
+    return tuple(sorted(required))
+
+
 def require_zinc(receptor: Path) -> None:
     if not any(value.upper() == "ZN" for value in atom_types(receptor)):
         raise ValueError("AD4Zn requires retained Zn in the prepared receptor. Review receptor preparation.")
@@ -298,7 +310,8 @@ def ensure_ad4zn_maps(repository, profile: dict, ligands: Iterable[Path], execut
     tools = check_ad4zn_environment(repository.root).require()
     receptor = (repository.root / str(profile["receptor"])).resolve()
     require_zinc(receptor)
-    required = collect_ligand_atom_types(ligands)
+    ligand_types = collect_ligand_atom_types(ligands)
+    required = required_ad4_map_types(ligand_types)
     grid = grid_definition(profile)
     # Each profile owns its bundles, even when the receptor was imported/shared.
     profile_id = str(profile["id"])
@@ -314,7 +327,8 @@ def ensure_ad4zn_maps(repository, profile: dict, ligands: Iterable[Path], execut
     unsupported = set(required) - parameters
     if unsupported:
         raise ValueError("AD4Zn.dat has no parameters for ligand atom types: " + ", ".join(sorted(unsupported)))
-    request = fingerprint(settings={"protocol": "ad4zn", "grid": grid, "atom_types": required}, inputs=inputs, tool_version="ad4zn-v1")
+    request = fingerprint(settings={"protocol": "ad4zn", "grid": grid, "atom_types": required,
+                                    "ligand_atom_types": ligand_types}, inputs=inputs, tool_version="ad4zn-v2")
     current = root / "current.json"
     if current.is_file():
         try:
@@ -354,7 +368,8 @@ def ensure_ad4zn_maps(repository, profile: dict, ligands: Iterable[Path], execut
         hashes = {path.name: file_sha256(path) for path in paths}
         record = {"protocol": "ad4zn", "request": request, "directory": work.relative_to(repository.root).as_posix(),
                   "maps_prefix": (work / "receptor_TZ").relative_to(repository.root).as_posix(),
-                  "atom_types": list(required), "grid": grid, "inputs": inputs, "hashes": hashes,
+                  "atom_types": list(required), "ligand_atom_types": list(ligand_types),
+                  "grid": grid, "inputs": inputs, "hashes": hashes,
                   "map_fingerprint": fingerprint(settings=grid, inputs=hashes, tool_version="ad4zn-v1"),
                   "versions": versions, "created_at": utc_now(), "warnings": ["Target-specific scientific validation is pending."]}
         (work / "manifest.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
