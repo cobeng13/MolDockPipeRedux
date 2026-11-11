@@ -9,6 +9,7 @@ from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Callable
 
+from ..execution_lock import project_execution_lock
 from ..fingerprints import file_sha256, fingerprint
 from ..project import ProjectRepository, utc_now
 from ..receptors.ligand_chemistry import (
@@ -20,6 +21,7 @@ from ..services.postdock import PostDockService
 from ..services.validation import parse_vina_poses, validate_pdbqt
 from ..services.vina import VinaDockingBackend, find_vina_executable
 from .models import RedockingSettings, RedockingStatus
+from .rmsd import LOG, REFERENCE, calculate_results, validate_mol2
 
 STAGES = ("reference_validation", "ligand_preparation", "vina_redocking", "pose_export", "mol2_generation", "final_validation")
 
@@ -75,15 +77,6 @@ def validate_ligand_pdbqt(path: Path) -> None:
         raise ValueError("Prepared ligand PDBQT has invalid AutoDock atom types")
 
 
-def validate_mol2(path: Path) -> None:
-    if not path.is_file(): raise ValueError(f"Missing MOL2: {path.name}")
-    text = path.read_text(encoding="utf-8", errors="replace")
-    if "@<TRIPOS>ATOM" not in text or "@<TRIPOS>BOND" not in text: raise ValueError(f"Invalid MOL2 sections: {path.name}")
-    header = text.splitlines(); marker = header.index("@<TRIPOS>MOLECULE")
-    counts = header[marker + 2].split()
-    if len(counts) < 2 or int(counts[0]) <= 0 or int(counts[1]) <= 0: raise ValueError(f"MOL2 contains no atoms or bonds: {path.name}")
-
-
 class RedockingRunner:
     def __init__(self, repository: ProjectRepository, profile: dict[str, Any], settings: RedockingSettings,
                  *, progress: Callable[[dict[str, Any]], None] | None = None, cancel_event: threading.Event | None = None,
@@ -101,7 +94,7 @@ class RedockingRunner:
 
     def _stage_reusable(self, run_id: str, stage: str, fingerprint_value: str, paths: tuple[Path, ...]) -> bool:
         with self.repository.connection() as conn:
-            row = conn.execute("SELECT status,fingerprint FROM redocking_stages WHERE run_id=? AND stage_name=?", (run_id, stage)).fetchone()
+            row = conn.execute("SELECT status,fingerprint,artifacts_json FROM redocking_stages WHERE run_id=? AND stage_name=?", (run_id, stage)).fetchone()
         if not (row and row["status"] == "completed" and row["fingerprint"] == fingerprint_value and all(path.is_file() and path.stat().st_size for path in paths)):
             return False
         try:
@@ -111,7 +104,11 @@ class RedockingRunner:
             elif stage == "pose_export":
                 for path in paths: read_sdf(path)
             elif stage == "mol2_generation":
-                for path in paths: validate_mol2(path)
+                digests = json.loads(row["artifacts_json"])
+                for path in paths:
+                    validate_mol2(path)
+                    if digests.get(path.name) != file_sha256(path):
+                        return False
             elif stage == "final_validation":
                 if json.loads(paths[0].read_text(encoding="utf-8")).get("status") != RedockingStatus.ARTIFACTS_READY.value: return False
         except Exception:
@@ -228,33 +225,39 @@ class RedockingRunner:
                 self._stage_done(run_id, STAGES[3], {path.name: file_sha256(path) for path in expected_sdfs})
             else: self._emit("stage_reused", STAGES[3])
 
-            reference_out = rmsd_dir / "reference_ligand_heavy.mol2"; mol2_paths = tuple(rmsd_dir / f"pose_{rank:03d}_heavy.mol2" for rank, *_ in scored)
+            reference_out = rmsd_dir / REFERENCE; mol2_paths = tuple(rmsd_dir / f"pose_{rank:03d}_heavy.mol2" for rank, *_ in scored)
+            top_mol2 = rmsd_dir / "top_ranked_pose_heavy.mol2"
+            mol2_artifacts = (reference_out, *mol2_paths, top_mol2)
             mol2_fp = fingerprint(settings={"hydrogens": "remove", "writer": "moldockpipe-mol2-v1"},
-                                  inputs={path.name: file_sha256(path) for path in expected_sdfs}, tool_version="mol2-v1")
-            if not self._stage_reusable(run_id, STAGES[4], mol2_fp, (reference_out, *mol2_paths)):
+                                  inputs={"reference_sdf": reference_hash,
+                                          **{path.name: file_sha256(path) for path in expected_sdfs}}, tool_version="mol2-v1")
+            if not self._stage_reusable(run_id, STAGES[4], mol2_fp, mol2_artifacts):
                 self._stage_start(run_id, STAGES[4], mol2_fp); reference = read_sdf(reference_sdf)
                 write_mol2(reference, reference_out, heavy_only=True, name="reference_ligand")
                 for (rank, *_), sdf, mol2 in zip(scored, expected_sdfs, mol2_paths):
                     pose = read_sdf(sdf); aligned_pose = pose_in_reference_order(reference, pose)
                     write_mol2(aligned_pose, mol2, heavy_only=True, name=f"pose_{rank:03d}")
-                shutil.copy2(mol2_paths[0], rmsd_dir / "top_ranked_pose_heavy.mol2")
-                (rmsd_dir / "README.txt").write_text("DockRMSD is not run by MolDockPipe. Example commands:\n\n"
-                    "DockRMSD reference_ligand_heavy.mol2 pose_001_heavy.mol2\n"
-                    "DockRMSD reference_ligand_heavy.mol2 top_ranked_pose_heavy.mol2\n", encoding="utf-8")
-                self._stage_done(run_id, STAGES[4], {path.name: file_sha256(path) for path in (reference_out, *mol2_paths)})
+                shutil.copy2(mol2_paths[0], top_mol2)
+                (rmsd_dir / "README.txt").write_text(
+                    "MolDockPipe saves PyDockRMSD results for these heavy-atom MOL2 inputs in results.json.\n",
+                    encoding="utf-8")
+                self._stage_done(run_id, STAGES[4], {path.name: file_sha256(path) for path in mol2_artifacts})
             else: self._emit("stage_reused", STAGES[4])
 
             final_fp = fingerprint(settings={"validation": "redocking-v1", "transformation_manifest": "v1"},
-                                   inputs={"multi": file_sha256(multi), "reference": file_sha256(reference_out)},
-                                   tool_version="validation-v2")
+                                   inputs={"multi": file_sha256(multi), "receptor": receptor_hash,
+                                           "reference_sdf": reference_hash,
+                                           **{path.name: file_sha256(path) for path in mol2_artifacts}},
+                                   tool_version="validation-v3")
             validation_path = run_root / "validation.json"
             transformation_path = run_root / "transformation.json"
-            if not self._stage_reusable(run_id, STAGES[5], final_fp, (validation_path, transformation_path)):
+            pose_manifest = run_root / "pose_manifest.csv"
+            if not self._stage_reusable(run_id, STAGES[5], final_fp, (validation_path, transformation_path, pose_manifest)):
                 self._stage_start(run_id, STAGES[5], final_fp); validate_ligand_pdbqt(ligand_pdbqt); validate_mol2(reference_out)
                 for path in (*expected_sdfs, *mol2_paths):
                     if not path.is_file() or not path.stat().st_size: raise ValueError(f"Missing pose artifact: {path.name}")
                 for path in mol2_paths: validate_mol2(path)
-                if file_sha256(rmsd_dir / "top_ranked_pose_heavy.mol2") != file_sha256(mol2_paths[0]): raise ValueError("Top-ranked MOL2 does not point to pose rank 1")
+                if file_sha256(top_mol2) != file_sha256(mol2_paths[0]): raise ValueError("Top-ranked MOL2 does not point to pose rank 1")
                 pose_rows = []
                 with self.repository.connection() as conn:
                     conn.execute("DELETE FROM redocking_poses WHERE run_id=?", (run_id,))
@@ -264,10 +267,13 @@ class RedockingRunner:
                             sdf.relative_to(self.repository.root).as_posix(), mol2.relative_to(self.repository.root).as_posix(),
                             multi.relative_to(self.repository.root).as_posix(), digest, json.dumps(metadata, sort_keys=True)))
                         pose_rows.append((rank, affinity, sdf.relative_to(self.repository.root).as_posix(), digest))
-                with (run_root / "pose_manifest.csv").open("w", newline="", encoding="utf-8") as handle:
+                with pose_manifest.open("w", newline="", encoding="utf-8") as handle:
                     writer = csv.writer(handle); writer.writerow(("pose_rank", "affinity", "sdf_path", "artifact_sha256")); writer.writerows(pose_rows)
-                validation_path.write_text(json.dumps({"status": RedockingStatus.ARTIFACTS_READY.value, "rmsd_status": "Not calculated",
-                    "pose_count": len(scored), "top_affinity": scored[0][1], "top_rank": 1, "hashes_recorded": True}, indent=2), encoding="utf-8")
+                validation_path.write_text(json.dumps({"status": RedockingStatus.ARTIFACTS_READY.value,
+                    "pose_count": len(scored), "top_affinity": scored[0][1], "top_rank": 1, "hashes_recorded": True,
+                    "provenance": {"receptor_sha256": receptor_hash, "reference_sha256": reference_hash,
+                        "validated_reference_mol2_sha256": file_sha256(reference_out), "finished_at": utc_now()}},
+                    indent=2), encoding="utf-8")
                 mapping_path = _profile_path(self.repository, reference_info["mapping"])
                 chemistry_mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
                 meeko_command_path = input_dir / "meeko_command.json"
@@ -305,7 +311,7 @@ class RedockingRunner:
                          "hydrogen_policy": "heavy atoms only", "atom_mapping": "pose graph mapped to reference atom order",
                          "stereochemistry_matching": "ignored when absent from crystal reference"},
                     ],
-                    "dockrmsd": {"status": "Not calculated", "external_tool_placeholder": True},
+                    "dockrmsd": {"results": "dockrmsd/results.json"},
                 }
                 transformation_path.write_text(json.dumps(transformation, indent=2), encoding="utf-8")
                 for path, artifact_type in ((ligand_h, "redocking_input_sdf"), (ligand_pdbqt, "redocking_ligand_pdbqt"),
@@ -318,11 +324,23 @@ class RedockingRunner:
                 self._stage_done(run_id, STAGES[5], {"validation": file_sha256(validation_path),
                                                      "transformation": file_sha256(transformation_path)})
             else: self._emit("stage_reused", STAGES[5])
+            finished_at = utc_now()
             with self.repository.connection() as conn:
                 conn.execute("UPDATE redocking_runs SET status=?,finished_at=?,current_stage=NULL,prepared_ligand_path=?,prepared_ligand_sha256=?,meeko_version=?,vina_version=? WHERE run_id=?",
-                    (RedockingStatus.ARTIFACTS_READY.value, utc_now(), ligand_pdbqt.relative_to(self.repository.root).as_posix(), file_sha256(ligand_pdbqt),
+                    (RedockingStatus.ARTIFACTS_READY.value, finished_at, ligand_pdbqt.relative_to(self.repository.root).as_posix(), file_sha256(ligand_pdbqt),
                      _tool_version("meeko"), executable.name, run_id))
-            return {"run_id": run_id, "status": RedockingStatus.ARTIFACTS_READY.value, "run_root": str(run_root), "poses": len(scored), "top_affinity": scored[0][1]}
+            try:
+                self._emit("stage_started", "rmsd_calculation")
+                with project_execution_lock(self.repository.root):
+                    rmsd = calculate_results(run_root, dict(receptor_sha256=receptor_hash,
+                        reference_sha256=reference_hash, finished_at=finished_at,
+                        validated_reference_mol2_sha256=file_sha256(reference_out)))
+                self._emit("stage_completed", "rmsd_calculation", status=rmsd["status"])
+            except Exception:
+                LOG.exception("Could not save redocking RMSD for %s", run_id)
+                rmsd = None
+            return {"run_id": run_id, "status": RedockingStatus.ARTIFACTS_READY.value, "run_root": str(run_root),
+                    "poses": len(scored), "top_affinity": scored[0][1], "dockrmsd": rmsd}
         except InterruptedError as exc:
             status = RedockingStatus.CANCELLED.value if self._cancelled() else RedockingStatus.INTERRUPTED.value
             with self.repository.connection() as conn:

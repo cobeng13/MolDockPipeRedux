@@ -4,9 +4,11 @@ import shutil
 import json
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
 
+from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox, QTableWidget,
@@ -19,7 +21,8 @@ from ..project import DEFAULT_VINA_PROFILE, ProjectRepository
 from .redocking_dialog import RedockingSetupDialog
 from .redocking_queue import RedockingQueueController, RedockingQueueDialog
 from ..redocking.runner import validate_redocking_prerequisites
-from ..execution_lock import exclusive_project
+from ..execution_lock import exclusive_project, project_execution_lock
+from ..redocking.rmsd import REFERENCE, calculate_results, format_summary, validation_runs
 
 
 def rebase_imported_profile(value, old_folder, new_folder):
@@ -164,15 +167,23 @@ class ReceptorManagerDialog(QDialog):
         validation_controls = QHBoxLayout()
         self.redock_button = QPushButton("Add to Validation Queue"); self.redock_button.clicked.connect(self._redock); validation_controls.addWidget(self.redock_button)
         queue_button = QPushButton("View Validation Queue"); queue_button.clicked.connect(self._show_queue); validation_controls.addWidget(queue_button)
+        self.rmsd_button = QPushButton("Redocking RMSD…")
+        self.rmsd_button.clicked.connect(self._show_rmsd)
+        validation_controls.addWidget(self.rmsd_button)
+        self.rmsd_summary = QLabel()
+        self.rmsd_summary.setTextFormat(Qt.TextFormat.PlainText)
+        self.rmsd_summary.setWordWrap(True)
         validation_controls.addStretch()
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._save); buttons.rejected.connect(self.reject)
         layout = QVBoxLayout(self)
         description = QLabel("Each enabled profile docks the same prepared ligand states against its own receptor and search settings.")
         description.setWordWrap(True)
-        layout.addWidget(description); layout.addWidget(self.table); layout.addLayout(controls); layout.addLayout(validation_controls); layout.addWidget(buttons)
+        layout.addWidget(description); layout.addWidget(self.table); layout.addLayout(controls); layout.addLayout(validation_controls)
+        layout.addWidget(self.rmsd_summary); layout.addWidget(buttons)
         self._refresh()
         self.table.itemSelectionChanged.connect(self._update_redock_button)
+        self.queue_controller.validation_completed.connect(self._update_redock_button)
 
     def _refresh(self) -> None:
         self.table.setRowCount(0)
@@ -188,6 +199,98 @@ class ReceptorManagerDialog(QDialog):
         index = self._selected()
         eligible = index is not None and not self.profiles[index].get("archived") and not validate_redocking_prerequisites(self.repository, self.profiles[index])
         self.redock_button.setEnabled(bool(eligible))
+        self.rmsd_button.setEnabled(index is not None)
+        runs = validation_runs(self.repository, self.profiles[index]) if index is not None else []
+        current = next((result for _, _, result, matches in runs if matches), None)
+        self.rmsd_summary.setText(format_summary(current) if index is not None else "")
+
+    def _show_rmsd(self) -> None:
+        index = self._selected()
+        if index is None:
+            return
+        runs = validation_runs(self.repository, self.profiles[index])
+        if not runs:
+            QMessageBox.information(self, "Redocking RMSD", "RMSD not calculated. No saved completed redocking runs found.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Redocking RMSD")
+        dialog.resize(720, 350)
+        layout = QVBoxLayout(dialog)
+        selector = QComboBox()
+        for run, provenance, _, current in runs:
+            label = "Current inputs" if current else "Historical"
+            selector.addItem(f"{label} · {provenance.get('finished_at') or run.name}")
+        selector.setCurrentIndex(next((i for i, item in enumerate(runs) if item[3]), 0))
+        layout.addWidget(selector)
+        summary = QLabel()
+        summary.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(summary)
+        table = QTableWidget(0, 4)
+        table.setHorizontalHeaderLabels(["Pose rank", "Affinity", "RMSD (Å)", "Details"])
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(table)
+        calculate = QPushButton("Calculate RMSD")
+        layout.addWidget(calculate)
+        close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close.rejected.connect(dialog.reject)
+        layout.addWidget(close)
+
+        def display():
+            run, _, result, _ = runs[selector.currentIndex()]
+            summary.setText(format_summary(result))
+            poses = result["poses"] if result else []
+            table.setRowCount(len(poses))
+            for index, row in enumerate(poses):
+                value = row["rmsd_angstrom"]
+                values = (row["pose_rank"], row["affinity"], f"{value:.3f}" if value is not None else "—", row.get("error") or "")
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(str(value))
+                    item.setToolTip(str(value))
+                    table.setItem(index, column, item)
+            required = (run / "pose_manifest.csv", run / "dockrmsd" / REFERENCE)
+            missing = [path.name for path in required if not path.is_file()]
+            calculate.setEnabled(not missing)
+            calculate.setToolTip("Missing " + ", ".join(missing) if missing else "")
+
+        def start():
+            selected = selector.currentIndex()
+            run, provenance, _, current = runs[selected]
+            selector.setEnabled(False)
+            calculate.setEnabled(False)
+            summary.setText("Calculating RMSD…")
+
+            def work():
+                with project_execution_lock(self.repository.root):
+                    return calculate_results(run, provenance)
+
+            future = executor.submit(work)
+            timer = QTimer(dialog)
+
+            def check():
+                if not future.done():
+                    return
+                timer.stop()
+                selector.setEnabled(True)
+                try:
+                    runs[selected] = (run, provenance, future.result(), current)
+                except Exception as exc:
+                    QMessageBox.warning(dialog, "RMSD calculation failed", str(exc))
+                display()
+                self._update_redock_button()
+
+            timer.timeout.connect(check)
+            timer.start(100)
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        selector.currentIndexChanged.connect(display)
+        calculate.clicked.connect(start)
+        display()
+        try:
+            dialog.exec()
+        finally:
+            executor.shutdown(wait=False)
+            self._update_redock_button()
 
     def _redock(self) -> None:
         index = self._selected()

@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QThread, QTimer, QUrl, pyqtSignal, pyqtSlot
+from ..redocking.rmsd import format_summary
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QMessageBox, QPushButton, QSpinBox,
@@ -19,7 +20,7 @@ from ..redocking.runner import RedockingRunner, STAGES, validate_redocking_prere
 STAGE_LABELS = {
     "reference_validation": "Reference ligand validation", "ligand_preparation": "Ligand preparation",
     "vina_redocking": "Vina redocking", "pose_export": "Pose export", "mol2_generation": "MOL2 generation",
-    "final_validation": "Final validation",
+    "final_validation": "Final validation", "rmsd_calculation": "Redocking RMSD",
 }
 
 
@@ -80,7 +81,7 @@ class RedockingProgressDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent); self.setWindowTitle("Redocking Validation"); self.setModal(True); self.resize(480, 360)
         self.labels = {}; layout = QVBoxLayout(self); self.active = QLabel("Starting…"); layout.addWidget(self.active)
-        for stage in STAGES:
+        for stage in (*STAGES, "rmsd_calculation"):
             label = QLabel(f"○ {STAGE_LABELS[stage]}"); self.labels[stage] = label; layout.addWidget(label)
         self.elapsed = QLabel("Elapsed: 0 s"); layout.addWidget(self.elapsed); layout.addStretch()
         self.cancel_button = QPushButton("Cancel"); layout.addWidget(self.cancel_button)
@@ -104,7 +105,9 @@ class RedockingResultDialog(QDialog):
         reference = profile.get("reference_ligand", {})
         text = QLabel(f"Redocking Artifacts Ready\n\nReceptor: {profile.get('name')}\nReference: {reference.get('identity')}\n"
             f"Vina poses: {result.get('poses')}\nTop affinity: {result.get('top_affinity')} kcal/mol\nSeed: {seed}\n\n"
-            "DockRMSD inputs\n✓ Reference ligand MOL2\n✓ Redocked pose MOL2 files\n✓ Top-ranked pose MOL2\n✓ Command examples\n\nRMSD status\nNot calculated")
+            "DockRMSD inputs\n✓ Reference ligand MOL2\n✓ Redocked pose MOL2 files\n✓ Top-ranked pose MOL2\n\n"
+            f"{format_summary(result.get('dockrmsd'))}")
+        text.setWordWrap(True)
         open_button = QPushButton("Open Output Folder"); open_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(result["run_root"]))))
         poses = QPushButton("View Pose Table"); poses.clicked.connect(self._show_poses)
         again = QPushButton("Run Again"); again.clicked.connect(lambda: (self.run_again_requested.emit(), self.accept()))
@@ -114,12 +117,19 @@ class RedockingResultDialog(QDialog):
         layout = QVBoxLayout(self); layout.addWidget(text); layout.addLayout(row)
 
     def _show_poses(self) -> None:
-        dialog = QDialog(self); dialog.setWindowTitle("Redocked Poses"); table = QTableWidget(0, 4)
-        table.setHorizontalHeaderLabels(("Rank", "Affinity", "SDF", "MOL2"))
+        dialog = QDialog(self); dialog.setWindowTitle("Redocked Poses"); table = QTableWidget(0, 6)
+        table.setHorizontalHeaderLabels(("Rank", "Affinity", "RMSD (Å)", "RMSD details", "SDF", "MOL2"))
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        rmsd = self.result.get("dockrmsd") or {}
+        measurements = {item["pose_rank"]: item for item in rmsd.get("poses", [])}
         with self.repository.connection() as conn:
             rows = conn.execute("SELECT pose_rank,affinity,sdf_path,mol2_path FROM redocking_poses WHERE run_id=? ORDER BY pose_rank", (str(self.result["run_id"]),)).fetchall()
         for row_data in rows:
             row = table.rowCount(); table.insertRow(row)
-            for column, value in enumerate(row_data): table.setItem(row, column, QTableWidgetItem(str(value)))
+            measurement = measurements.get(row_data["pose_rank"], {})
+            value = measurement.get("rmsd_angstrom")
+            values = (row_data["pose_rank"], row_data["affinity"], f"{value:.3f}" if value is not None else "—",
+                      measurement.get("error") or "", row_data["sdf_path"], row_data["mol2_path"])
+            for column, value in enumerate(values): table.setItem(row, column, QTableWidgetItem(str(value)))
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close); buttons.rejected.connect(dialog.reject)
         layout = QVBoxLayout(dialog); layout.addWidget(table); layout.addWidget(buttons); dialog.resize(760, 400); dialog.exec()

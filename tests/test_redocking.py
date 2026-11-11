@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from rdkit.Chem import AllChem
 from moldockpipe.project import ProjectRepository
 from moldockpipe.receptors.ligand_chemistry import chemistry_summary, pose_in_reference_order, read_sdf, validate_same_heavy_graph, write_mol2, write_sdf
 from moldockpipe.redocking.models import RedockingSettings
+from moldockpipe.redocking import rmsd
 from moldockpipe.redocking.runner import RedockingRunner, validate_mol2, validate_redocking_prerequisites
 from moldockpipe.services.meeko import MeekoResult
 from moldockpipe.services.vina import VinaResult
@@ -107,7 +109,9 @@ def test_pose_affinity_parsing(tmp_path: Path) -> None:
     assert parse_vina_poses(output) == [(1, -9.1, 0.0, 0.0), (2, -8.2, 1.0, 2.0)]
 
 
-def test_successful_redocking_generates_all_artifacts(redocking_project) -> None:
+def test_successful_redocking_generates_all_artifacts(redocking_project, monkeypatch) -> None:
+    monkeypatch.setattr(rmsd, "_engine", lambda: (
+        lambda reference, pose: 2.5 if "001" in Path(pose).name else 0.8, "test-version"))
     repo, profile, molecule = redocking_project; result = runner_for(repo, profile, molecule).run()
     assert result["status"] == "ARTIFACTS_READY" and result["poses"] == 2 and result["top_affinity"] == -8.2
     root = Path(result["run_root"]); assert (root / "dockrmsd/reference_ligand_heavy.mol2").is_file()
@@ -115,11 +119,135 @@ def test_successful_redocking_generates_all_artifacts(redocking_project) -> None
     assert (root / "dockrmsd/top_ranked_pose_heavy.mol2").read_bytes() == (root / "dockrmsd/pose_001_heavy.mol2").read_bytes()
     assert "DockRMSD" in (root / "dockrmsd/README.txt").read_text()
     transformation = json.loads((root / "transformation.json").read_text(encoding="utf-8"))
-    assert transformation["dockrmsd"]["status"] == "Not calculated"
+    assert transformation["dockrmsd"]["results"] == "dockrmsd/results.json"
+    saved = rmsd.read_results(root)
+    assert saved["rank_1"]["rmsd_angstrom"] == 2.5
+    assert saved["lowest"]["pose_rank"] == 2
+    assert saved["lowest"]["rmsd_angstrom"] == 0.8
+    assert rmsd.validation_runs(repo, profile)[0][2:] == (saved, True)
     assert transformation["operations"][-1]["atom_mapping"] == "pose graph mapped to reference atom order"
     with repo.connection() as conn:
         assert conn.execute("SELECT status FROM redocking_runs").fetchone()[0] == "ARTIFACTS_READY"
         assert conn.execute("SELECT COUNT(*) FROM redocking_poses").fetchone()[0] == 2
+
+
+def test_rmsd_retries_missing_pose_and_reuses_results(redocking_project, monkeypatch):
+    repo, profile, molecule = redocking_project
+    meeko, vina = FakeMeeko(), FakeVina()
+    monkeypatch.setattr(rmsd, "_engine", lambda: (lambda *_: 0.0, "test-version"))
+    runner_for(repo, profile, molecule, meeko=meeko, vina=vina).run()
+    run, provenance, _, _ = rmsd.validation_runs(repo, profile)[0]
+    pose = run / "dockrmsd" / "pose_002_heavy.mol2"
+    original = pose.read_bytes()
+    pose.unlink()
+    assert rmsd.read_results(run) is None
+    partial = rmsd.calculate_results(run, provenance)
+    assert partial["status"] == "Incomplete"
+    assert pose.name in partial["poses"][1]["error"]
+    pose.write_bytes(original)
+    assert rmsd.calculate_results(run, provenance)["status"] == "Calculated"
+
+    def unexpected(*_):
+        pytest.fail("Matching results should be reused")
+
+    monkeypatch.setattr(rmsd, "_engine", lambda: (unexpected, "test-version"))
+    assert rmsd.calculate_results(run, provenance)["status"] == "Calculated"
+    assert meeko.calls == vina.calls == 1
+
+
+def test_rmsd_engine_failure_version_and_changed_inputs(redocking_project, monkeypatch):
+    repo, profile, molecule = redocking_project
+
+    def unavailable():
+        raise ImportError("test missing engine")
+
+    monkeypatch.setattr(rmsd, "_engine", unavailable)
+    completed = runner_for(repo, profile, molecule).run()
+    assert completed["status"] == "ARTIFACTS_READY"
+    assert completed["dockrmsd"]["status"] == "Unavailable"
+    run, provenance, _, _ = rmsd.validation_runs(repo, profile)[0]
+    monkeypatch.setattr(rmsd, "_engine", lambda: (lambda *_: 0.25, "v1"))
+    result = rmsd.calculate_results(run, provenance)
+    assert result["status"] == "Calculated" and result["lowest"]["pose_rank"] == 1
+    monkeypatch.setattr(rmsd, "_engine", lambda: (lambda *_: 1.25, "v2"))
+    assert rmsd.calculate_results(run, provenance)["lowest"]["rmsd_angstrom"] == 1.25
+    reference = run / "dockrmsd" / rmsd.REFERENCE
+    reference.write_text(reference.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    assert rmsd.read_results(run) is None
+    invalid = rmsd.calculate_results(run, provenance)
+    assert invalid["status"] == "Unavailable"
+    assert "Checksum" in invalid["poses"][0]["error"]
+
+
+def test_real_pydockrmsd_on_generated_mol2(tmp_path):
+    try:
+        version("pydockrmsd")
+    except PackageNotFoundError:
+        pytest.skip("PyDockRMSD wheel is not installed")
+    molecule = Chem.MolFromSmiles("CC")
+    conformer = Chem.Conformer(2)
+    conformer.SetAtomPosition(0, (0, 0, 0))
+    conformer.SetAtomPosition(1, (1.5, 0, 0))
+    molecule.AddConformer(conformer)
+    reference = tmp_path / "reference.mol2"
+    write_mol2(molecule, reference, heavy_only=True)
+    assert rmsd._measure(str(reference), str(reference)) == pytest.approx(0)
+
+    translated = Chem.Mol(molecule)
+    for index in range(2):
+        translated.GetConformer().SetAtomPosition(index, (index * 1.5, 0, 3))
+    translated_path = tmp_path / "translated.mol2"
+    write_mol2(translated, translated_path, heavy_only=True)
+    assert rmsd._measure(str(reference), str(translated_path)) == pytest.approx(3)
+
+    swapped = Chem.RenumberAtoms(molecule, [1, 0])
+    swapped_path = tmp_path / "swapped.mol2"
+    write_mol2(swapped, swapped_path, heavy_only=True)
+    assert rmsd._measure(str(reference), str(swapped_path)) == pytest.approx(0)
+
+
+def test_rmsd_package_and_report_round_trip(redocking_project, tmp_path, monkeypatch):
+    pytest.importorskip("PyQt6.QtWidgets")
+    from PyQt6.QtWidgets import QApplication, QFileDialog, QLabel, QMessageBox
+    from moldockpipe.reporting import generate_project_report
+    from moldockpipe.ui.receptor_manager import ReceptorManagerDialog
+    from moldockpipe.ui.redocking_dialog import RedockingResultDialog
+
+    app = QApplication.instance() or QApplication([])
+    repo, profile, molecule = redocking_project
+    monkeypatch.setattr(rmsd, "_engine", lambda: (
+        lambda reference, pose: 2.5 if "001" in Path(pose).name else 0.8, "test-version"))
+    completed = runner_for(repo, profile, molecule).run()
+    result_dialog = RedockingResultDialog(repo, completed, profile, 123)
+    assert any("Rank 1 2.500 Å" in label.text() for label in result_dialog.findChildren(QLabel))
+    package = tmp_path / "receptor.moldock-receptor.zip"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(package), ""))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (str(package), ""))
+    monkeypatch.setattr(QMessageBox, "information", lambda *a: None)
+    source = ReceptorManagerDialog(repo)
+    source.table.selectRow(0)
+    assert "Rank 1 2.500 Å" in source.rmsd_summary.text()
+    source._export_profile()
+
+    destination = ProjectRepository.create(tmp_path / "imported")
+    target = ReceptorManagerDialog(destination)
+    target._import_profile()
+    target._save_locked()
+    imported = next(item for item in destination.get_receptor_profiles() if item["name"] == profile["name"])
+    run, _, result, current = rmsd.validation_runs(destination, imported)[0]
+    assert current and result == completed["dockrmsd"]
+    with destination.connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM redocking_runs").fetchone()[0] == 0
+    report = generate_project_report(destination, output_root=destination.root / "exports" / "rmsd")
+    data = json.loads(report.with_name("report_data.json").read_text(encoding="utf-8"))
+    receptor = next(item for item in data["receptors"] if item["profile"]["id"] == imported["id"])
+    assert receptor["redocking"]["dockrmsd"] == result
+    assert "Lowest 0.800 Å (pose 2)" in report.read_text(encoding="utf-8")
+    (destination.root / imported["receptor"]).write_text("different receptor", encoding="utf-8")
+    assert rmsd.validation_runs(destination, imported)[0][3] is False
+    (run / "dockrmsd" / "results.json").unlink()
+    assert rmsd.validation_runs(destination, imported)[0][2] is None
+    app.processEvents()
 
 
 @pytest.mark.parametrize(("service", "message"), (("meeko", "mock Meeko failure"), ("vina", "mock Vina failure")))

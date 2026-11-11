@@ -11,6 +11,7 @@ from typing import Any, Iterable
 
 from .fingerprints import file_sha256
 from .project import ProjectRepository, utc_now
+from .redocking.rmsd import format_summary, validation_runs
 
 
 REPORT_SCHEMA = "moldockpipe-report-v1"
@@ -186,10 +187,19 @@ class ReportDataBuilder:
                                      (redock_row["run_id"],)).fetchall()
                 redocking["pose_count"] = len(poses)
                 redocking["affinities"] = [row["affinity"] for row in poses]
-                redocking["dockrmsd"] = {"status": "Not calculated", "pose_rank": None, "rmsd_angstrom": None,
-                                          "tool": None, "notes": None}
                 transformation = self.repository.root / "inputs" / "receptors" / profile_id / "redocking" / str(redock_row["run_id"]) / "transformation.json"
                 redocking["transformation"] = _decode(transformation.read_text(encoding="utf-8"), {}) if transformation.is_file() else {}
+
+        current_validation = next((item for item in validation_runs(self.repository, profile) if item[3]), None)
+        if current_validation:
+            run, _, rmsd, _ = current_validation
+            if not redocking or redocking["run_id"] != run.name:
+                validation = run / "validation.json"
+                metadata = _decode(validation.read_text(encoding="utf-8"), {}) if validation.is_file() else {}
+                redocking = {"run_id": run.name, "status": "ARTIFACTS_READY", "pose_count": metadata.get("pose_count")}
+            redocking["dockrmsd"] = rmsd
+        elif redocking:
+            redocking["dockrmsd"] = None
 
         ad4zn_record = None
         ad4zn_manifest = self.repository.root / "inputs" / "receptors" / profile_id / "ad4zn" / "current.json"
@@ -307,7 +317,13 @@ def render_html(data: dict[str, object]) -> str:
         if redocking:
             redocking_html = _table(["Run", "Status", "Poses", "Settings", "DockRMSD"], [[
                 redocking.get("run_id"), redocking.get("status"), redocking.get("pose_count"),
-                redocking.get("settings"), redocking.get("dockrmsd", {}).get("status")]])
+                redocking.get("settings"), format_summary(redocking.get("dockrmsd"))]])
+            rmsd = redocking.get("dockrmsd")
+            if rmsd:
+                redocking_html += _table(["Pose rank", "Affinity", "RMSD (Å)", "Details"], [
+                    [row["pose_rank"], row["affinity"],
+                     f"{row['rmsd_angstrom']:.3f}" if row["rmsd_angstrom"] is not None else None, row.get("error")]
+                    for row in rmsd["poses"]])
             transformation = redocking.get("transformation", {})
             reference = transformation.get("reference_ligand", {})
             if reference:
