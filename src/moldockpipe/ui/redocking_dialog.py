@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QThread, QTimer, QUrl, pyqtSignal, pyqtSlot
+from ..redocking.campaign import MAX_TRIALS, run_campaign
 from ..redocking.rmsd import format_summary
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
@@ -28,22 +29,36 @@ class RedockingWorker(QObject):
     progress = pyqtSignal(object); succeeded = pyqtSignal(object); failed = pyqtSignal(str); finished = pyqtSignal()
 
     def __init__(self, repository: ProjectRepository, profile: dict[str, object], settings: RedockingSettings,
-                 run_id: str | None = None) -> None:
-        super().__init__(); self.cancel_event = threading.Event(); self.runner = RedockingRunner(repository, profile, settings,
-            progress=self.progress.emit, cancel_event=self.cancel_event); self.run_id = run_id
+                 run_id: str | None = None, *, campaign: dict | None = None) -> None:
+        super().__init__()
+        self.cancel_event = threading.Event()
+        self.repository = repository
+        self.profile = profile
+        self.settings = settings
+        self.run_id = run_id
+        self.campaign = campaign
 
     @pyqtSlot()
     def run(self) -> None:
-        try: self.succeeded.emit(self.runner.run(self.run_id))
-        except Exception as exc: self.failed.emit(str(exc))
-        finally: self.finished.emit()
+        try:
+            if self.campaign is not None:
+                result = run_campaign(self.repository, self.campaign, self.settings, self.progress.emit, self.cancel_event)
+            else:
+                runner = RedockingRunner(self.repository, self.profile, self.settings,
+                                         progress=self.progress.emit, cancel_event=self.cancel_event)
+                result = runner.run(self.run_id)
+            self.succeeded.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            self.finished.emit()
 
     def cancel(self) -> None: self.cancel_event.set()
 
 
 class RedockingSetupDialog(QDialog):
     def __init__(self, repository: ProjectRepository, profile: dict[str, object], parent: QWidget | None = None,
-                 *, action_label: str = "Run Redocking") -> None:
+                 *, action_label: str = "Run Redocking", campaign: bool = False) -> None:
         super().__init__(parent); self.repository = repository; self.profile = profile; self.setWindowTitle("Redocking Validation")
         reference = profile.get("reference_ligand") if isinstance(profile.get("reference_ligand"), dict) else {}
         form = QFormLayout(); form.addRow("Receptor profile", QLabel(str(profile.get("name", profile.get("id", "")))))
@@ -59,6 +74,18 @@ class RedockingSetupDialog(QDialog):
             ("energy_range", "Energy range", 0, 100), ("seed", "Seed", 0, 2147483647), ("cpu_count", "CPU count", 1, max(256, logical_cpu_count()))):
             spin = QDoubleSpinBox() if key == "energy_range" else QSpinBox(); spin.setRange(minimum, maximum); spin.setValue(defaults[key])
             self.values[key] = spin; form.addRow(label, spin)
+        self.trial_cap = None
+        if campaign:
+            self.setWindowTitle("Redocking Campaign")
+            self.values["seed"].setMinimum(1)
+            self.trial_cap = QSpinBox()
+            self.trial_cap.setRange(1, MAX_TRIALS)
+            self.trial_cap.setValue(MAX_TRIALS)
+            form.addRow("Maximum trials", self.trial_cap)
+            explanation = QLabel("Starts with the saved box, then tests ±2 Å center shifts and dimension changes. "
+                                 "Stops when pose #1 is below 2 Å RMSD.")
+            explanation.setWordWrap(True)
+            form.addRow(explanation)
         mapping_path = Path(str(reference.get("mapping", ""))); mapping_path = mapping_path if mapping_path.is_absolute() else repository.root / mapping_path
         warning = QLabel("")
         if mapping_path.is_file():

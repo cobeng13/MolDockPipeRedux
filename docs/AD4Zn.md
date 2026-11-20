@@ -52,8 +52,7 @@ $env:MOLDOCKPIPE_AD4ZN_AUTOGRID = 'C:/path/to/ADFR/bin/autogrid4.exe'
 $env:MOLDOCKPIPE_AD4ZN_ZINC_PSEUDO = 'C:/path/to/zinc_pseudo.py'
 $env:MOLDOCKPIPE_AD4ZN_PREPARE_GPF = 'C:/path/to/prepare_gpf4zn.py'
 $env:MOLDOCKPIPE_AD4ZN_PARAMETERS = 'C:/path/to/AD4Zn.dat'
-# From the feature worktree, select its source without changing the stable
-# checkout's editable installation:
+# From the repository root, select the current checkout's source:
 $env:PYTHONPATH = (Join-Path (Get-Location) 'src')
 python -m moldockpipe ui
 ```
@@ -140,6 +139,9 @@ metadata. Generated bundles live at
 validated bundle. Each bundle includes the base/TZ receptors, parameter file,
 GPF, maps/field descriptor, command output, versions, hashes, and manifest.
 Failures retain their directory and logs and never replace a valid current bundle.
+Each [redocking campaign trial](redocking-rmsd.md) records its own map manifest.
+The production bundle is checked against the saved profile when production
+docking next runs.
 
 Reuse checks scientific input hashes and validates the complete cached outputs.
 Changed tools, parameters, receptor, grid, required atom types, or map contents
@@ -159,7 +161,7 @@ Do not compare standard Vina and AD4Zn scores as one scoring scale.
 
 ## Acceptance and limitations
 
-From this worktree, set PYTHONPATH to its src directory as shown above, then
+From the repository root, set PYTHONPATH to its src directory as shown above, then
 run `python -m pytest -q -p no:cacheprovider` in the project Conda environment.
 Tests cover failures, backward compatibility, mixed campaigns, atom-type union,
 cache invalidation, redocking, and actual bundled Vina AD4 execution on synthetic
@@ -167,7 +169,7 @@ maps. Synthetic maps are a command/parsing test, not a force-field validation.
 
 After installing the external tools, run the official zinc tutorial as a toolchain
 check, then test the selected MMP-13 complex manually: retain the intended metals,
-inspect TZ geometry, redock the reference ligand, inspect metal coordination and
-pose recovery, and assess RMSD externally. MolDockPipe still does not compute
-DockRMSD itself. Test standard Vina in a separate project as a release regression.
-Keep this feature branch separate from main until that acceptance review.
+inspect TZ geometry, redock the reference ligand, and inspect metal coordination
+and pose recovery. Use the optional PyDockRMSD engine to measure
+crystallographic-reference RMSD. Test standard Vina in a separate project as a
+release regression.

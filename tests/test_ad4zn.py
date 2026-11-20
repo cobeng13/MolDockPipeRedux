@@ -187,6 +187,23 @@ def test_bundle_reuse_and_portable_metadata(zinc_project):
     assert (prefix.parent / 'manifest.json').is_file()
 
 
+def test_trial_manifest_preserves_active_map_selection(zinc_project):
+    repo, profile, ligand, vina, _, calls = zinc_project
+    active, _ = ad4zn.ensure_ad4zn_maps(repo, profile, [ligand], vina)
+    active_path = active.parent.parent / "current.json"
+    saved = active_path.read_bytes()
+    manifest = repo.root / "trial" / "ad4zn-maps.json"
+    manifest.parent.mkdir()
+    trial_profile = {**profile, "center_x": profile["center_x"] + 2}
+    trial, record = ad4zn.ensure_ad4zn_maps(repo, trial_profile, [ligand], vina, manifest=manifest)
+    assert trial != active
+    assert active_path.read_bytes() == saved
+    assert record["grid"]["center"][0] == trial_profile["center_x"]
+    count = len(calls)
+    assert ad4zn.ensure_ad4zn_maps(repo, trial_profile, [ligand], vina, manifest=manifest)[0] == trial
+    assert len(calls) == count
+
+
 @pytest.mark.parametrize('change', ['parameters', 'zinc_pseudo', 'autogrid', 'vina', 'receptor', 'box', 'ligand_types', 'map'])
 def test_scientific_changes_invalidate_bundle(zinc_project, change):
     repo, profile, ligand, vina, tools, calls = zinc_project

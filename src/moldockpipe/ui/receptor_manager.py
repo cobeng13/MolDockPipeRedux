@@ -20,6 +20,7 @@ from ..receptors.ad4zn import check_ad4zn_environment, require_zinc
 from ..project import DEFAULT_VINA_PROFILE, ProjectRepository
 from .redocking_dialog import RedockingSetupDialog
 from .redocking_queue import RedockingQueueController, RedockingQueueDialog
+from ..redocking.models import BOX_KEYS, SEARCH_SETTING_KEYS
 from ..redocking.runner import validate_redocking_prerequisites
 from ..execution_lock import exclusive_project, project_execution_lock
 from ..redocking.rmsd import REFERENCE, calculate_results, format_summary, validation_runs
@@ -78,7 +79,9 @@ class ReceptorProfileDialog(QDialog):
             ("energy_range", "Energy range", 0, 100, 3), ("seed", "Random seed", 0, 2147483647, 42),
             ("cpu_count", "CPU count", 1, max(256, logical_cpu_count()), logical_cpu_count()),
         ):
-            field = QSpinBox(); field.setRange(minimum, maximum); field.setValue(int(profile.get(key, default)))
+            field = QDoubleSpinBox() if key == "energy_range" else QSpinBox()
+            field.setRange(minimum, maximum)
+            field.setValue(float(profile.get(key, default)) if key == "energy_range" else int(profile.get(key, default)))
             self.numbers[key] = field; form.addRow(label, field)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._validate); buttons.rejected.connect(self.reject)
@@ -166,6 +169,9 @@ class ReceptorManagerDialog(QDialog):
         controls.addStretch()
         validation_controls = QHBoxLayout()
         self.redock_button = QPushButton("Add to Validation Queue"); self.redock_button.clicked.connect(self._redock); validation_controls.addWidget(self.redock_button)
+        self.campaign_button = QPushButton("Queue Redocking Campaign…")
+        self.campaign_button.clicked.connect(lambda: self._redock(campaign=True))
+        validation_controls.addWidget(self.campaign_button)
         queue_button = QPushButton("View Validation Queue"); queue_button.clicked.connect(self._show_queue); validation_controls.addWidget(queue_button)
         self.rmsd_button = QPushButton("Redocking RMSD…")
         self.rmsd_button.clicked.connect(self._show_rmsd)
@@ -184,6 +190,7 @@ class ReceptorManagerDialog(QDialog):
         self._refresh()
         self.table.itemSelectionChanged.connect(self._update_redock_button)
         self.queue_controller.validation_completed.connect(self._update_redock_button)
+        self.queue_controller.box_applied.connect(self._winning_box_applied)
 
     def _refresh(self) -> None:
         self.table.setRowCount(0)
@@ -199,6 +206,7 @@ class ReceptorManagerDialog(QDialog):
         index = self._selected()
         eligible = index is not None and not self.profiles[index].get("archived") and not validate_redocking_prerequisites(self.repository, self.profiles[index])
         self.redock_button.setEnabled(bool(eligible))
+        self.campaign_button.setEnabled(bool(eligible))
         self.rmsd_button.setEnabled(index is not None)
         runs = validation_runs(self.repository, self.profiles[index]) if index is not None else []
         current = next((result for _, _, result, matches in runs if matches), None)
@@ -292,23 +300,39 @@ class ReceptorManagerDialog(QDialog):
             executor.shutdown(wait=False)
             self._update_redock_button()
 
-    def _redock(self) -> None:
+    def _winning_box_applied(self, profile: dict) -> None:
+        profile_id = str(profile["id"])
+        original = self.original_profiles.get(profile_id)
+        if original:
+            defaults = {key: profile[key] for key in (*BOX_KEYS, *SEARCH_SETTING_KEYS)}
+            original.update(defaults)
+            for local in self.profiles:
+                if str(local["id"]) == profile_id:
+                    local.update(defaults)
+                    break
+        self._update_redock_button()
+
+    def _redock(self, *, campaign: bool = False) -> None:
         index = self._selected()
         if index is None: return
         profile = self.profiles[index]; missing = validate_redocking_prerequisites(self.repository, profile)
         if missing:
             QMessageBox.warning(self, "Redocking cannot start", "Missing:\n• " + "\n• ".join(missing) + "\n\nReturn to Receptor Preparation to complete the profile."); return
-        setup = RedockingSetupDialog(self.repository, profile, self, action_label="Add to Queue")
+        setup = RedockingSetupDialog(self.repository, profile, self, action_label="Add to Queue", campaign=campaign)
         if setup.exec() != QDialog.DialogCode.Accepted: return
-        if not self._save_profiles():
+        original = list(self.original_profiles.values())
+        if self.profiles != original and not self._save_profiles():
             return
         try:
-            self.queue_controller.enqueue(profile, setup.settings())
-        except ValueError as exc:
+            self.repository.check_receptor_profiles(list(self.original_profiles.values()))
+            self.queue_controller.enqueue(profile, setup.settings(),
+                                          trial_cap=setup.trial_cap.value() if setup.trial_cap is not None else None)
+        except (OSError, RuntimeError, ValueError) as exc:
             QMessageBox.warning(self, "Validation not queued", str(exc)); return
-        QMessageBox.information(self, "Validation queued",
-            f"{profile.get('name')} was added to the validation queue.\n\n"
-            "Validations run one at a time. You can close the queue window and leave MolDockPipe running.")
+        if not campaign:
+            QMessageBox.information(self, "Validation queued",
+                f"{profile.get('name')} was added to the validation queue.\n\n"
+                "Validations run one at a time. You can close the queue window and leave MolDockPipe running.")
         self._show_queue()
 
     def _show_queue(self) -> None:
@@ -510,8 +534,7 @@ class ReceptorManagerDialog(QDialog):
     @exclusive_project
     def _save_locked(self) -> None:
         self.repository.check_receptor_profiles(list(self.original_profiles.values()))
-        docking_keys = {"protocol", "ad4zn", "receptor", "center_x", "center_y", "center_z", "size_x", "size_y", "size_z",
-                        "exhaustiveness", "num_modes", "energy_range", "seed", "cpu_count"}
+        docking_keys = {"protocol", "ad4zn", "receptor", *BOX_KEYS, *SEARCH_SETTING_KEYS}
         for profile in self.profiles:
             profile_id = str(profile["id"])
             source = self.sources.get(profile_id)

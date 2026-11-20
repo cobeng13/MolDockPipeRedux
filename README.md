@@ -5,12 +5,40 @@ ligands, generated molecular states, docking runs, poses, and scientific artifac
 separate. The legacy scripts remain in `Reference/` as behavioral reference only.
 
 Automated ProLIF comparison against the crystallographic reference is available
-from **Multidock Results â†’ Analyze Interactions** after existing SDF export.
-Use **Load co-crystallized SDFâ€¦** there to attach a reference for an imported
+from **Multidock Results → Analyze Interactions** after existing SDF export.
+Use **Load co-crystallized SDF…** there to attach a reference for an imported
 receptor without a validation run.
 Optional execution after each export batch is configured in Post-docking settings.
 See [interaction analysis](docs/interaction-analysis.md) for inputs, CSV schemas,
 scientific policies, command-line use, and limitations.
+
+## Understanding the program and reporting a study
+
+Start with [How MolDockPipe works](docs/how-it-works.md) for the scientific
+workflow, compound/state/run/pose identities, project storage, source architecture,
+and the implemented limits of reuse and validation. The
+[publication reporting guide](docs/publication-reporting.md) provides a methods
+reporting checklist, reproducibility-package instructions, and a study-specific
+methods paragraph template.
+
+MolDockPipe coordinates RDKit, MolScrub, Meeko, and docking backends. With the
+optional PyDockRMSD engine installed, reference redocking measures how closely
+the predicted poses recover a crystallographic ligand. Scientific performance
+claims require evaluation on the study's own targets and compounds.
+
+## Redocking validation and production settings
+
+In **Receptors**, use **Add to Validation Queue** to redock once with the saved
+box, or **Queue Redocking Campaign…** to try a bounded series of boxes. A campaign
+stops when affinity-ranked pose 1 is below 2 Å RMSD to the crystallographic
+reference. Choose **Apply Winning Box and Settings** in the completed campaign
+details to save the successful box and validation settings as the receptor's
+production docking defaults. Earlier screening runs retain their original
+settings in the run history.
+
+**Export → Project report (HTML)** shows recorded validation and production-run
+settings alongside the saved production defaults. See the
+[redocking guide](docs/redocking-rmsd.md) for setup, retry, and campaign behavior.
 
 ## First-time installation (Windows desktop)
 
@@ -108,12 +136,12 @@ export first is unnecessary. Missing or changed structures produce an error
 instead of displaying an unmatched complex.
 
 Interaction toggles display colored dashed lines for **H-bonds** (blue),
-**Ï€â€“Ï€** (purple), **cationâ€“Ï€** (orange), **salt bridges** (green), and
+**π–π** (purple), **cation–π** (orange), **salt bridges** (green), and
 **hydrophobic contacts** (gray, initially hidden). Counts include all detected
 contacts, including hidden types. Contacted residues appear as sticks on the
 cartoon. Toggle **Contact labels** to show residue identity, interaction type,
-and distance in Ã…; hiding the receptor also hides these annotations.
-PNG exports include the visible contacts and labels. **Interaction criteriaâ€¦**
+and distance in Å; hiding the receptor also hides these annotations.
+PNG exports include the visible contacts and labels. **Interaction criteria…**
 explains the rules inside Results. No additional installation is required.
 
 These are geometric predictions, not validated bonds, interaction energies,
@@ -130,13 +158,13 @@ Only the first receptor model and blank/A alternate locations are considered.
 
 | Contact | Geometry used |
 | --- | --- |
-| H-bond | Donorâ€“acceptor â‰¤3.5 Ã…. With explicit donor H: Hâ€“A â‰¤2.6 Ã… and Dâ€“Hâ€“A â‰¥120Â°. Without donor H: every heavy-neighborâ€“Dâ€“A angle â‰¥90Â°; explicitly labeled **candidate**. |
-| Ï€â€“Ï€ | Ring centers â‰¤5.5 Ã…; acute plane angle â‰¤30Â° (parallel) or â‰¥60Â° (T-shaped); minimum of the two ring-plane offsets â‰¤2 Ã…. Ring atoms must be planar within 0.15 Ã…. |
-| Cationâ€“Ï€ | Positive groupâ€“ring center â‰¤6 Ã…; in-plane offset â‰¤2 Ã…. |
-| Salt bridge | Opposite charge group centers â‰¤4 Ã…. |
-| Hydrophobic | Nonpolar CÂ·Â·Â·C â‰¤4 Ã…; carbon neighbors limited to C/H/S; shortest contact per residue. |
+| H-bond | Donor–acceptor ≤3.5 Å. With explicit donor H: H–A ≤2.6 Å and D–H–A ≥120°. Without donor H: every heavy-neighbor–D–A angle ≥90°; explicitly labeled **candidate**. |
+| π–π | Ring centers ≤5.5 Å; acute plane angle ≤30° (parallel) or ≥60° (T-shaped); minimum of the two ring-plane offsets ≤2 Å. Ring atoms must be planar within 0.15 Å. |
+| Cation–π | Positive group–ring center ≤6 Å; in-plane offset ≤2 Å. |
+| Salt bridge | Opposite charge group centers ≤4 Å. |
+| Hydrophobic | Nonpolar C···C ≤4 Å; carbon neighbors limited to C/H/S; shortest contact per residue. |
 
-Distances below 0.5 Ã… are excluded as coincident coordinates, not contacts.
+Distances below 0.5 Å are excluded as coincident coordinates, not contacts.
 Ring and charged-group distances are measured between centers, not nearest atoms.
 This is a local geometric detector, **not PLIP**. Its ring/offset rules and
 hydrophobic cutoff are informed by the
@@ -196,7 +224,7 @@ validation and the separate persistent-work architecture proposal.
 
 ## Troubleshooting student installations
 
-Open **Tools â†’ Troubleshooterâ€¦** (no project is required), click **Run checks**,
+Open **Tools → Troubleshooter…** (no project is required), click **Run checks**,
 then copy or save the report. It records the app's Python executable, environment,
 package versions and locations, full errors, and suggested actions. Each check
 runs separately with a time limit, so an import crash does not stop other checks.
@@ -287,9 +315,12 @@ The main window provides individual stage buttons and **Run All**:
 Screening -> MolScrub states -> Meeko PDBQT -> Vina docking -> post-docking export
 ```
 
-Screening uses RDKit physicochemical rules. Its default policy is **Annotate only**;
+Screening uses RDKit descriptor predicates, including simplified Ghose and
+BOILED-Egg criteria described in the [workflow guide](docs/how-it-works.md).
+Its default policy is **Annotate only**;
 the Settings dialog can instead exclude compounds failing any/all selected rules or
-send them to manual review.
+flag them for manual review. The current manual-review flag does not itself block
+state generation pending approval.
 
 Run All and individual stages execute in the background. The interface shows:
 
@@ -304,7 +335,9 @@ verified SDFs, Meeko skips verified prepared PDBQTs, and Vina reuses completed
 runs per state and receptor when receptor/settings/tool fingerprints and output
 checksums match. Changed scientific settings can require fresh work. Failed
 preparation/docking or missing/damaged artifacts are retried. Closing during work marks unfinished runs as interrupted when
-the project is reopened.
+the project is reopened. Reuse checks differ by stage; see the
+[implemented reuse boundaries](docs/how-it-works.md#reuse-failure-and-provenance-boundaries)
+before treating an existing output as a fully verified reproducibility record.
 
 For older projects that report an unknown historical MolScrub version, enable
 **Settings > MolScrub > Retain verified legacy results**, save, and run again
@@ -338,7 +371,7 @@ Large campaigns update the dashboard through one background snapshot at a time;
 slow queries and export-file checks do not run on the GUI thread. Results load
 only the visible receptor in pages of 200 ligands. The export selector uses a
 virtual table, and project loading and CSV imports run in background workers.
-For a responsiveness or memory report, choose **Tools â†’ Save performance report**.
+For a responsiveness or memory report, choose **Tools → Save performance report**.
 The local JSON includes app/source identifiers, record counts and indexes,
 dashboard timing, GUI heartbeat gaps, available memory, and Windows app/child
 process memory and CPU times. It includes local paths; review before sharing.
@@ -429,7 +462,7 @@ while preserving inputs and `project.yml`.
 
 ## Optional zinc-metalloprotein docking
 
-The feature branch adds receptor-specific AutoDock4Zn preparation and Vina AD4
+The application includes optional receptor-specific AutoDock4Zn preparation and Vina AD4
 map scoring. Standard Vina remains the default. See [AD4Zn setup and validation](docs/AD4Zn.md)
 for the required external tools and manual validation steps.
 

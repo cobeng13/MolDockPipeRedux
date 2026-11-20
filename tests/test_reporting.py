@@ -34,6 +34,7 @@ def test_generate_project_report_uses_structured_provenance(tmp_path: Path) -> N
     workflow_id = repo.start_workflow_run("docking", {"requested_dockings": 1})
     repo.update_workflow_stage(workflow_id, "vina", "completed", summary={"succeeded": 1})
     repo.finish_workflow_run(workflow_id, "completed")
+    production_settings = {"exhaustiveness": 8, "num_modes": 9, "energy_range": 3, "cpu": 2}
     with repo.connection() as conn:
         conn.execute("""INSERT INTO molecular_states
             (state_id,parent_id,state_smiles,state_isomeric_smiles,formal_charge,state_structure_hash,
@@ -42,8 +43,8 @@ def test_generate_project_report_uses_structured_provenance(tmp_path: Path) -> N
         conn.execute("""INSERT INTO docking_runs
             (run_id,state_id,receptor_hash,settings_fingerprint,status,command_json,return_code,
              started_at,ended_at,is_current,receptor_profile_id,receptor_profile_name,workflow_run_id)
-            VALUES ('dock-1','state-1','receptor-hash','settings','completed','{}',0,?,?,1,'rec-a','Receptor A',?)""",
-            (utc_now(), utc_now(), workflow_id))
+            VALUES ('dock-1','state-1','receptor-hash','settings','completed',?,0,?,?,1,'rec-a','Receptor A',?)""",
+            (json.dumps({"settings": production_settings}), utc_now(), utc_now(), workflow_id))
         conn.execute("""INSERT INTO docking_poses
             (pose_id,run_id,mode_index,affinity,rmsd_lb,rmsd_ub,is_best_for_state)
             VALUES ('pose-1','dock-1',1,-8.5,0,0,1)""")
@@ -55,8 +56,16 @@ def test_generate_project_report_uses_structured_provenance(tmp_path: Path) -> N
     assert receptor["preparation"]["inventory"]["counts"]["protein_residues"] == 100
     assert receptor["docking"]["best_affinity_per_parent_statistics"]["best_minimum"] == -8.5
     assert receptor["docking"]["top_compounds"][0]["parent_id"] == "lig1"
+    assert receptor["docking"]["parameters"]["exhaustiveness"] == 16
+    assert receptor["docking"]["run_parameters"] == [{
+        "parameters": {"exhaustiveness": 8, "num_modes": 9, "energy_range": 3, "cpu_count": 2},
+        "run_count": 1,
+    }]
     assert manifest["runs"]["current_docking_runs"] == ["dock-1"]
-    assert "Receptor preparation" in html_path.read_text(encoding="utf-8")
+    html = html_path.read_text(encoding="utf-8")
+    assert "Receptor preparation" in html
+    assert "Recorded production settings" in html
+    assert "Saved production defaults" in html
     with repo.connection() as conn:
         snapshot = conn.execute("SELECT output_path,output_sha256 FROM report_snapshots").fetchone()
         report_artifacts = conn.execute("SELECT COUNT(*) FROM artifacts WHERE created_stage='report'").fetchone()[0]

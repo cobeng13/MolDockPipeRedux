@@ -305,8 +305,9 @@ def validate_maps(work: Path, required: tuple[str, ...], grid: dict) -> list[Pat
     return paths
 
 
-def ensure_ad4zn_maps(repository, profile: dict, ligands: Iterable[Path], executable: Path, cancelled=None) -> tuple[Path, dict]:
-    """Build before docking any state; reuse only byte-verified complete bundles."""
+def ensure_ad4zn_maps(repository, profile: dict, ligands: Iterable[Path], executable: Path, cancelled=None, *,
+                      manifest: Path | None = None) -> tuple[Path, dict]:
+    """Build before docking; an optional trial manifest isolates the active bundle pointer."""
     tools = check_ad4zn_environment(repository.root).require()
     receptor = (repository.root / str(profile["receptor"])).resolve()
     require_zinc(receptor)
@@ -329,7 +330,7 @@ def ensure_ad4zn_maps(repository, profile: dict, ligands: Iterable[Path], execut
         raise ValueError("AD4Zn.dat has no parameters for ligand atom types: " + ", ".join(sorted(unsupported)))
     request = fingerprint(settings={"protocol": "ad4zn", "grid": grid, "atom_types": required,
                                     "ligand_atom_types": ligand_types}, inputs=inputs, tool_version="ad4zn-v2")
-    current = root / "current.json"
+    current = manifest if manifest is not None else root / "current.json"
     if current.is_file():
         try:
             record = json.loads(current.read_text())
@@ -378,7 +379,7 @@ def ensure_ad4zn_maps(repository, profile: dict, ligands: Iterable[Path], execut
                 repository.add_artifact(path, "ad4zn_preparation", "ad4zn")
         repository.record_provenance_event(event_type="ad4zn_maps_prepared", stage_name="ad4zn",
             receptor_profile_id=profile_id, data=record)
-        temporary = root / ("current-" + uuid.uuid4().hex + ".tmp")
+        temporary = current.with_name(f"{current.stem}-{uuid.uuid4().hex}.tmp")
         temporary.write_text(json.dumps(record, indent=2), encoding="utf-8")
         temporary.replace(current)
         return work / "receptor_TZ", record

@@ -11,6 +11,7 @@ from typing import Any, Iterable
 
 from .fingerprints import file_sha256
 from .project import ProjectRepository, utc_now
+from .redocking.models import BOX_KEYS, SEARCH_SETTING_KEYS
 from .redocking.rmsd import format_summary, validation_runs
 
 
@@ -127,7 +128,7 @@ class ReportDataBuilder:
             "receptors": receptors,
             "limitations": [
                 "Vina affinities are ranking estimates and are not experimental binding free energies.",
-                "Redocking remains ARTIFACTS_READY until an external RMSD result is recorded.",
+                "ARTIFACTS_READY indicates prepared redocking outputs. Reference RMSD is recorded separately when PyDockRMSD succeeds.",
                 "Flexible-receptor and covalent docking are outside the current workflow. AD4Zn is opt-in and requires target-specific validation; scores from different protocols are not directly comparable.",
                 "Inferred ligand chemistry and deliberately excluded receptor residues should be reviewed.",
             ],
@@ -135,11 +136,15 @@ class ReportDataBuilder:
 
     def _receptor(self, profile: dict[str, Any]) -> dict[str, object]:
         profile_id = str(profile.get("id"))
+        current_validation = next((item for item in validation_runs(self.repository, profile) if item[3]), None)
+        current_run_id = current_validation[0].name if current_validation else None
         with self.repository.connection() as conn:
             prep_row = conn.execute("""SELECT * FROM receptor_preparation_runs
                 WHERE receptor_profile_id=? ORDER BY started_at DESC LIMIT 1""", (profile_id,)).fetchone()
             redock_row = conn.execute("""SELECT * FROM redocking_runs WHERE receptor_profile_id=?
-                ORDER BY COALESCE(finished_at,interrupted_at,started_at) DESC LIMIT 1""", (profile_id,)).fetchone()
+                AND (run_id=? OR json_type(settings_json, '$.campaign') IS NULL)
+                ORDER BY (run_id=?) DESC, COALESCE(finished_at,interrupted_at,started_at) DESC LIMIT 1""",
+                (profile_id, current_run_id, current_run_id)).fetchone()
             docking_counts = conn.execute("""SELECT COUNT(*) total_runs,
                 SUM(CASE WHEN d.status='completed' THEN 1 ELSE 0 END) completed_runs,
                 SUM(CASE WHEN d.status='failed' THEN 1 ELSE 0 END) failed_runs,
@@ -151,6 +156,12 @@ class ReportDataBuilder:
             pose_count = conn.execute("""SELECT COUNT(*) FROM docking_poses p JOIN docking_runs d ON d.run_id=p.run_id
                 JOIN molecular_states s ON s.state_id=d.state_id WHERE d.receptor_profile_id=?
                 AND d.is_current=1 AND d.status='completed' AND s.active=1""", (profile_id,)).fetchone()[0]
+            run_setting_rows = conn.execute("""SELECT
+                CASE WHEN json_valid(d.command_json) THEN json_extract(d.command_json, '$.settings') END AS settings,
+                COUNT(*) AS run_count
+                FROM docking_runs d JOIN molecular_states s ON s.state_id=d.state_id
+                WHERE d.receptor_profile_id=? AND d.is_current=1 AND d.status='completed' AND s.active=1
+                GROUP BY settings ORDER BY run_count DESC, settings""", (profile_id,)).fetchall()
             best_rows = conn.execute("""WITH ranked AS (
                 SELECT s.parent_id,s.state_id,d.run_id,p.mode_index,p.affinity,
                     ROW_NUMBER() OVER (PARTITION BY s.parent_id ORDER BY p.affinity ASC,d.ended_at DESC) rank
@@ -190,7 +201,6 @@ class ReportDataBuilder:
                 transformation = self.repository.root / "inputs" / "receptors" / profile_id / "redocking" / str(redock_row["run_id"]) / "transformation.json"
                 redocking["transformation"] = _decode(transformation.read_text(encoding="utf-8"), {}) if transformation.is_file() else {}
 
-        current_validation = next((item for item in validation_runs(self.repository, profile) if item[3]), None)
         if current_validation:
             run, _, rmsd, _ = current_validation
             if not redocking or redocking["run_id"] != run.name:
@@ -206,9 +216,19 @@ class ReportDataBuilder:
         if profile.get("protocol") == "ad4zn" and ad4zn_manifest.is_file():
             ad4zn_record = _decode(ad4zn_manifest.read_text(encoding="utf-8"), {})
         best = [dict(row) for row in best_rows]
-        parameters = {key: profile.get(key) for key in (
-            "center_x", "center_y", "center_z", "size_x", "size_y", "size_z",
-            "exhaustiveness", "num_modes", "energy_range", "seed", "cpu_count")}
+        parameter_keys = (*BOX_KEYS, *SEARCH_SETTING_KEYS)
+        parameters = {key: profile.get(key) for key in parameter_keys}
+        run_parameter_counts: dict[str, int] = {}
+        for row in run_setting_rows:
+            settings = _decode(row["settings"], {})
+            if not isinstance(settings, dict):
+                settings = {}
+            recorded = {key: settings[key] for key in
+                        ("backend", "protocol", *parameter_keys, "thread", "search_depth") if key in settings}
+            if "cpu" in settings:
+                recorded["cpu_count"] = settings["cpu"]
+            encoded = json.dumps(recorded)
+            run_parameter_counts[encoded] = run_parameter_counts.get(encoded, 0) + row["run_count"]
         return {
             "profile": {key: value for key, value in profile.items() if key != "reference_ligand"},
             "reference_ligand": profile.get("reference_ligand"),
@@ -218,6 +238,8 @@ class ReportDataBuilder:
             "docking": {
                 "counts": {**dict(docking_counts), "pose_count": pose_count},
                 "parameters": parameters,
+                "run_parameters": [{"parameters": json.loads(encoded), "run_count": count}
+                                   for encoded, count in run_parameter_counts.items()],
                 "best_affinity_per_parent_statistics": _score_statistics(row["affinity"] for row in best),
                 "top_compounds": best[:25],
                 "failure_reasons": [dict(row) for row in failure_rows],
@@ -315,7 +337,7 @@ def render_html(data: dict[str, object]) -> str:
                     for item in incomplete])
         redocking_html = "<p>Not run.</p>"
         if redocking:
-            redocking_html = _table(["Run", "Status", "Poses", "Settings", "DockRMSD"], [[
+            redocking_html = _table(["Run", "Status", "Poses", "Recorded validation settings", "DockRMSD"], [[
                 redocking.get("run_id"), redocking.get("status"), redocking.get("pose_count"),
                 redocking.get("settings"), format_summary(redocking.get("dockrmsd"))]])
             rmsd = redocking.get("dockrmsd")
@@ -345,7 +367,10 @@ def render_html(data: dict[str, object]) -> str:
             + _table(["Best", "Median", "Mean", "Worst", "Q1", "Q3", "N"], [[
                 stats.get("best_minimum"), stats.get("median"), stats.get("mean"), stats.get("worst_maximum"),
                 stats.get("q1"), stats.get("q3"), stats.get("count")]])
-            + _table(["Docking parameters", "Value"], [[key, value] for key, value in docking["parameters"].items()])
+            + _table(["Recorded production settings", "Completed runs"], [
+                [group["parameters"] or "Settings unavailable", group["run_count"]]
+                for group in docking.get("run_parameters", [])])
+            + _table(["Saved production defaults", "Value"], [[key, value] for key, value in docking["parameters"].items()])
             + _table(["Affinity threshold", "Parent compounds"], [[key, value]
                 for key, value in stats.get("threshold_counts", {}).items()])
             + _table(["Rank", "Parent", "State", "Affinity (kcal/mol)", "Mode"], [

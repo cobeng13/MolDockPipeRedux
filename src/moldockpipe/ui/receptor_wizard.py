@@ -4,7 +4,7 @@ import re
 import uuid
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, QStandardPaths, Qt, QUrl, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -26,6 +26,26 @@ ROLE_LABELS = {
     ComponentRole.REMOVE: "Remove",
     ComponentRole.UNRESOLVED: "Choose an action…",
 }
+
+
+def _choose_input_file(parent: QWidget, title: str, name_filter: str) -> str:
+    dialog = QFileDialog(parent)
+    try:
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog)
+        dialog.setWindowTitle(title)
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        dialog.setNameFilter(name_filter)
+        downloads_path = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+        if downloads_path:
+            downloads = QUrl.fromLocalFile(downloads_path)
+            sidebar = dialog.sidebarUrls()
+            if downloads not in sidebar:
+                dialog.setSidebarUrls([*sidebar, downloads])
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            return dialog.selectedFiles()[0]
+        return ""
+    finally:
+        dialog.deleteLater()
 
 
 def _page_surface(page: QWidget) -> QVBoxLayout:
@@ -78,7 +98,7 @@ class SourcePage(QWidget):
         content.addLayout(form); content.addWidget(note); content.addStretch()
 
     def _browse(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Select receptor structure", filter="Structures (*.pdb *.cif *.mmcif)")
+        path = _choose_input_file(self, "Select receptor structure", "Structures (*.pdb *.cif *.mmcif)")
         if path:
             self.source.setText(path)
             if not self.name.text(): self.name.setText(Path(path).stem)
@@ -124,7 +144,7 @@ class ComponentsPage(QWidget):
         layout.addWidget(self.summary); layout.addWidget(self.table, 1); layout.addLayout(template_row)
 
     def _browse_template(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Select reference-ligand chemical template", filter="SDF files (*.sdf)")
+        path = _choose_input_file(self, "Select reference-ligand chemical template", "SDF files (*.sdf)")
         if path: self.template.setText(path)
 
     def load_analysis(self, analysis: StructureAnalysis) -> None:

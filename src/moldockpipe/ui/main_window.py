@@ -431,8 +431,10 @@ class MainWindow(QMainWindow):
         self.redocking_queue.activity.connect(self._write_log)
         self.redocking_queue.activity.connect(lambda message: self.statusBar().showMessage(message, 10000))
         self.redocking_queue.validation_completed.connect(
-            lambda result: self._write_log(f"Redocking artifacts ready: run {result.get('run_id')}")
+            lambda result: self._write_log(f"Redocking artifacts ready: run {result['run_id']}")
+            if "campaign_id" not in result else None
         )
+        self.redocking_queue.box_applied.connect(self._refresh_checkpoint_state)
         self.redocking_queue.start()
         self._write_log(f"{action} project: {self.repo.root}")
         self.refresh_tables()

@@ -8,10 +8,12 @@ import os
 import subprocess
 import sys
 import tempfile
+from time import monotonic
 from importlib.metadata import version
 from pathlib import Path
 
 from ..fingerprints import file_sha256
+from .models import BOX_KEYS
 
 LOG = logging.getLogger(__name__)
 REFERENCE = "reference_ligand_heavy.mol2"
@@ -36,7 +38,7 @@ def validation_runs(repository, profile):
     reference_hash = _hash(repository.root / str(reference.get("sdf") or ""))
     with repository.connection() as conn:
         local = {row["run_id"]: dict(row) for row in conn.execute(
-            """SELECT r.run_id, r.status, r.receptor_sha256, r.reference_sha256, r.finished_at,
+            """SELECT r.run_id, r.status, r.receptor_sha256, r.reference_sha256, r.finished_at, r.settings_json,
                       s.artifacts_json AS mol2_artifacts
                FROM redocking_runs r LEFT JOIN redocking_stages s
                    ON s.run_id=r.run_id AND s.stage_name='mol2_generation'
@@ -47,31 +49,42 @@ def validation_runs(repository, profile):
             continue
         result = read_results(run)
         provenance = local.get(run.name)
+        campaign = None
         if provenance is not None:
             if provenance.pop("status") != "ARTIFACTS_READY":
                 continue
             provenance.pop("run_id")
             try:
+                campaign = json.loads(provenance.pop("settings_json")).get("campaign")
                 provenance["validated_reference_mol2_sha256"] = json.loads(
                     provenance.pop("mol2_artifacts") or "{}").get(REFERENCE)
             except (ValueError, AttributeError):
                 continue
             if result and result.get("provenance") != provenance:
                 result = None
-        elif result:
-            provenance = result.get("provenance")
         else:
+            provenance = result.get("provenance") if result else None
             try:
                 metadata = json.loads((run / "validation.json").read_text(encoding="utf-8"))
-                if metadata.get("status") == "ARTIFACTS_READY":
-                    provenance = metadata.get("provenance") or {}
+                campaign = metadata.get("campaign")
+                if not result and metadata.get("status") == "ARTIFACTS_READY":
+                    provenance = metadata.get("provenance")
             except (OSError, ValueError, AttributeError):
-                continue
+                if not result:
+                    continue
         if not isinstance(provenance, dict):
             continue
         current = bool(receptor_hash and reference_hash
                        and receptor_hash == provenance.get("receptor_sha256")
                        and reference_hash == provenance.get("reference_sha256"))
+        if current and campaign is not None:
+            protocol = profile.get("protocol", "vina")
+            try:
+                current = (campaign["protocol"] == protocol
+                           and (protocol != "ad4zn" or campaign["ad4zn"] == profile.get("ad4zn"))
+                           and all(float(profile[key]) == campaign["box"][key] for key in BOX_KEYS))
+            except (KeyError, TypeError, ValueError):
+                current = False
         runs.append((run, provenance, result, current))
     return sorted(runs, key=lambda item: (str(item[1].get("finished_at") or ""), item[0].name), reverse=True)
 
@@ -137,7 +150,7 @@ def _engine():
     return _measure, version("pydockrmsd")
 
 
-def _measure(reference, pose):
+def _measure(reference, pose, *, cancelled=None):
     # The upstream extension parses MOL2 in native code. Isolate it so a
     # parser failure cannot terminate the desktop app or its docking queue.
     code = """
@@ -148,21 +161,36 @@ result = PyDockRMSD(sys.argv[1], sys.argv[2])
 print(json.dumps([result.rmsd, result.error]))
 """
     folder = Path(reference).resolve().parent
-    process = subprocess.run(
-        [sys.executable, "-c", code, Path(reference).name, os.path.relpath(pose, folder)],
-        cwd=folder, capture_output=True, text=True,
-        encoding="utf-8", errors="replace", timeout=120,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    command = [sys.executable, "-c", code, Path(reference).name, os.path.relpath(pose, folder)]
+    deadline = monotonic() + 120
+    with subprocess.Popen(command, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                          encoding="utf-8", errors="replace",
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as process:
+        try:
+            while True:
+                if cancelled is not None and cancelled():
+                    raise InterruptedError("Redocking RMSD was cancelled.")
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, 120)
+                try:
+                    stdout, stderr = process.communicate(timeout=min(0.2, remaining) if cancelled else remaining)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        except BaseException:
+            process.kill()
+            process.communicate()
+            raise
     if process.returncode:
-        raise RuntimeError(process.stderr.strip() or f"PyDockRMSD exited with code {process.returncode}")
-    value, error = json.loads(process.stdout.strip().splitlines()[-1])
+        raise RuntimeError(stderr.strip() or f"PyDockRMSD exited with code {process.returncode}")
+    value, error = json.loads(stdout.strip().splitlines()[-1])
     if error:
         raise ValueError(error)
     return float(value)
 
 
-def calculate_results(run, provenance):
+def calculate_results(run, provenance, *, cancelled=None):
     folder = run / "dockrmsd"
     reference = folder / REFERENCE
     rows = _poses(run)
@@ -185,7 +213,10 @@ def calculate_results(run, provenance):
             _write_results(folder, cached)
         return cached
     poses = []
+    options = {"cancelled": cancelled} if cancelled is not None else {}
     for rank, affinity, expected in rows:
+        if cancelled is not None and cancelled():
+            raise InterruptedError("Redocking RMSD was cancelled.")
         path = _pose_path(folder, rank)
         digest = _hash(path)
         value = None
@@ -195,10 +226,12 @@ def calculate_results(run, provenance):
                 raise ValueError("Missing file or checksum differs from the validated pose manifest")
             if not error:
                 validate_mol2(path)
-                measured = engine(str(reference), str(path))
+                measured = engine(str(reference), str(path), **options)
                 if not math.isfinite(measured) or measured < 0:
                     raise ValueError("Engine returned an invalid RMSD")
                 value = measured
+        except InterruptedError:
+            raise
         except Exception as exc:
             pose_error = f"{path.name}: {exc}"
         poses.append(dict(pose_rank=rank, affinity=affinity, mol2_sha256=digest,

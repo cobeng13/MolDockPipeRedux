@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from threading import Event
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from rdkit.Chem import AllChem
 from moldockpipe.project import ProjectRepository
 from moldockpipe.receptors.ligand_chemistry import chemistry_summary, pose_in_reference_order, read_sdf, validate_same_heavy_graph, write_mol2, write_sdf
 from moldockpipe.redocking.models import RedockingSettings
-from moldockpipe.redocking import rmsd
+from moldockpipe.redocking import campaign, rmsd
 from moldockpipe.redocking.runner import RedockingRunner, validate_mol2, validate_redocking_prerequisites
 from moldockpipe.services.meeko import MeekoResult
 from moldockpipe.services.vina import VinaResult
@@ -332,3 +333,174 @@ def test_ad4zn_redocking_uses_maps_and_invalidates_reuse(redocking_project, monk
     with repo.connection() as conn:
         row = conn.execute('SELECT settings_json FROM redocking_runs WHERE run_id=?', (result['run_id'],)).fetchone()
     assert json.loads(row[0])['ad4zn']['map_fingerprint'] == 'maps-b'
+
+
+def queue_campaign(repo, profile, limit=3):
+    settings = RedockingSettings(num_modes=2, energy_range=5.25, cpu_count=2)
+    queue_id = repo.enqueue_redocking(profile, {
+        **settings.as_dict(), "campaign": {"snapshot": campaign.campaign_snapshot(repo, profile)},
+    }, campaign_boxes=campaign.campaign_boxes(profile, limit))
+    return queue_id, settings
+
+
+def test_campaign_box_order_cap_and_invalid_grids(redocking_project):
+    _, profile, _ = redocking_project
+    boxes = campaign.campaign_boxes(profile, 21)
+    assert len(boxes) == 21
+    assert boxes[0] == campaign.docking_box(profile)
+    assert boxes[1] == {**boxes[0], "center_x": -1}
+    assert boxes[6] == {**boxes[0], "center_z": 5}
+    assert boxes[7] == {**boxes[0], "size_x": 18, "size_y": 19, "size_z": 20}
+    assert boxes[14] == {**boxes[0], "size_x": 22, "size_y": 23, "size_z": 24}
+    assert campaign.campaign_boxes(profile, 3) == boxes[:3]
+    assert len(campaign.campaign_boxes({**profile, "size_x": 2}, 21)) == 14
+    with pytest.raises(ValueError, match="finite"):
+        campaign.campaign_boxes({**profile, "center_x": float("nan")}, 21)
+    zinc = {**profile, "protocol": "ad4zn", "ad4zn": {"spacing": 3}, "size_x": 21, "size_z": 21}
+    assert len(campaign.campaign_boxes(zinc, 21)) == 7
+    zinc = {**zinc, "ad4zn": {"spacing": 0.375}, "size_x": 47}
+    assert len(campaign.campaign_boxes(zinc, 21)) == 14
+
+
+@pytest.mark.parametrize("box_already_applied", [False, True])
+def test_campaign_uses_only_rank_one_and_applies_winner(redocking_project, monkeypatch, box_already_applied):
+    from moldockpipe.reporting import ReportDataBuilder
+
+    repo, profile, molecule = redocking_project
+    queue_id, settings = queue_campaign(repo, profile)
+    trial_ids = [trial["run_id"] for trial in repo.redocking_campaign_trials(queue_id)]
+    trials_started = []
+
+    class TrackingVina(FakeVina):
+        def run(self, **kwargs):
+            trials_started.append(kwargs["settings"])
+            return super().run(**kwargs)
+
+    monkeypatch.setattr(campaign, "RedockingRunner",
+        lambda *args, **kwargs: RedockingRunner(*args, **kwargs, meeko=FakeMeeko(),
+                                                vina=TrackingVina(), postdock=FakePostDock(molecule)))
+
+    def measure(reference, pose, *, cancelled):
+        if "002" in Path(pose).name:
+            return 0.5
+        return 2.0 if trial_ids[0] in reference else 1.999
+
+    monkeypatch.setattr(rmsd, "_engine", lambda: (measure, "test-version"))
+    result = campaign.run_campaign(repo, repo.claim_next_redocking(), settings, lambda _: None, Event())
+    repo.finish_redocking_queue_item(queue_id, "completed")
+    assert result["run_id"] == trial_ids[1]
+    assert [trial["outcome"] for trial in repo.redocking_campaign_trials(queue_id)] == ["miss", "hit", None]
+    assert [options["center_x"] for options in trials_started] == [1, -1]
+    assert [options["seed"] for options in trials_started] == [settings.seed, settings.seed]
+    assert repo.clear_finished_redocking_queue() == 0
+    assert repo.get_receptor_profiles()[0]["center_x"] == profile["center_x"]
+    assert {run.name: current for run, _, _, current in rmsd.validation_runs(repo, profile)} == {
+        trial_ids[0]: True, trial_ids[1]: False,
+    }
+
+    other = {**profile, "id": "receptor-b", "center_x": 9}
+    repo.save_receptor_profiles([profile, other])
+    report = ReportDataBuilder(repo)
+    assert report._receptor(profile)["redocking"]["run_id"] == trial_ids[0]
+    repo.save_receptor_profiles([{**profile, "center_x": 5}, other])
+    with pytest.raises(ValueError, match="saved box changed"):
+        campaign.apply_winning_box(repo, queue_id)
+    saved_profile = {**profile, "center_x": -1} if box_already_applied else profile
+    repo.save_receptor_profiles([saved_profile, other])
+    with repo.connection() as conn:
+        conn.execute("""INSERT INTO parent_ligands (parent_id, source_smiles, parse_status, created_at)
+                     VALUES ('parent', 'CCO', 'completed', '2026-01-01')""")
+        conn.execute("""INSERT INTO molecular_states (state_id, parent_id, state_smiles, state_isomeric_smiles,
+                     formal_charge, state_structure_hash, generation_fingerprint, status, created_at)
+                     VALUES ('state', 'parent', 'CCO', 'CCO', 0, 'structure', 'generation', 'completed', '2026-01-01')""")
+        conn.executemany("""INSERT INTO docking_runs (run_id, state_id, receptor_hash, settings_fingerprint,
+                         status, is_current, receptor_profile_id)
+                         VALUES (?, 'state', 'receptor', 'settings', 'completed', 1, ?)""",
+                         [("screen-a", profile["id"]), ("screen-b", other["id"])])
+    updated = campaign.apply_winning_box(repo, queue_id)
+    assert updated["center_x"] == -1
+    assert {key: updated[key] for key in settings.as_dict()} == settings.as_dict()
+    assert repo.get_receptor_profiles() == [updated, {**other, "protocol": "vina"}]
+    with repo.connection() as conn:
+        current = dict(conn.execute("SELECT run_id, is_current FROM docking_runs").fetchall())
+    assert current == {"screen-a": 0, "screen-b": 1}
+    validation = report._receptor(updated)["redocking"]
+    assert validation["run_id"] == trial_ids[1]
+    assert {key: validation["settings"][key] for key in settings.as_dict()} == settings.as_dict()
+    assert campaign.apply_winning_box(repo, queue_id) == updated
+
+
+def test_campaign_resumes_after_failure_and_restart(redocking_project, monkeypatch):
+    repo, profile, _ = redocking_project
+    queue_id, settings = queue_campaign(repo, profile)
+    attempts = []
+    event = Event()
+    attempts_to_result = iter([3.5, RuntimeError("mock docking failure"), None, 2.5])
+
+    class TrialRunner:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, run_id):
+            attempts.append(run_id)
+            result = next(attempts_to_result)
+            if isinstance(result, Exception):
+                raise result
+            if result is None:
+                event.set()
+            return {"dockrmsd": {"status": "Incomplete" if result is None else "Calculated",
+                                 "rank_1": {"rmsd_angstrom": result, "affinity": -8.2}}}
+
+    monkeypatch.setattr(campaign, "RedockingRunner", TrialRunner)
+    item = repo.claim_next_redocking()
+    with pytest.raises(RuntimeError, match="mock docking failure"):
+        campaign.run_campaign(repo, item, settings, lambda _: None, event)
+    assert [row["outcome"] for row in repo.redocking_campaign_trials(queue_id)] == ["miss", "error", None]
+    repo.finish_redocking_queue_item(queue_id, "failed")
+    assert repo.retry_redocking_queue_item(queue_id)
+    item = repo.claim_next_redocking()
+    with pytest.raises(InterruptedError):
+        campaign.run_campaign(repo, item, settings, lambda _: None, event)
+    assert repo.recover_interrupted_runs() >= 1
+    event.clear()
+    assert campaign.run_campaign(repo, repo.claim_next_redocking(), settings, lambda _: None, event) == {
+        "campaign_id": queue_id,
+    }
+    trials = repo.redocking_campaign_trials(queue_id)
+    assert [trial["outcome"] for trial in trials] == ["miss", "rmsd_missing", "miss"]
+    assert attempts == [trials[i]["run_id"] for i in (0, 1, 1, 2)]
+
+
+def test_campaign_cancellation_and_unavailable_engine(redocking_project, monkeypatch):
+    repo, profile, molecule = redocking_project
+    queue_id, settings = queue_campaign(repo, profile, limit=2)
+    vina = FakeVina()
+    monkeypatch.setattr(campaign, "RedockingRunner",
+        lambda *args, **kwargs: RedockingRunner(*args, **kwargs, meeko=FakeMeeko(),
+                                                vina=vina, postdock=FakePostDock(molecule)))
+
+    def unavailable():
+        raise ImportError("mock missing RMSD engine")
+
+    monkeypatch.setattr(rmsd, "_engine", unavailable)
+    item = repo.claim_next_redocking()
+    with pytest.raises(RuntimeError, match="mock missing RMSD engine"):
+        campaign.run_campaign(repo, item, settings, lambda _: None, Event())
+    assert vina.calls == 1
+    assert repo.cancel_redocking_queue_item(queue_id)
+    with pytest.raises(InterruptedError):
+        campaign.run_campaign(repo, item, settings, lambda _: None, Event())
+    repo.recover_interrupted_runs()
+    assert repo.list_redocking_queue()[0]["status"] == "cancelled"
+    assert repo.retry_redocking_queue_item(queue_id)
+    event = Event()
+
+    def interrupted(reference, pose, *, cancelled):
+        event.set()
+        raise InterruptedError("RMSD was cancelled")
+
+    monkeypatch.setattr(rmsd, "_engine", lambda: (interrupted, "test-version"))
+    with pytest.raises(InterruptedError, match="RMSD was cancelled"):
+        campaign.run_campaign(repo, repo.claim_next_redocking(), settings, lambda _: None, event)
+    assert vina.calls == 1
+    assert repo.redocking_campaign_trials(queue_id)[1]["outcome"] is None

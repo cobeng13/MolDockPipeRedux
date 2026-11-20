@@ -252,6 +252,12 @@ class ProjectRepository:
                 current_stage TEXT, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
                 error_message TEXT, cancel_requested INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS redocking_campaign_trials (
+                queue_id TEXT NOT NULL REFERENCES redocking_queue_items(queue_id),
+                trial_number INTEGER NOT NULL, run_id TEXT NOT NULL UNIQUE,
+                box_json TEXT NOT NULL, outcome TEXT, affinity REAL, rmsd REAL, error TEXT,
+                PRIMARY KEY(queue_id, trial_number)
+            );
             CREATE INDEX IF NOT EXISTS idx_redocking_profile_status ON redocking_runs(receptor_profile_id, status);
             CREATE INDEX IF NOT EXISTS idx_redocking_queue_status_created ON redocking_queue_items(status, created_at);
             """)
@@ -394,6 +400,16 @@ class ProjectRepository:
         config["vina"] = {"profiles": profiles}
         write_project_config(path, config)
 
+    @exclusive_project
+    def update_receptor_docking_defaults(self, profiles: list[dict[str, Any]], updated: dict[str, Any]) -> None:
+        """Save the updated profile and invalidate screening runs for its previous defaults."""
+        self.check_receptor_profiles(profiles)
+        # Invalidate first so an interruption cannot leave old runs current under the new defaults.
+        with self.connection() as conn:
+            conn.execute("UPDATE docking_runs SET is_current=0 WHERE receptor_profile_id=?", (str(updated["id"]),))
+        self.save_receptor_profiles([updated if profile["id"] == updated["id"] else profile
+                                     for profile in profiles], expected_profiles=profiles)
+
     def check_receptor_profiles(self, expected_profiles: list[dict[str, Any]] | None) -> None:
         if expected_profiles is not None and self.get_receptor_profiles(include_archived=True) != expected_profiles:
             raise RuntimeError("Receptor profiles changed since this window was opened. "
@@ -429,10 +445,12 @@ class ProjectRepository:
             shutil.rmtree(target)
         return True
 
-    def enqueue_redocking(self, profile: dict[str, Any], settings: dict[str, Any]) -> str:
-        """Persist one receptor-validation request for FIFO background execution."""
+    def enqueue_redocking(self, profile: dict[str, Any], settings: dict[str, Any], *,
+                          campaign_boxes: list[dict[str, float]] | None = None) -> str:
+        """Persist one validation and, for a campaign, its ordered trials."""
         profile_id = str(profile["id"])
         with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             duplicate = conn.execute("""SELECT queue_id FROM redocking_queue_items
                 WHERE receptor_profile_id=? AND status IN ('queued','running') LIMIT 1""", (profile_id,)).fetchone()
             if duplicate:
@@ -443,7 +461,33 @@ class ProjectRepository:
                 VALUES (?, ?, ?, 'queued', ?, ?)""",
                 (queue_id, profile_id, str(profile.get("name", profile_id)),
                  json.dumps(settings, sort_keys=True), utc_now()))
+            if campaign_boxes:
+                conn.executemany("""INSERT INTO redocking_campaign_trials (queue_id,trial_number,run_id,box_json)
+                    VALUES (?, ?, ?, ?)""", ((queue_id, index, uuid.uuid4().hex, json.dumps(box))
+                                             for index, box in enumerate(campaign_boxes, 1)))
         return queue_id
+
+    def redocking_campaign_trials(self, queue_id: str) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute("""SELECT * FROM redocking_campaign_trials
+                WHERE queue_id=? ORDER BY trial_number""", (queue_id,)).fetchall()
+        trials = []
+        for row in rows:
+            trial = dict(row)
+            trial["box"] = json.loads(trial.pop("box_json"))
+            trials.append(trial)
+        return trials
+
+    def record_redocking_trial(self, run_id: str, outcome: str, affinity: float | None = None,
+                               rmsd: float | None = None, error: str | None = None) -> None:
+        with self.connection() as conn:
+            conn.execute("""UPDATE redocking_campaign_trials SET outcome=?,affinity=?,rmsd=?,error=?
+                WHERE run_id=?""", (outcome, affinity, rmsd, error, run_id))
+
+    def redocking_cancel_requested(self, queue_id: str) -> bool:
+        with self.connection() as conn:
+            row = conn.execute("SELECT cancel_requested FROM redocking_queue_items WHERE queue_id=?", (queue_id,)).fetchone()
+        return bool(row and row["cancel_requested"])
 
     def list_redocking_queue(self) -> list[dict[str, Any]]:
         with self.connection() as conn:
@@ -461,11 +505,14 @@ class ProjectRepository:
     def claim_next_redocking(self) -> dict[str, Any] | None:
         """Atomically claim the oldest queued validation."""
         with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("""SELECT * FROM redocking_queue_items WHERE status='queued'
+                AND NOT EXISTS (SELECT 1 FROM redocking_queue_items WHERE status='running')
                 ORDER BY created_at,rowid LIMIT 1""").fetchone()
             if not row:
                 return None
-            run_id = str(row["redocking_run_id"] or uuid.uuid4().hex)
+            settings = json.loads(row["settings_json"])
+            run_id = None if "campaign" in settings else str(row["redocking_run_id"] or uuid.uuid4().hex)
             now = utc_now()
             updated = conn.execute("""UPDATE redocking_queue_items SET status='running',
                 redocking_run_id=?,started_at=COALESCE(started_at,?),finished_at=NULL,
@@ -475,7 +522,8 @@ class ProjectRepository:
                 return None
             item = dict(row)
             item.update(status="running", redocking_run_id=run_id, started_at=item.get("started_at") or now)
-            item["settings"] = json.loads(item.pop("settings_json"))
+            item.pop("settings_json")
+            item["settings"] = settings
             return item
 
     def update_redocking_queue_stage(self, queue_id: str, stage: str) -> None:
@@ -506,7 +554,10 @@ class ProjectRepository:
         with self.connection() as conn:
             return bool(conn.execute("""UPDATE redocking_queue_items SET status='queued',current_stage=NULL,
                 finished_at=NULL,error_message=NULL,cancel_requested=0 WHERE queue_id=?
-                AND status IN ('failed','cancelled')""", (queue_id,)).rowcount)
+                AND status IN ('failed','cancelled') AND NOT EXISTS (
+                    SELECT 1 FROM redocking_queue_items AS active
+                    WHERE active.receptor_profile_id=redocking_queue_items.receptor_profile_id
+                        AND active.status IN ('queued','running'))""", (queue_id,)).rowcount)
 
     def requeue_running_redocking(self, queue_id: str, reason: str) -> bool:
         with self.connection() as conn:
@@ -516,7 +567,9 @@ class ProjectRepository:
 
     def clear_finished_redocking_queue(self) -> int:
         with self.connection() as conn:
-            return conn.execute("DELETE FROM redocking_queue_items WHERE status IN ('completed','cancelled')").rowcount
+            return conn.execute("""DELETE FROM redocking_queue_items WHERE status IN ('completed','cancelled')
+                AND NOT EXISTS (SELECT 1 FROM redocking_campaign_trials AS trial
+                                WHERE trial.queue_id=redocking_queue_items.queue_id)""").rowcount
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -776,7 +829,10 @@ class ProjectRepository:
                          (utc_now(), "Application restarted before completion"))
             conn.execute("UPDATE workflow_run_stages SET status='interrupted',finished_at=?,error_message=? WHERE status='running'",
                          (utc_now(), "Application restarted before completion"))
+            cancelled = conn.execute("""UPDATE redocking_queue_items SET status='cancelled',current_stage=NULL,
+                finished_at=?,error_message='Cancelled by user'
+                WHERE status='running' AND cancel_requested=1""", (utc_now(),)).rowcount
             queued = conn.execute("""UPDATE redocking_queue_items SET status='queued',current_stage=NULL,
-                error_message='Application restarted; validation will resume from reusable stages',cancel_requested=0
-                WHERE status='running'""").rowcount
+                error_message='Application restarted; validation will resume from reusable stages'
+                WHERE status='running'""").rowcount + cancelled
             return result + redocking + workflows + queued

@@ -20,7 +20,7 @@ from ..services.meeko import MeekoService
 from ..services.postdock import PostDockService
 from ..services.validation import parse_vina_poses, validate_pdbqt
 from ..services.vina import VinaDockingBackend, find_vina_executable
-from .models import RedockingSettings, RedockingStatus
+from .models import BOX_KEYS, RedockingSettings, RedockingStatus
 from .rmsd import LOG, REFERENCE, calculate_results, validate_mol2
 
 STAGES = ("reference_validation", "ligand_preparation", "vina_redocking", "pose_export", "mol2_generation", "final_validation")
@@ -81,8 +81,9 @@ class RedockingRunner:
     def __init__(self, repository: ProjectRepository, profile: dict[str, Any], settings: RedockingSettings,
                  *, progress: Callable[[dict[str, Any]], None] | None = None, cancel_event: threading.Event | None = None,
                  meeko: MeekoService | None = None, postdock: PostDockService | None = None,
-                 vina: VinaDockingBackend | None = None) -> None:
+                 vina: VinaDockingBackend | None = None, campaign_id: str | None = None) -> None:
         self.repository, self.profile, self.settings = repository, profile, settings
+        self.campaign_id = campaign_id
         self.progress = progress or (lambda event: None); self.cancel_event = cancel_event or threading.Event()
         self.meeko, self.postdock, self.vina = meeko or MeekoService(), postdock or PostDockService(), vina or VinaDockingBackend()
 
@@ -142,7 +143,14 @@ class RedockingRunner:
         run_root = self.repository.root / "inputs" / "receptors" / profile_id / "redocking" / run_id
         input_dir, docking_dir, poses_dir, rmsd_dir = (run_root / name for name in ("input", "docking", "poses", "dockrmsd"))
         for folder in (input_dir, docking_dir, poses_dir, rmsd_dir): folder.mkdir(parents=True, exist_ok=True)
-        settings = self.settings.as_dict(); receptor_hash, reference_hash = file_sha256(receptor), file_sha256(reference_sdf)
+        settings: dict[str, Any] = dict(self.settings.as_dict())
+        campaign = {}
+        if self.campaign_id:
+            campaign["campaign"] = {"id": self.campaign_id, "box": {key: self.profile[key] for key in BOX_KEYS},
+                                    "protocol": protocol_for(self.profile),
+                                    "ad4zn": self.profile.get("ad4zn") if protocol_for(self.profile) == "ad4zn" else None}
+            settings.update(campaign)
+        receptor_hash, reference_hash = file_sha256(receptor), file_sha256(reference_sdf)
         with self.repository.connection() as conn:
             existing = conn.execute("SELECT run_id FROM redocking_runs WHERE run_id=?", (run_id,)).fetchone()
             if not existing:
@@ -185,7 +193,9 @@ class RedockingRunner:
             maps_kwargs = {}
             if protocol_for(self.profile) == "ad4zn":
                 self._stage_start(run_id, "ad4zn_maps", file_sha256(ligand_pdbqt))
-                maps, record = ensure_ad4zn_maps(self.repository, self.profile, [ligand_pdbqt], executable, self._cancelled)
+                map_options = {"manifest": docking_dir / "ad4zn-maps.json"} if self.campaign_id else {}
+                maps, record = ensure_ad4zn_maps(self.repository, self.profile, [ligand_pdbqt], executable,
+                                                 self._cancelled, **map_options)
                 vina_settings.update(protocol="ad4zn", ad4zn=record)
                 maps_kwargs = {"maps": maps}
                 settings["protocol"] = "ad4zn"
@@ -269,7 +279,7 @@ class RedockingRunner:
                         pose_rows.append((rank, affinity, sdf.relative_to(self.repository.root).as_posix(), digest))
                 with pose_manifest.open("w", newline="", encoding="utf-8") as handle:
                     writer = csv.writer(handle); writer.writerow(("pose_rank", "affinity", "sdf_path", "artifact_sha256")); writer.writerows(pose_rows)
-                validation_path.write_text(json.dumps({"status": RedockingStatus.ARTIFACTS_READY.value,
+                validation_path.write_text(json.dumps({**campaign, "status": RedockingStatus.ARTIFACTS_READY.value,
                     "pose_count": len(scored), "top_affinity": scored[0][1], "top_rank": 1, "hashes_recorded": True,
                     "provenance": {"receptor_sha256": receptor_hash, "reference_sha256": reference_hash,
                         "validated_reference_mol2_sha256": file_sha256(reference_out), "finished_at": utc_now()}},
@@ -332,10 +342,13 @@ class RedockingRunner:
             try:
                 self._emit("stage_started", "rmsd_calculation")
                 with project_execution_lock(self.repository.root):
+                    rmsd_options = {"cancelled": self._cancelled} if self.campaign_id else {}
                     rmsd = calculate_results(run_root, dict(receptor_sha256=receptor_hash,
                         reference_sha256=reference_hash, finished_at=finished_at,
-                        validated_reference_mol2_sha256=file_sha256(reference_out)))
+                        validated_reference_mol2_sha256=file_sha256(reference_out)), **rmsd_options)
                 self._emit("stage_completed", "rmsd_calculation", status=rmsd["status"])
+            except InterruptedError:
+                raise
             except Exception:
                 LOG.exception("Could not save redocking RMSD for %s", run_id)
                 rmsd = None

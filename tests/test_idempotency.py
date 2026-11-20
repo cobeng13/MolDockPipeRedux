@@ -99,6 +99,61 @@ def test_changed_scientific_inputs_or_damaged_pose_require_docking(docking_cache
     assert len(p.calls) == 2
 
 
+@pytest.mark.parametrize("stop_when", ["between_jobs", "during_second_job"])
+def test_continued_docking_skips_completed_job_after_stop(docking_cache_project, monkeypatch, stop_when):
+    from threading import Event
+    import moldockpipe.pipeline as pipeline
+
+    p = docking_cache_project
+    second_ligand = p.ligand.parent.parent / "state2" / "ligand.pdbqt"
+    second_ligand.parent.mkdir()
+    second_ligand.write_text("SECOND LIGAND", encoding="ascii")
+    p.repo.add_artifact(second_ligand, "ligand_pdbqt", "meeko")
+    with p.repo.connection() as conn:
+        conn.execute("""INSERT INTO molecular_states
+            (state_id,parent_id,state_smiles,state_isomeric_smiles,formal_charge,
+             state_structure_hash,generation_fingerprint,status,enumeration_truncated,created_at)
+            VALUES ('state2','lig1','CCO','CCO',0,'structure2','generation','pdbqt_ready',0,'now')""")
+        sdf_id = conn.execute("SELECT sdf_artifact_id FROM conformers WHERE state_id='state1'").fetchone()[0]
+        conn.execute("INSERT INTO conformers VALUES ('conf2','state2',1,?,'pdbqt_ready','now')", (sdf_id,))
+
+    stop = Event()
+    backend_calls = []
+    original_run = pipeline.VinaDockingBackend().run
+
+    class InterruptibleBackend:
+        def run(self, **kwargs):
+            state_id = kwargs["ligand"].parent.name
+            backend_calls.append(state_id)
+            if state_id == "state2" and stop_when == "during_second_job" and not stop.is_set():
+                stop.set()
+                raise InterruptedError("Stopped during second ligand")
+            return original_run(**kwargs)
+
+    monkeypatch.setattr(pipeline, "VinaDockingBackend", InterruptibleBackend)
+
+    def progress(event):
+        if stop_when == "between_jobs" and event.event == "item_succeeded" and event.item_id == "state1":
+            stop.set()
+
+    with pytest.raises(InterruptedError):
+        PipelineRunner(p.repo, progress=progress, cancelled=stop.is_set).run_vina()
+    with p.repo.connection() as conn:
+        original = conn.execute("SELECT run_id FROM docking_runs WHERE state_id='state1' AND status='completed'").fetchone()[0]
+
+    # A fresh runner/repository must use the saved ledger, without in-memory state.
+    events = []
+    resumed = PipelineRunner(ProjectRepository(p.repo.root), progress=events.append)
+    assert resumed.run_vina() == (2, 0)
+    assert backend_calls.count("state1") == 1
+    assert backend_calls.count("state2") == (2 if stop_when == "during_second_job" else 1)
+    assert events[-1].skipped == 1
+    assert any(event.event == "item_skipped" and event.item_id == "state1" for event in events)
+    with p.repo.connection() as conn:
+        assert [row[0] for row in conn.execute("SELECT run_id FROM docking_runs WHERE state_id='state1'")] == [original]
+        assert conn.execute("SELECT COUNT(*) FROM docking_runs WHERE status='completed'").fetchone()[0] == 2
+
+
 def test_reverting_box_reuses_historical_completed_docking(docking_cache_project):
     p = docking_cache_project
     assert p.runner.run_vina() == (1, 0)
